@@ -1764,9 +1764,9 @@ function writeRegularTable(worksheet, visualName, columns, rows, originRow, orig
     noteCell.font = { italic: true, size: 10, color: { argb: "FF888888" } };
     noteCell.alignment = { horizontal: "left", vertical: "center" };
     noteCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF5F5F5" } };
-    if (numCols > 1) {
-      worksheet.mergeCells(r + 1, C + 1, r + 1, C + numCols);
-    }
+    // if (numCols > 1) {
+    //   worksheet.mergeCells(r + 1, C + 1, r + 1, C + numCols);
+    // }
     rangeTracker.update(r, C);
     r++;
   }
