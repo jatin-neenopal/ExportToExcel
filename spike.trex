@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest manifest-version="0.1" xmlns="http://www.tableau.com/xml/extension_manifest">
+  <dashboard-extension id="com.exporttoexcel.phase0spike" extension-version="0.0.1">
+    <default-locale>en_US</default-locale>
+    <name resource-id="name"/>
+    <description>Phase 0 spike: REST workbook fetch + multi-dashboard data feasibility</description>
+    <author name="Export to Excel team" email="you@example.com" organization="" website="https://YOUR-USER.github.io"/>
+    <min-api-version>1.4</min-api-version>
+    <source-location>
+      <url>https://YOUR-USER.github.io/YOUR-REPO/spike.html</url>
+    </source-location>
+    <permissions>
+      <permission>full data</permission>
+    </permissions>
+  </dashboard-extension>
+  <resources>
+    <resource id="name">
+      <text locale="en_US">Export to Excel — Phase 0 spike</text>
+    </resource>
+  </resources>
+</manifest>
