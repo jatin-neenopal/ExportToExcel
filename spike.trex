@@ -7,7 +7,7 @@
     <author name="Export to Excel team" email="you@example.com" organization="" website="https://YOUR-USER.github.io"/>
     <min-api-version>1.4</min-api-version>
     <source-location>
-      <url>https://YOUR-USER.github.io/YOUR-REPO/spike.html</url>
+      <url>https://jatin-neenopal.github.io/ExportToExcel/spike.html</url>
     </source-location>
     <permissions>
       <permission>full data</permission>
