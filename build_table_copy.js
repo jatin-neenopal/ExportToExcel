@@ -2245,6 +2245,29 @@ if (typeof module !== "undefined" && module.exports) {  // lets you unit-test th
   }
 
 
+  /* =============================================================================
+   * uniqueExcelSheetName() — a valid, unique Excel sheet name for a dashboard.
+   * Excel rules: max 31 chars; none of \ / ? * [ ] : ; not empty; must not start or
+   * end with an apostrophe; "History" is reserved; names are unique ignoring case.
+   * usedLower: Set of lower-cased names already taken (updated here).
+   * ============================================================================= */
+  function uniqueExcelSheetName(dashboardName, usedLower) {
+    let base = String(dashboardName || "Dashboard Export")
+      .replace(/[\\\/\*\?\[\]:]/g, "")
+      .replace(/^'+|'+$/g, "")
+      .slice(0, 31)
+      .replace(/^'+|'+$/g, "");
+    if (!base.trim()) base = "Dashboard Export";
+    if (base.toLowerCase() === "history") base = "History (1)";
+    let name = base, n = 2;
+    while (usedLower.has(name.toLowerCase())) {
+      const suffix = ` (${n++})`;
+      name = base.slice(0, 31 - suffix.length).replace(/[\s']+$/, "") + suffix;
+    }
+    usedLower.add(name.toLowerCase());
+    return name;
+  }
+
   /* ── buildLayoutMap ─────────────────────────────────────────────────── */
   function buildLayoutMap(dashboardObjects, titleMap = {}) {
     const map = new Map();
@@ -2680,20 +2703,91 @@ if (typeof module !== "undefined" && module.exports) {  // lets you unit-test th
         });
       }
 
+      /* =========================================================================
+       * exportToExcel() — one click → ONE .xlsx, ONE sheet per dashboard (Phase 2)
+       * Phase 2 exports the current dashboard; Phase 3 adds the other dashboards
+       * by returning more entries from collectDashboardsToExport().
+       * ========================================================================= */
       async function exportToExcel() {
   const btn = document.getElementById("export_button");
   btn.disabled = true;
 
   try {
-    const filterValuesMap = await extractFilterValuesPerField(sheets);
-    console.log("📊 Filter values per field:", filterValuesMap);
-
     const titleMap = getTitleMap();
     console.log(`[Export] Using ${Object.keys(titleMap).length} titles`);
 
     const fmtModel = getFormatModel();
     console.log(`[Export] Format model: ${fmtModel ? Object.keys(fmtModel.sheets).length + " sheets" : "none – load the workbook for exact formatting"}`);
 
+    const workbook = new ExcelJS.Workbook();
+    const usedSheetNames = new Set();
+    const written = [];
+
+    for (const target of await collectDashboardsToExport()) {
+      const sheetName = uniqueExcelSheetName(target.dashboard.name, usedSheetNames);
+      const filterValuesMap = await extractFilterValuesPerField(target.sheets);
+      console.log(`📊 [${target.dashboard.name}] Filter values per field:`, filterValuesMap);
+      const allSheetsData = await fetchAllSheetsData(target.sheets);
+      const ok = await writeDashboardSheet(workbook, sheetName, target.dashboard, target.sheets,
+                                           allSheetsData, filterValuesMap, titleMap, fmtModel);
+      if (ok) written.push(sheetName);
+      else {
+        usedSheetNames.delete(sheetName.toLowerCase());
+        console.log(`[Export] "${target.dashboard.name}" has no exportable data – no sheet added`);
+      }
+    }
+
+    if (written.length === 0) {
+      throw new Error("No data found in any visible worksheet.");
+    }
+
+    const buffer = await workbook.xlsx.writeBuffer();
+    const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    const now = new Date();
+    const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}`;
+    const fname = `${exportFileBaseName(written)}_${stamp}.xlsx`;
+
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = fname;
+    link.click();
+    URL.revokeObjectURL(link.href);
+
+    console.log(`✅ Export completed with Tableau formatting (fonts, colours, number formats, borders) — ${written.length} sheet(s): ${written.join(", ")}`);
+
+  } catch (err) {
+    console.error("[Export]", err);
+    alert("Export failed. Check console (F12) for details.\n\n" + err.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+      /* -------------------------------------------------------------------------
+       * collectDashboardsToExport() — which dashboards go into the file, in tab order.
+       * Phase 2: the dashboard the extension sits on. Phase 3 appends the others
+       * (same shape: { dashboard: {name, objects}, sheets: [worksheet-like] }).
+       * ------------------------------------------------------------------------- */
+      async function collectDashboardsToExport() {
+        return [{ dashboard, sheets }];
+      }
+
+      /* -------------------------------------------------------------------------
+       * exportFileBaseName() — one dashboard: its sheet name (unchanged behaviour);
+       * several: the workbook name if known, else the first sheet name.
+       * ------------------------------------------------------------------------- */
+      function exportFileBaseName(sheetNames) {
+        if (sheetNames.length === 1) return sheetNames[0];
+        const wbName = readSaved("twbWorkbookName");
+        return (wbName || sheetNames[0]).replace(/[\\\/:*?"<>|]/g, "").slice(0, 80) || "Tableau Export";
+      }
+
+      /* =========================================================================
+       * writeDashboardSheet() — writes ONE dashboard onto ONE new Excel sheet.
+       * Same layout/formatting logic as before, now reusable per dashboard.
+       * Returns false (and adds no sheet) when the dashboard has nothing to export.
+       * ========================================================================= */
+      async function writeDashboardSheet(workbook, sheetName, dashboard, sheets, allSheetsData, filterValuesMap, titleMap, fmtModel) {
     const layoutMap = buildLayoutMap(dashboard.objects || [], titleMap);
 
     // ── 1. Build DZV map ──
@@ -2706,7 +2800,6 @@ if (typeof module !== "undefined" && module.exports) {  // lets you unit-test th
     console.log("[DZV] Visibility map:", dzvMap);
 
     // ── 2. Fetch all sheets in parallel ──
-    const allSheetsData = await fetchAllSheetsData(sheets);
 
     const filterValueItems = [];
     const dataWorksheetItems = [];
@@ -2785,7 +2878,7 @@ if (typeof module !== "undefined" && module.exports) {  // lets you unit-test th
     const allItems = [...filterValueItems, ...dataWorksheetItems];
 
     if (allItems.length === 0) {
-      throw new Error("No data found in any visible worksheet.");
+      return false;   // nothing exportable on this dashboard → no sheet for it
     }
 
     const placedItems = allItems.map((item, idx) => {
@@ -2863,10 +2956,6 @@ while (FORMAT_CONFIG.groupOverflowRows && snapChanged && snapPass < MAX_SNAP_PAS
   }
 }
 
-    const workbook = new ExcelJS.Workbook();
-    const sheetName = (dashboard.name || "Dashboard Export")
-      .replace(/[\\\/\*\?\[\]:]/g, "")
-      .slice(0, 31);
     const worksheet = workbook.addWorksheet(sheetName);
 
     const colWidths = {};
@@ -2920,26 +3009,7 @@ while (FORMAT_CONFIG.groupOverflowRows && snapChanged && snapPass < MAX_SNAP_PAS
     setColumnWidths(worksheet, colWidths, exactWidths);
     applyAutoFilters(worksheet, allTablesInfo);
 
-    const buffer = await workbook.xlsx.writeBuffer();
-    const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-    const now = new Date();
-    const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}`;
-    const fname = `${sheetName}_${stamp}.xlsx`;
-
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = fname;
-    link.click();
-    URL.revokeObjectURL(link.href);
-
-    console.log("✅ Export completed with Tableau formatting (fonts, colours, number formats, borders)");
-
-  } catch (err) {
-    console.error("[Export]", err);
-    alert("Export failed. Check console (F12) for details.\n\n" + err.message);
-  } finally {
-    btn.disabled = false;
-  }
+    return true;
 }
 
     }).catch((err) => {
