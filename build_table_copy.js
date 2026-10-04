@@ -2085,6 +2085,7 @@ if (typeof module !== "undefined" && module.exports) {  // lets you unit-test th
     const formatModel = parseTableauFormatting(xmlString);
     TITLE_MAP_CACHE = titleMap;
     FORMAT_MODEL_CACHE = formatModel;
+    LOADED_WORKBOOK = { id: null, name: sourceName, xml: xmlString };   // id is set by auto-load
     console.log(`[Workbook] ${sourceName}: ${describeModel(titleMap, formatModel)}`);
 
     if (persistToSettings) {
@@ -2214,6 +2215,7 @@ if (typeof module !== "undefined" && module.exports) {  // lets you unit-test th
         }
 
         const { titleMap, formatModel } = await applyWorkbookXml(xml, wb.name, false);
+        LOADED_WORKBOOK.id = wb.id;            // lets Phase 3 find the other dashboards' views
         if (!wb.fromSaved) await writeSaved({ twbWorkbookId: wb.id, twbWorkbookName: wb.name });
         showWorkbookStatus(`✅ ${wb.name} (auto, Tableau Cloud) — ${describeModel(titleMap, formatModel)}`);
         return;
@@ -2244,6 +2246,197 @@ if (typeof module !== "undefined" && module.exports) {  // lets you unit-test th
     });
   }
 
+
+  /* =============================================================================
+   * OTHER DASHBOARDS (Phase 3) — read dashboards the extension is NOT placed on.
+   * -----------------------------------------------------------------------------
+   * The Extensions API only sees its own dashboard. For the others we open each one
+   * in an invisible Embedding API viz, in the viewer's OWN Tableau session (so row-level
+   * security and permissions apply), read every worksheet's summary data, then close it.
+   * The result has the same shape the existing export pipeline already uses:
+   *   { dashboard: {name, objects}, sheets: [{ name, getSummaryDataAsync, getFiltersAsync }] }
+   * ============================================================================= */
+  const VIZ_LOAD_TIMEOUT_MS = 90000;
+  let LOADED_WORKBOOK = null;            // { id, name, xml } — set by auto-load / manual load
+  let EMBED_LIB_PROMISE = null;
+
+  /** Visible dashboards in Tableau tab order, from the workbook XML (<windows>). */
+  function dashboardTabOrder(xmlString) {
+    const doc = new DOMParser().parseFromString(xmlString, "text/xml");
+    const root = doc && doc.documentElement;
+    if (!root) return [];
+    const windows = getDirectChildByTag(root, "windows");
+    const out = [];
+    if (windows) {
+      for (let i = 0; i < windows.childNodes.length; i++) {
+        const w = windows.childNodes[i];
+        if (w.nodeType === 1 && w.tagName === "window" && w.getAttribute("class") === "dashboard" &&
+            w.getAttribute("hidden") !== "true") out.push(w.getAttribute("name"));
+      }
+    }
+    if (out.length) return out;
+    const dashboards = getDirectChildByTag(root, "dashboards");       // fallback: definition order
+    if (!dashboards) return [];
+    for (let i = 0; i < dashboards.childNodes.length; i++) {
+      const d = dashboards.childNodes[i];
+      if (d.nodeType === 1 && d.tagName === "dashboard") out.push(d.getAttribute("name"));
+    }
+    return out;
+  }
+
+  /** Dashboard size from the XML (fixed-size dashboards), so the hidden viz renders at its real size. */
+  function dashboardPixelSize(xmlString, name) {
+    const doc = new DOMParser().parseFromString(xmlString, "text/xml");
+    const d = [...doc.getElementsByTagName("dashboard")].find(x => x.getAttribute("name") === name);
+    const size = d && getDirectChildByTag(d, "size");
+    const num = k => (size && +size.getAttribute(k)) || 0;
+    return { width: num("maxwidth") || num("minwidth") || 1200, height: num("maxheight") || num("minheight") || 900 };
+  }
+
+  function loadEmbeddingApi(libUrl) {
+    if (window.customElements && customElements.get("tableau-viz")) return Promise.resolve();
+    if (!EMBED_LIB_PROMISE) {
+      EMBED_LIB_PROMISE = import(libUrl).catch(e => {
+        EMBED_LIB_PROMISE = null;
+        throw new Error(`could not load Tableau's Embedding API (${e.message})`);
+      });
+    }
+    return EMBED_LIB_PROMISE;
+  }
+
+  /** Off-screen host: the viz must actually render to become interactive, so not display:none. */
+  function hiddenVizHost() {
+    let host = document.getElementById("tfx_viz_host");
+    if (!host) {
+      host = document.createElement("div");
+      host.id = "tfx_viz_host";
+      host.setAttribute("aria-hidden", "true");
+      host.style.cssText = "position:absolute;left:-20000px;top:0;overflow:hidden;";
+      document.body.appendChild(host);
+    }
+    return host;
+  }
+
+  /** Open one view invisibly; resolves with the <tableau-viz> once it's interactive. */
+  function openHiddenViz(embedUrl, size) {
+    return new Promise((resolve, reject) => {
+      const viz = document.createElement("tableau-viz");
+      viz.setAttribute("src", embedUrl);
+      viz.setAttribute("toolbar", "hidden");
+      viz.setAttribute("hide-tabs", "");
+      viz.setAttribute("width", String(size.width));
+      viz.setAttribute("height", String(size.height));
+      const timer = setTimeout(() => {
+        viz.remove();
+        reject(new Error(`didn't open within ${VIZ_LOAD_TIMEOUT_MS / 1000}s (usually a Tableau sign-in / cookie problem)`));
+      }, VIZ_LOAD_TIMEOUT_MS);
+      viz.addEventListener("firstinteractive", () => { clearTimeout(timer); resolve(viz); });
+      viz.addEventListener("vizloaderror", e => {
+        clearTimeout(timer);
+        viz.remove();
+        let detail = e && e.detail;
+        try { detail = JSON.stringify(detail); } catch (x) { /* keep as is */ }
+        reject(new Error("Tableau refused to open it: " + detail));
+      });
+      hiddenVizHost().appendChild(viz);
+    });
+  }
+
+  /** Copy only what the export uses, so nothing keeps a reference to the closed viz. */
+  function plainSummary(t) {
+    return {
+      columns: (t.columns || []).map(c => ({ fieldName: c.fieldName, dataType: c.dataType, index: c.index })),
+      data: (t.data || []).map(r => r.map(v => ({ value: v.value, nativeValue: v.nativeValue, formattedValue: v.formattedValue }))),
+    };
+  }
+  function plainFilter(f) {
+    const fv = v => (v ? { formattedValue: v.formattedValue, value: v.value } : v);
+    return { fieldName: f.fieldName, filterType: f.filterType,
+             appliedValues: (f.appliedValues || []).map(fv), minValue: fv(f.minValue), maxValue: fv(f.maxValue) };
+  }
+
+  async function readWorksheetSummary(ws) {
+    if (typeof ws.getSummaryDataReaderAsync === "function") {
+      const reader = await ws.getSummaryDataReaderAsync(undefined, { ignoreSelection: true });
+      try { return plainSummary(await reader.getAllPagesAsync()); }
+      finally { try { await reader.releaseAsync(); } catch (e) { /* ignore */ } }
+    }
+    return plainSummary(await ws.getSummaryDataAsync({ ignoreSelection: true }));
+  }
+
+  /** Read every worksheet of the dashboard shown in `viz` into the export's input shape. */
+  async function readEmbeddedDashboard(viz) {
+    const sheet = viz.workbook.activeSheet;
+    if (!sheet || sheet.sheetType !== "dashboard") throw new Error("opened view is not a dashboard");
+    const sheets = [];
+    for (const ws of sheet.worksheets || []) {
+      let summary = null, summaryError = null, filters = [];
+      try { summary = await readWorksheetSummary(ws); } catch (e) { summaryError = e; }
+      try { filters = ((await ws.getFiltersAsync()) || []).map(plainFilter); } catch (e) { /* no filters */ }
+      sheets.push({
+        name: ws.name,
+        getSummaryDataAsync: async () => { if (summaryError) throw summaryError; return summary; },
+        getFiltersAsync: async () => filters,
+      });
+    }
+    const objects = (sheet.objects || []).map(o => ({
+      type: o.type, name: o.name, isVisible: o.isVisible !== false,
+      position: o.position ? { x: o.position.x, y: o.position.y } : undefined,
+      size: o.size ? { width: o.size.width, height: o.size.height } : undefined,
+    }));
+    return { dashboard: { name: sheet.name, objects }, sheets };
+  }
+
+  /**
+   * All visible dashboards in tab order: the current one from the Extensions API (live
+   * filters), the others via hidden vizzes. Never throws for a single dashboard — failures
+   * become `notes`, and the export continues with whatever could be read.
+   */
+  async function collectAllDashboards(current, onProgress) {
+    const notes = [];
+    const wb = LOADED_WORKBOOK;
+    if (!wb || !wb.xml) return { targets: [current], notes: ["Other dashboards: load the workbook first."] };
+    const order = dashboardTabOrder(wb.xml);
+    if (!order.includes(current.dashboard.name)) order.unshift(current.dashboard.name);
+    if (order.length === 1) return { targets: [current], notes };
+    if (!wb.id) {
+      return { targets: [current], notes: ["Other dashboards are only available when the workbook is auto-loaded from Tableau Cloud (not from a manual file)."] };
+    }
+
+    let views, libUrl;
+    try {
+      const r = await (await backendFetch(`/workbooks/${encodeURIComponent(wb.id)}/views`)).json();
+      views = r.views || [];
+      libUrl = r.embedLibUrl;
+      if (!libUrl || !views.every(v => v.embedUrl)) throw new Error("backend is outdated — update worker.js");
+      await loadEmbeddingApi(libUrl);
+    } catch (e) {
+      return { targets: [current], notes: [`Other dashboards skipped: ${e.message}`] };
+    }
+
+    const targets = [];
+    const others = order.filter(n => n !== current.dashboard.name);
+    let done = 0, abort = null;
+    for (const name of order) {
+      if (name === current.dashboard.name) { targets.push(current); continue; }
+      done++;
+      if (abort) { notes.push(`"${name}": skipped (${abort})`); continue; }
+      const view = views.find(v => v.name === name);
+      if (!view) { notes.push(`"${name}": not published as a tab — skipped`); continue; }
+      if (onProgress) onProgress(name, done, others.length);
+      let viz = null;
+      try {
+        viz = await openHiddenViz(view.embedUrl, dashboardPixelSize(wb.xml, name));
+        targets.push(await readEmbeddedDashboard(viz));
+      } catch (e) {
+        notes.push(`"${name}": ${e.message}`);
+        if (/sign-in|refused|Embedding API/i.test(e.message)) abort = "same problem as the previous dashboard";
+      } finally {
+        if (viz) viz.remove();
+      }
+    }
+    return { targets, notes };
+  }
 
   /* =============================================================================
    * uniqueExcelSheetName() — a valid, unique Excel sheet name for a dashboard.
@@ -2704,13 +2897,16 @@ if (typeof module !== "undefined" && module.exports) {  // lets you unit-test th
       }
 
       /* =========================================================================
-       * exportToExcel() — one click → ONE .xlsx, ONE sheet per dashboard (Phase 2)
-       * Phase 2 exports the current dashboard; Phase 3 adds the other dashboards
-       * by returning more entries from collectDashboardsToExport().
+       * exportToExcel() — one click → ONE .xlsx, ONE sheet per dashboard
+       * (Phase 2 writer + Phase 3 dashboards from collectDashboardsToExport()).
        * ========================================================================= */
       async function exportToExcel() {
   const btn = document.getElementById("export_button");
+  const btnText = btn.textContent;
   btn.disabled = true;
+  let notes = [];
+  const written = [];
+  showExportStatus("");
 
   try {
     const titleMap = getTitleMap();
@@ -2721,9 +2917,14 @@ if (typeof module !== "undefined" && module.exports) {  // lets you unit-test th
 
     const workbook = new ExcelJS.Workbook();
     const usedSheetNames = new Set();
-    const written = [];
 
-    for (const target of await collectDashboardsToExport()) {
+    const collected = await collectDashboardsToExport((name, i, n) => {
+      btn.textContent = `⏳ Reading "${name}" (${i}/${n})…`;
+    });
+    notes = collected.notes || [];
+    btn.textContent = "⏳ Building Excel…";
+
+    for (const target of collected.targets) {
       const sheetName = uniqueExcelSheetName(target.dashboard.name, usedSheetNames);
       const filterValuesMap = await extractFilterValuesPerField(target.sheets);
       console.log(`📊 [${target.dashboard.name}] Filter values per field:`, filterValuesMap);
@@ -2755,21 +2956,39 @@ if (typeof module !== "undefined" && module.exports) {  // lets you unit-test th
 
     console.log(`✅ Export completed with Tableau formatting (fonts, colours, number formats, borders) — ${written.length} sheet(s): ${written.join(", ")}`);
 
+    showExportStatus(`✅ ${written.length} sheet(s): ${written.join(", ")}`, notes);
+
   } catch (err) {
     console.error("[Export]", err);
+    showExportStatus("", notes);
     alert("Export failed. Check console (F12) for details.\n\n" + err.message);
   } finally {
+    btn.textContent = btnText;
     btn.disabled = false;
   }
 }
 
+      /** Result line under the Export button: what went in, and why anything was left out. */
+      function showExportStatus(summary, notes = []) {
+        notes.forEach(n => console.warn("[Export] " + n));
+        const el = document.getElementById("export_status");
+        if (!el) return;
+        el.textContent = [summary, ...notes.map(n => "⚠️ " + n)].filter(Boolean).join("\n");
+      }
+
       /* -------------------------------------------------------------------------
        * collectDashboardsToExport() — which dashboards go into the file, in tab order.
-       * Phase 2: the dashboard the extension sits on. Phase 3 appends the others
-       * (same shape: { dashboard: {name, objects}, sheets: [worksheet-like] }).
+       * "All dashboards" ticked (default): every visible dashboard in tab order (Phase 3).
+       * Unticked, or Tableau Desktop: only the dashboard the extension sits on.
+       * Returns { targets: [{ dashboard: {name, objects}, sheets: [...] }], notes: [string] }.
        * ------------------------------------------------------------------------- */
-      async function collectDashboardsToExport() {
-        return [{ dashboard, sheets }];
+      async function collectDashboardsToExport(onProgress) {
+        const current = { dashboard, sheets };
+        const allBox = document.getElementById("export_all");
+        const wantAll = allBox ? allBox.checked : true;
+        const env = tableau.extensions.environment || {};
+        if (!wantAll || env.context === "desktop") return { targets: [current], notes: [] };
+        return collectAllDashboards(current, onProgress);
       }
 
       /* -------------------------------------------------------------------------
