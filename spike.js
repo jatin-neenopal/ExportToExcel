@@ -164,7 +164,15 @@ if (typeof window !== "undefined" && window.tableau && window.document) (functio
     if (!c.workerUrl) throw new Error("Worker URL is empty");
     const headers = { ...(init.headers || {}) };
     if (c.spikeKey) headers["X-Spike-Key"] = c.spikeKey;
-    const res = await fetch(c.workerUrl + path, { ...init, headers });
+    const t0 = performance.now();
+    let res;
+    try { res = await fetch(c.workerUrl + path, { ...init, headers }); }
+    catch (e) {
+      const secs = ((performance.now() - t0) / 1000).toFixed(1);
+      throw new Error(`Failed to fetch after ${secs}s — ` + (secs > 90
+        ? "likely a timeout (the tunnel gives up after ~100s); check the receptionist terminal"
+        : "the receptionist or tunnel didn't answer; check both terminals are running"));
+    }
     if (!res.ok) {
       let body = ""; try { body = await res.text(); } catch (e) { /* ignore */ }
       throw new Error(`${res.status} ${path}: ${body.slice(0, 400)}`);
@@ -191,6 +199,7 @@ if (typeof window !== "undefined" && window.tableau && window.document) (functio
       })).json();
       log("S2", "Resolution source", r.source === "metadata" ? "PASS" : "WARN",
         r.source + (r.metadataError ? " (Metadata API error: " + r.metadataError + ")" : "") + `, ${r.ms} ms`);
+      if (r.metadataWarnings && r.metadataWarnings.length) log("S2", "Metadata API notices", "INFO", r.metadataWarnings.join(", ") + " (harmless: results limited to what the PAT user can see)");
       log("S2", "Candidates", "INFO", r.candidates.map(c =>
         `${c.projectName}/${c.workbookName} score=${c.score.toFixed(2)}${c.exact ? " exact" : ""}`).join(" | ") || "none");
       if (r.decision === "unique") {
@@ -198,7 +207,8 @@ if (typeof window !== "undefined" && window.tableau && window.document) (functio
         log("S2", "Decision", "PASS", `unique → ${r.candidates[0].workbookName} (${state.workbookId})`);
       } else if (r.decision === "ambiguous" && r.candidates.length) {
         state.workbookId = r.candidates[0].workbookId;
-        log("S2", "Decision", "WARN", `ambiguous — using top candidate for the remaining spikes; production needs the author-confirm dialog`);
+        const pick = r.candidates[0];
+        log("S2", "Decision", "WARN", `ambiguous (${r.candidates.length} matching workbooks) — using ${pick.projectName}/${pick.workbookName} (${pick.workbookId}) for the remaining spikes; production asks the author once`);
       } else {
         log("S2", "Decision", "FAIL", "no candidate (new workbook? Metadata indexing can lag a few minutes after publish)");
         return false;
@@ -278,6 +288,7 @@ if (typeof window !== "undefined" && window.tableau && window.document) (functio
           (kind === "dashboard" ? " ← check which worksheet this is" : ""));
       } catch (e) { log("S4", `View data: ${v.name}`, "FAIL", e.message); }
     }
+    log("S4", "Finished", "INFO", `${Math.min(views.length, 20)} view(s) tried`);
     return true;
   }
 
@@ -323,7 +334,8 @@ if (typeof window !== "undefined" && window.tableau && window.document) (functio
   async function runS3() {
     const c = cfg();
     const target = $("target_dash").value;
-    if (!state.twb || !target) { log("S3", "Pre-req", "FAIL", "run S1 first and pick another dashboard"); return false; }
+    if (!state.twb) { log("S3", "Pre-req", "FAIL", "run S1 first"); return false; }
+    if (!target) { log("S3", "Pre-req", "INFO", "this workbook has only 1 dashboard — run S3 on a workbook with 2+ dashboards"); return false; }
     let views;
     try { views = await loadViews(); } catch (e) { log("S3", "List views", "FAIL", e.message); return false; }
     const view = views.find(v => v.name === target);
@@ -386,7 +398,10 @@ if (typeof window !== "undefined" && window.tableau && window.document) (functio
     try {
       await saveCfg();
       if (await runS2() && await runS1()) { await runS4(); await runS3(); }
-    } finally { $("run_all").disabled = false; }
+    } finally {
+      $("run_all").disabled = false;
+      log("ALL", "Run all finished", "INFO", "safe to Copy report now");
+    }
   }
 
   function copyReport() {
