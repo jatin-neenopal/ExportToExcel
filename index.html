@@ -130,6 +130,11 @@
     }
     #backend_settings .btn-load { margin-top: 8px; }
 
+    /* ── Export options + result line ── */
+    .export-option { display: flex; align-items: center; gap: 6px; margin: 0 0 8px; font-size: 0.9em; cursor: pointer; }
+    .export-option input { margin: 0; }
+    #export_status { margin-top: 8px; font-size: 0.85em; color: var(--ink-soft); white-space: pre-line; word-break: break-word; }
+
     /* ── Hover tooltip (pure CSS, no markup/JS changes needed) ── */
     .has-tip { position: relative; }
 
@@ -226,9 +231,21 @@
       class="has-tip" + data-tip added only for the CSS hover tooltip below;
       does not affect click handling or any JS lookups.
     -->
+    <!--
+      Ticked (default): every visible dashboard of the workbook, one Excel sheet each.
+      Unticked: only this dashboard (faster). id="export_all" is read by the JS.
+    -->
+    <label class="export-option">
+      <input type="checkbox" id="export_all" checked>
+      All dashboards (one sheet each)
+    </label>
+
     <button id="export_button" class="btn-export has-tip" data-tip="If you modify the default filename, add .xlsx at end (example: Marketing.xlsx)">
-      Export All Worksheets to EXCEL
+      Export to EXCEL
     </button>
+
+    <!-- Result of the last export: sheets written + any dashboard that was skipped and why. -->
+    <div id="export_status" aria-live="polite"></div>
 
   </div>
 
