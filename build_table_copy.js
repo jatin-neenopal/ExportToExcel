@@ -2256,7 +2256,7 @@ if (typeof module !== "undefined" && module.exports) {  // lets you unit-test th
    * The result has the same shape the existing export pipeline already uses:
    *   { dashboard: {name, objects}, sheets: [{ name, getSummaryDataAsync, getFiltersAsync }] }
    * ============================================================================= */
-  const VIZ_LOAD_TIMEOUT_MS = 90000;
+  const VIZ_LOAD_TIMEOUT_MS = (typeof window !== "undefined" && window.TFX_VIZ_TIMEOUT_MS) || 90000;   // window override = tests only
   let LOADED_WORKBOOK = null;            // { id, name, xml } — set by auto-load / manual load
   let EMBED_LIB_PROMISE = null;
 
@@ -2304,20 +2304,35 @@ if (typeof module !== "undefined" && module.exports) {  // lets you unit-test th
     return EMBED_LIB_PROMISE;
   }
 
-  /** Off-screen host: the viz must actually render to become interactive, so not display:none. */
+  /** Debug switch: localStorage.setItem("tfx_debugViz", "1") shows the hidden dashboards on screen. */
+  function debugVizOn() {
+    try { return localStorage.getItem("tfx_debugViz") === "1"; } catch (e) { return false; }
+  }
+
+  /**
+   * Host for the hidden vizzes. It sits INSIDE the visible area but fully transparent:
+   * Chrome pauses rendering of cross-origin frames that are off-screen, and a paused
+   * Tableau viz never becomes interactive — so "off-screen" is not an option.
+   */
   function hiddenVizHost() {
     let host = document.getElementById("tfx_viz_host");
     if (!host) {
       host = document.createElement("div");
       host.id = "tfx_viz_host";
       host.setAttribute("aria-hidden", "true");
-      host.style.cssText = "position:absolute;left:-20000px;top:0;overflow:hidden;";
       document.body.appendChild(host);
     }
+    host.style.cssText = debugVizOn()
+      ? "position:fixed;left:0;top:0;width:100%;height:100%;overflow:auto;z-index:9999;background:#fff;outline:3px dashed #b3261e;"
+      : "position:fixed;left:0;top:0;overflow:hidden;opacity:0;pointer-events:none;";
     return host;
   }
 
-  /** Open one view invisibly; resolves with the <tableau-viz> once it's interactive. */
+  /**
+   * Open one view invisibly; resolves with the <tableau-viz> once it's interactive.
+   * Tracks Tableau's earlier "size known" event so a timeout can say WHICH stage failed:
+   * never loaded (sign-in / cookies / embedding blocked) vs loaded but never finished drawing.
+   */
   function openHiddenViz(embedUrl, size) {
     return new Promise((resolve, reject) => {
       const viz = document.createElement("tableau-viz");
@@ -2326,9 +2341,14 @@ if (typeof module !== "undefined" && module.exports) {  // lets you unit-test th
       viz.setAttribute("hide-tabs", "");
       viz.setAttribute("width", String(size.width));
       viz.setAttribute("height", String(size.height));
+      let sizeKnown = false;
+      viz.addEventListener("firstvizsizeknown", () => { sizeKnown = true; });
       const timer = setTimeout(() => {
         viz.remove();
-        reject(new Error(`didn't open within ${VIZ_LOAD_TIMEOUT_MS / 1000}s (usually a Tableau sign-in / cookie problem)`));
+        const secs = VIZ_LOAD_TIMEOUT_MS / 1000;
+        reject(new Error(sizeKnown
+          ? `loaded but never finished drawing within ${secs}s (browser paused it?)`
+          : `never loaded within ${secs}s — usually a Tableau sign-in/cookie problem, or embedding blocked for this site`));
       }, VIZ_LOAD_TIMEOUT_MS);
       viz.addEventListener("firstinteractive", () => { clearTimeout(timer); resolve(viz); });
       viz.addEventListener("vizloaderror", e => {
@@ -2430,7 +2450,7 @@ if (typeof module !== "undefined" && module.exports) {  // lets you unit-test th
         targets.push(await readEmbeddedDashboard(viz));
       } catch (e) {
         notes.push(`"${name}": ${e.message}`);
-        if (/sign-in|refused|Embedding API/i.test(e.message)) abort = "same problem as the previous dashboard";
+        if (/sign-in|refused|Embedding API|never finished drawing/i.test(e.message)) abort = "same problem as the previous dashboard";
       } finally {
         if (viz) viz.remove();
       }
