@@ -2529,7 +2529,14 @@ if (typeof module !== "undefined" && module.exports) {  // lets you unit-test th
         if (viz) viz.remove();
       }
     }
+    removeHiddenVizHost();
     return { targets, notes };
+  }
+
+  /** Remove the hidden-viz host once reading is done, so nothing (debug view included) covers the extension. */
+  function removeHiddenVizHost() {
+    const host = document.getElementById("tfx_viz_host");
+    if (host) host.remove();
   }
 
   /* =============================================================================
@@ -3057,6 +3064,7 @@ if (typeof module !== "undefined" && module.exports) {  // lets you unit-test th
     showExportStatus("", notes);
     alert("Export failed. Check console (F12) for details.\n\n" + err.message);
   } finally {
+    removeHiddenVizHost();
     btn.textContent = btnText;
     btn.disabled = false;
   }
