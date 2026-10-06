@@ -2310,9 +2310,19 @@ if (typeof module !== "undefined" && module.exports) {  // lets you unit-test th
     return EMBED_LIB_PROMISE;
   }
 
-  /** Debug switch: localStorage.setItem("tfx_debugViz", "1") shows the hidden dashboards on screen. */
+  /**
+   * One-shot debug switch: localStorage.setItem("tfx_debugVizOnce", "1") shows the hidden dashboards
+   * on screen for the NEXT export only, then switches itself off (see clearDebugVizSwitch).
+   * The old persistent key "tfx_debugViz" is ignored and removed, so it can't stay on by accident.
+   */
   function debugVizOn() {
-    try { return localStorage.getItem("tfx_debugViz") === "1"; } catch (e) { return false; }
+    try {
+      localStorage.removeItem("tfx_debugViz");
+      return localStorage.getItem("tfx_debugVizOnce") === "1";
+    } catch (e) { return false; }
+  }
+  function clearDebugVizSwitch() {
+    try { localStorage.removeItem("tfx_debugVizOnce"); localStorage.removeItem("tfx_debugViz"); } catch (e) { /* ignore */ }
   }
 
   /**
@@ -2606,6 +2616,7 @@ if (typeof module !== "undefined" && module.exports) {  // lets you unit-test th
       }
     }
     removeHiddenVizHost();
+    clearDebugVizSwitch();
     return { targets, notes };
   }
 
