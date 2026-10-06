@@ -2261,6 +2261,8 @@ if (typeof module !== "undefined" && module.exports) {  // lets you unit-test th
   const SIGNIN_DETECT_MS = (typeof window !== "undefined" && window.TFX_SIGNIN_DETECT_MS) || 15000;
   // How long the user gets to complete the one-time sign-in.
   const SIGNIN_WAIT_MS = (typeof window !== "undefined" && window.TFX_SIGNIN_WAIT_MS) || 300000;
+  // Upper bound for one live Extensions API read of the current dashboard.
+  const LIVE_READ_TIMEOUT_MS = (typeof window !== "undefined" && window.TFX_LIVE_READ_TIMEOUT_MS) || 120000;
   let LOADED_WORKBOOK = null;            // { id, name, xml } — set by auto-load / manual load
   let EMBED_LIB_PROMISE = null;
 
@@ -2422,6 +2424,39 @@ if (typeof module !== "undefined" && module.exports) {  // lets you unit-test th
     return { dashboard: { name: sheet.name, objects }, sheets };
   }
 
+  /** Rejects with a readable error if `promise` doesn't settle in time (nothing may hang the export). */
+  function withTimeout(promise, ms, what) {
+    let t;
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => { t = setTimeout(() => reject(new Error(`${what} took longer than ${ms / 1000}s`)), ms); }),
+    ]).finally(() => clearTimeout(t));
+  }
+
+  /**
+   * Read the CURRENT dashboard's data and filters up front, through the Extensions API, BEFORE the
+   * Embedding API is loaded. Once embedded vizzes are connected inside this frame, Extensions API
+   * calls can stop getting answers (both libraries talk to Tableau through postMessage), which
+   * left the export stuck on "Building Excel…". Returns the same { dashboard, sheets } shape,
+   * with each sheet answering from the snapshot.
+   */
+  async function snapshotLiveDashboard(current) {
+    const sheets = [];
+    for (const ws of current.sheets) {
+      let summary = null, summaryError = null, filters = [];
+      try { summary = await withTimeout(ws.getSummaryDataAsync(), LIVE_READ_TIMEOUT_MS, `Reading "${ws.name}"`); }
+      catch (e) { summaryError = e; }
+      try { filters = (await withTimeout(ws.getFiltersAsync(), LIVE_READ_TIMEOUT_MS, `Filters of "${ws.name}"`)) || []; }
+      catch (e) { /* export works without filter values */ }
+      sheets.push({
+        name: ws.name,
+        getSummaryDataAsync: async () => { if (summaryError) throw summaryError; return summary; },
+        getFiltersAsync: async () => filters,
+      });
+    }
+    return { dashboard: current.dashboard, sheets };
+  }
+
   /**
    * One-time Tableau sign-in for embedded dashboards.
    * The extension's frame can't reuse the user's normal Tableau login, so Tableau shows its own
@@ -2487,6 +2522,9 @@ if (typeof module !== "undefined" && module.exports) {  // lets you unit-test th
     if (!wb.id) {
       return { targets: [current], notes: ["Other dashboards are only available when the workbook is auto-loaded from Tableau Cloud (not from a manual file)."] };
     }
+
+    // Current dashboard first — before any embedded viz exists in this frame.
+    current = await snapshotLiveDashboard(current);
 
     let views, libUrl;
     try {
