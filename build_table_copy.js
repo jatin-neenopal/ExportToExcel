@@ -2257,6 +2257,10 @@ if (typeof module !== "undefined" && module.exports) {  // lets you unit-test th
    *   { dashboard: {name, objects}, sheets: [{ name, getSummaryDataAsync, getFiltersAsync }] }
    * ============================================================================= */
   const VIZ_LOAD_TIMEOUT_MS = (typeof window !== "undefined" && window.TFX_VIZ_TIMEOUT_MS) || 90000;   // window override = tests only
+  // No "size known" from Tableau within this time = the viz is showing Tableau's sign-in page.
+  const SIGNIN_DETECT_MS = (typeof window !== "undefined" && window.TFX_SIGNIN_DETECT_MS) || 15000;
+  // How long the user gets to complete the one-time sign-in.
+  const SIGNIN_WAIT_MS = (typeof window !== "undefined" && window.TFX_SIGNIN_WAIT_MS) || 300000;
   let LOADED_WORKBOOK = null;            // { id, name, xml } — set by auto-load / manual load
   let EMBED_LIB_PROMISE = null;
 
@@ -2343,16 +2347,27 @@ if (typeof module !== "undefined" && module.exports) {  // lets you unit-test th
       viz.setAttribute("height", String(size.height));
       let sizeKnown = false;
       viz.addEventListener("firstvizsizeknown", () => { sizeKnown = true; });
+      // Signed-out embeds never report a size (Tableau shows its sign-in page instead).
+      const signInTimer = setTimeout(() => {
+        if (sizeKnown) return;
+        clearTimeout(timer);
+        viz.remove();
+        const err = new Error("needs Tableau sign-in");
+        err.code = "SIGN_IN_NEEDED";
+        reject(err);
+      }, SIGNIN_DETECT_MS);
       const timer = setTimeout(() => {
+        clearTimeout(signInTimer);
         viz.remove();
         const secs = VIZ_LOAD_TIMEOUT_MS / 1000;
         reject(new Error(sizeKnown
           ? `loaded but never finished drawing within ${secs}s (browser paused it?)`
           : `never loaded within ${secs}s — usually a Tableau sign-in/cookie problem, or embedding blocked for this site`));
       }, VIZ_LOAD_TIMEOUT_MS);
-      viz.addEventListener("firstinteractive", () => { clearTimeout(timer); resolve(viz); });
+      viz.addEventListener("firstinteractive", () => { clearTimeout(timer); clearTimeout(signInTimer); resolve(viz); });
       viz.addEventListener("vizloaderror", e => {
         clearTimeout(timer);
+        clearTimeout(signInTimer);
         viz.remove();
         let detail = e && e.detail;
         try { detail = JSON.stringify(detail); } catch (x) { /* keep as is */ }
@@ -2408,6 +2423,56 @@ if (typeof module !== "undefined" && module.exports) {  // lets you unit-test th
   }
 
   /**
+   * One-time Tableau sign-in for embedded dashboards.
+   * The extension's frame can't reuse the user's normal Tableau login, so Tableau shows its own
+   * "Sign in to Tableau Cloud" button inside the embedded view. We show that view (with a short
+   * explanation) and wait until it becomes interactive = signed in. Resolves true / false (skipped).
+   */
+  function promptTableauSignIn(embedUrl) {
+    return new Promise(resolve => {
+      const overlay = document.createElement("div");
+      overlay.id = "tfx_signin";
+      overlay.style.cssText = "position:fixed;inset:0;z-index:10000;background:#fff;display:flex;flex-direction:column;";
+      const bar = document.createElement("div");
+      bar.style.cssText = "display:flex;gap:8px;align-items:center;padding:8px 10px;border-bottom:1px solid #dfe6e2;font-size:12px;line-height:1.4;";
+      const msg = document.createElement("div");
+      msg.style.flex = "1";
+      msg.textContent = "To export the other dashboards, Tableau needs you to sign in once. Click \u201cSign in to Tableau Cloud\u201d below.";
+      const skip = document.createElement("button");
+      skip.className = "btn-load";
+      skip.style.width = "auto";
+      skip.textContent = "Skip";
+      bar.appendChild(msg);
+      bar.appendChild(skip);
+      const box = document.createElement("div");
+      box.style.cssText = "flex:1;min-height:0;overflow:auto;";
+      overlay.appendChild(bar);
+      overlay.appendChild(box);
+      document.body.appendChild(overlay);
+
+      const viz = document.createElement("tableau-viz");
+      viz.setAttribute("src", embedUrl);
+      viz.setAttribute("toolbar", "hidden");
+      viz.setAttribute("hide-tabs", "");
+      viz.setAttribute("width", String(Math.max(300, box.clientWidth || 0)));
+      viz.setAttribute("height", String(Math.max(300, box.clientHeight || 0)));
+
+      let finished = false;
+      const finish = ok => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        overlay.remove();
+        resolve(ok);
+      };
+      const timer = setTimeout(() => finish(false), SIGNIN_WAIT_MS);
+      viz.addEventListener("firstinteractive", () => finish(true));
+      skip.addEventListener("click", () => finish(false));
+      box.appendChild(viz);
+    });
+  }
+
+  /**
    * All visible dashboards in tab order: the current one from the Extensions API (live
    * filters), the others via hidden vizzes. Never throws for a single dashboard — failures
    * become `notes`, and the export continues with whatever could be read.
@@ -2446,7 +2511,16 @@ if (typeof module !== "undefined" && module.exports) {  // lets you unit-test th
       if (onProgress) onProgress(name, done, others.length);
       let viz = null;
       try {
-        viz = await openHiddenViz(view.embedUrl, dashboardPixelSize(wb.xml, name));
+        const size = dashboardPixelSize(wb.xml, name);
+        try {
+          viz = await openHiddenViz(view.embedUrl, size);
+        } catch (e) {
+          if (e.code !== "SIGN_IN_NEEDED") throw e;
+          if (onProgress) onProgress(name, done, others.length, "signin");
+          if (!(await promptTableauSignIn(view.embedUrl))) throw new Error("Tableau sign-in was skipped");
+          if (onProgress) onProgress(name, done, others.length);
+          viz = await openHiddenViz(view.embedUrl, size);       // signed in now → open hidden again
+        }
         targets.push(await readEmbeddedDashboard(viz));
       } catch (e) {
         notes.push(`"${name}": ${e.message}`);
@@ -2938,8 +3012,8 @@ if (typeof module !== "undefined" && module.exports) {  // lets you unit-test th
     const workbook = new ExcelJS.Workbook();
     const usedSheetNames = new Set();
 
-    const collected = await collectDashboardsToExport((name, i, n) => {
-      btn.textContent = `⏳ Reading "${name}" (${i}/${n})…`;
+    const collected = await collectDashboardsToExport((name, i, n, stage) => {
+      btn.textContent = stage === "signin" ? "🔐 Waiting for Tableau sign-in…" : `⏳ Reading "${name}" (${i}/${n})…`;
     });
     notes = collected.notes || [];
     btn.textContent = "⏳ Building Excel…";
