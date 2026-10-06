@@ -107,7 +107,7 @@ const FORMAT_CONFIG = {
   tableauFontSubstitute: "Arial",
   writeNativeNumbers: true,       // write real numbers + Excel numFmt instead of text
   applyFallbackHeatmap: false,    // old red/green heatmap when Tableau has no color (not in Tableau → off)
-  chartPolicy: "skip",            // charts on the dashboard: "skip" | "data" (export their data as a plain table)
+  chartPolicy: "data",            // charts on the dashboard: "data" (export their data as a crosstab table) | "skip"
   groupOverflowRows: true,        // collapse rows beyond ROW_GROUP_THRESHOLD into an expandable [+]/[-] group
   autoFilter: "largest",          // Excel allows ONE autofilter per sheet: "largest" table | "none"
   textBoxHeaders: true,           // use dashboard text boxes as column headers – only when they line up exactly with the table
@@ -2424,6 +2424,44 @@ if (typeof module !== "undefined" && module.exports) {  // lets you unit-test th
     return { dashboard: { name: sheet.name, objects }, sheets };
   }
 
+  /**
+   * Loading screen over the extension while other dashboards are read. The hidden vizzes sit
+   * underneath it (they must stay on screen for Chrome to render them), so the user sees progress
+   * instead of dashboards flashing by. The debug view and the sign-in panel sit above it.
+   */
+  function showExportOverlay(title, detail) {
+    if (!document.getElementById("tfx_loading_css")) {
+      const css = document.createElement("style");
+      css.id = "tfx_loading_css";
+      css.textContent =
+        "#tfx_loading{position:fixed;inset:0;z-index:9000;background:#fff;display:flex;flex-direction:column;" +
+        "align-items:center;justify-content:center;gap:10px;padding:16px;text-align:center;" +
+        "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#1c2b26;}" +
+        "#tfx_loading .tfx-spin{width:28px;height:28px;border:3px solid #dfe6e2;border-top-color:#1c7a4d;" +
+        "border-radius:50%;animation:tfxspin .8s linear infinite;}" +
+        "#tfx_loading .tfx-title{font-size:13px;font-weight:600;}" +
+        "#tfx_loading .tfx-detail{font-size:11px;color:#5b6b65;max-width:260px;line-height:1.4;}" +
+        "@keyframes tfxspin{to{transform:rotate(360deg)}}";
+      document.head.appendChild(css);
+    }
+    let overlay = document.getElementById("tfx_loading");
+    if (!overlay) {
+      overlay = document.createElement("div");
+      overlay.id = "tfx_loading";
+      overlay.setAttribute("role", "status");
+      overlay.setAttribute("aria-live", "polite");
+      overlay.innerHTML = '<div class="tfx-spin"></div><div class="tfx-title"></div><div class="tfx-detail"></div>';
+      document.body.appendChild(overlay);
+    }
+    overlay.querySelector(".tfx-title").textContent = title;
+    overlay.querySelector(".tfx-detail").textContent = detail || "";
+  }
+
+  function hideExportOverlay() {
+    const overlay = document.getElementById("tfx_loading");
+    if (overlay) overlay.remove();
+  }
+
   /** Rejects with a readable error if `promise` doesn't settle in time (nothing may hang the export). */
   function withTimeout(promise, ms, what) {
     let t;
@@ -3058,10 +3096,17 @@ if (typeof module !== "undefined" && module.exports) {  // lets you unit-test th
     const usedSheetNames = new Set();
 
     const collected = await collectDashboardsToExport((name, i, n, stage) => {
-      btn.textContent = stage === "signin" ? "🔐 Waiting for Tableau sign-in…" : `⏳ Reading "${name}" (${i}/${n})…`;
+      if (stage === "signin") {
+        btn.textContent = "🔐 Waiting for Tableau sign-in…";
+        hideExportOverlay();                       // the sign-in panel needs to be seen
+        return;
+      }
+      btn.textContent = `⏳ Reading "${name}" (${i}/${n})…`;
+      showExportOverlay(`Reading dashboard ${i} of ${n}`, `"${name}" — opening it in the background to read its tables.`);
     });
     notes = collected.notes || [];
     btn.textContent = "⏳ Building Excel…";
+    if (collected.targets.length > 1) showExportOverlay("Building Excel…", `${collected.targets.length} dashboards, one sheet each.`);
 
     for (const target of collected.targets) {
       const sheetName = uniqueExcelSheetName(target.dashboard.name, usedSheetNames);
@@ -3103,6 +3148,7 @@ if (typeof module !== "undefined" && module.exports) {  // lets you unit-test th
     alert("Export failed. Check console (F12) for details.\n\n" + err.message);
   } finally {
     removeHiddenVizHost();
+    hideExportOverlay();
     btn.textContent = btnText;
     btn.disabled = false;
   }
