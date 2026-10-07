@@ -10,7 +10,8 @@
  *     Tableau sign-in, and ONE Excel sheet per dashboard.
  *
  * Each "═══ <path> ═══" banner below starts one of the original modules (same names, same order as the
- * module tree, so a change can be traced back to it). Sections that belong to the merge:
+ * module tree, so a change can be traced back to it). The src/ modules are folded in up to "Donut centre
+ * totals and waterfall grand totals" (eab0bfb); this file is now the only source. Sections that belong to the merge:
  *   cloud/backend.js      auto-load from Tableau Cloud (Advanced → Backend URL)
  *   cloud/dashboards.js   the other dashboards (hidden views, sign-in, progress screen, sheet names)
  *   ui/workbook-store.js  applyWorkbookXml(): manual 📁 load and auto-load share one path
@@ -1696,7 +1697,7 @@ function tfCalcInfo(calc) {
 
 /* Raise when the parser reads something new: a workbook model remembered by an older version is then
    parsed again from its stored XML (ui/workbook-store.js), so an update reaches workbooks loaded before it. */
-const FORMAT_MODEL_VERSION = 4;
+const FORMAT_MODEL_VERSION = 5;
 
 /** @param {string} xmlString the .twb XML @returns {FormatModel} */
 function parseTableauFormatting(xmlString) {
@@ -1746,6 +1747,9 @@ function parseTableauFormatting(xmlString) {
       style: tfParseStyle(table && tfKid(table, "style")),
       rows: tfExtractRefs(table && tfKid(table, "rows") && tfKid(table, "rows").textContent),
       cols: tfExtractRefs(table && tfKid(table, "cols") && tfKid(table, "cols").textContent),
+      // Analysis → Totals → Show Row / Column Grand Totals (<rows total='true'> / <cols total='true'>)
+      grandTotals: { rows: !!(table && tfKid(table, "rows") && tfKid(table, "rows").getAttribute("total") === "true"),
+                     cols: !!(table && tfKid(table, "cols") && tfKid(table, "cols").getAttribute("total") === "true") },
       panes: [], fieldRefs: []
     };
     const view = table && tfKid(table, "view");
@@ -2147,8 +2151,27 @@ function tvCategories(vm, catCis, sortNative) {
   return {
     count: order.length,
     levels: (catCis.length ? catCis : [null]).map((_, l) => order.map(o => catCis.length ? shown[l](o.labels[l], o.dvs[l]) : o.labels[l])),
+    dvs: order.map(o => o.dvs || []),
     indexOf: row => index.get(catCis.map(ci => tvText(row[ci])).join("\u0001"))
   };
+}
+
+/**
+ * A continuous date on the category axis is a time axis in Tableau (ticks at whole years, quarters, months …): the
+ * categories' dates as Excel serials and the step between marks, or null when a category is not a date.
+ * @param {{ dvs?: DataValue[][] }} cats @returns {{ serials: number[], base: "days" | "months" | "years" } | null}
+ */
+function tvDateAxis(cats) {
+  const dvs = (cats.dvs || []).map(d => d[0]);
+  const isDate = dv => { const v = dv && (dv.nativeValue !== undefined ? dv.nativeValue : dv.value); return v instanceof Date || typeof v === "string"; };
+  if (dvs.length < 2 || !dvs.every(isDate)) return null;
+  // Tableau's dates arrive at midnight, sometimes in local time: the nearest whole day
+  const serials = dvs.map(dv => { const s = tvExcelSerial(dv); return s === null ? null : Math.round(s); });
+  if (serials.some(s => s === null)) return null;
+  const gaps = serials.slice(1).map((s, i) => s - /** @type {number} */ (serials[i]));
+  if (gaps.some(g => g <= 0)) return null;
+  const step = Math.min(...gaps);
+  return { serials: /** @type {number[]} */ (serials), base: step >= 365 ? "years" : step >= 28 ? "months" : "days" };
 }
 
 /**
@@ -2242,7 +2265,8 @@ function tvReferenceLabelFormat(rl, valueFmt) {
 /**
  * Adds the worksheet's reference lines (table / pane scope) on the value axis: a flat line series on a
  * vertical value axis, or spec.refLines for horizontal bars (the writer draws those across the bars).
- * Lines per cell are Tableau's per-mark ticks – not drawn.
+ * Lines per cell are Tableau's per-mark ticks – not drawn. Across horizontal bars on two axes a line is left
+ * out and named in the conversion report: the writer would need a third axis group, and Excel cannot open that.
  * @param {ChartSpec} spec @param {ChartContext} ctx
  */
 function tvApplyReferenceLines(spec, ctx) {
@@ -2270,6 +2294,8 @@ function tvApplyReferenceLines(spec, ctx) {
   const style = fmt.reflineStyle();
   const hidden = style.lineVisible === false || style.strokeSize === 0;
   const valueFmt = (style.numFmtRaw && tableauToExcelNumFmt(style.numFmtRaw)) || spec.numFmt || "General";
+  const twoAxes = spec.series.some(s => s.secondary);
+  let left = 0;
   lines.forEach(rl => {
     if (rl.axis && measures.length && !measures.some(m => tfSameField(m, rl.axis))) return;   // another measure's axis
     const data = seriesOf(rl);
@@ -2278,15 +2304,23 @@ function tvApplyReferenceLines(spec, ctx) {
     const labelFmt = tvReferenceLabelFormat(rl, valueFmt);
     if (hidden && !labelFmt) return;
     /** @type {RefLineStyle} */
-    const line = { value, labelFmt, color: style.strokeColor ? style.strokeColor.slice(2) : "7F7F7F", alpha: style.strokeAlpha ?? 1,
+    const line = { value, labelFmt, name: labelFmt ? tfFormatNumber(value, labelFmt) : "Reference line",
+                   color: style.strokeColor ? style.strokeColor.slice(2) : "7F7F7F", alpha: style.strokeAlpha ?? 1,
                    width: style.strokeSize || 1, dash: style.dash === "dashed", hidden,
                    font: { color: style.color ? style.color.slice(2) : undefined, bold: style.bold } };
-    if (spec.barDir === "bar" && data.some(s => (s.type || spec.kind) === "bar")) (spec.refLines = spec.refLines || []).push(line);
+    if (spec.barDir === "bar" && data.some(s => (s.type || spec.kind) === "bar")) {
+      if (twoAxes) left++; else (spec.refLines = spec.refLines || []).push(line);
+    }
     // drawn on its measure's axis: on a dual-axis chart that may be the secondary one
-    else spec.series.push({ name: (labelFmt || "Reference line").replace(/"/g, ""), type: "line", color: line.color, line: !hidden,
+    else spec.series.push({ name: line.name, type: "line", color: line.color, line: !hidden,
                             ...(data.length && data.every(s => s.secondary) ? { secondary: true } : {}),
                             marker: false, labels: false, values: spec.categories.levels[0].map(() => value), refLine: line });
   });
+  if (left) {
+    const c = spec.conversion;
+    const note = `reference line${left > 1 ? "s" : ""} left out: Excel cannot draw ${left > 1 ? "them" : "one"} across horizontal bars on two axes`;
+    spec.conversion = { ...c, strategy: "APPROXIMATE", note: c && c.note ? `${c.note}; ${note}` : note };
+  }
 }
 
 
@@ -2592,6 +2626,8 @@ function tvCartesianSpecs(ctx) {
   if (cats.count > TV_MAX_POINTS) throw new Error(`${cats.count} categories – too many for an Excel chart`);
   const categoryTitle = fieldLabels && catDims.length ? catDims.map(d => tvMeasureLabel(vm, d.ci)).join(" / ") : "";
   const categories = { names: catDims.length ? catDims.map(d => tvMeasureLabel(vm, d.ci)) : [mnCategory ? "Measure Names" : ""], levels: cats.levels };
+  // one continuous date across the chart: an Excel date axis, labelled at whole years / months like Tableau's
+  const dateAxis = !horizontal && !mnCategory && catDims.length === 1 && catDims[0].continuous ? tvDateAxis(cats) : null;
 
   // per-category colours: colour = a category level, or a continuous measure
   let pointColors;
@@ -2679,7 +2715,7 @@ function tvCartesianSpecs(ctx) {
     // bottom → reversed (bars across keep the legend's order from the axis outwards)
     const ordered = paneBreaks(stacked && !horizontal ? [...series].reverse() : series);
     const spec = { ...tvBaseSpec(vm), kind, barDir: horizontal ? "bar" : "col", stacked,
-                   categories, categoryTitle, legend: series.length > 1, series: ordered, ...extra };
+                   categories, categoryTitle, legend: series.length > 1, series: ordered, ...(dateAxis ? { dateAxis } : {}), ...extra };
     if (percent) {
       spec.percent = true;
       if (!/%/.test(spec.numFmt || "")) spec.numFmt = "0%";
@@ -3703,6 +3739,10 @@ function buildPieSpec(fmt, summary, opts = {}) {
   // this layer's rows are the ones where its own axis measure has a value
   const axisCol = fmt.axisRefs().length === 1 ? colFor(fmt.axisRefs()[0]) : -1;
   if (axisCol >= 0) marks = marks.filter(({ r }) => !tfIsNull(r[axisCol]));
+  // both layers on one axis measure (MIN(0) twice): the other layer's rows are the ones without this layer's
+  // colour member – a donut's hole total comes back as Country = Null
+  const enc0 = fmt.colorEncoding(), ci0 = enc0 && !enc0.continuous ? colFor(enc0.ref) : -1;
+  if (axisCol >= 0 && ci0 >= 0 && marks.some(({ r }) => !tfIsNull(r[ci0]))) marks = marks.filter(({ r }) => !tfIsNull(r[ci0]));
   if (vi >= 0) marks = marks.filter(({ r }) => { const v = tfDvNum(r[vi]); return v !== null && v > 0; });   // Tableau drops null / ≤ 0 wedges
   if (!marks.length) return null;
 
@@ -3795,7 +3835,11 @@ function buildHoleSpec(fmt, pie) {
   const shown = fmt.markLabelsShown(), tpl = fmt.labelRunsTemplate();
   const ax = fmt.axisRefs()[0];
   const ai = ax ? pie.columns.findIndex(c => c.ref && tfSameField(c.ref, ax)) : -1;
-  const own = new Map(ai >= 0 ? pie.data.filter(r => !tfIsNull(r[ai])).map(r => [pie.paneOf(r), r]) : []);
+  // the hole's own row: one the slices don't use (on one shared axis measure every row has an axis value)
+  const sliceRows = new Set(pie.points.map(p => p.row));
+  const axisRows = ai >= 0 ? pie.data.filter(r => !tfIsNull(r[ai])) : [];
+  const spare = axisRows.filter(r => !sliceRows.has(pie.data.indexOf(r)));
+  const own = new Map((spare.length ? spare : axisRows).map(r => [pie.paneOf(r), r]));
   const valueOf = pts => ref => {
     const k = pie.columns.findIndex(c => c.ref && tfSameField(c.ref, ref));
     if (k < 0) return "";
@@ -4223,6 +4267,17 @@ function tvWaterfallSpec(ctx) {
     { name: label + " (increase)", type: "bar", values: up, color: markColor, pointColors: stepColors, labels: labels && !above },
     { name: label + " (decrease)", type: "bar", values: down, color: markColor, pointColors: stepColors, labels: labels && !above, labelNumFmt: downFmt }
   ];
+  // Analysis → Totals → Show Grand Totals on the category shelf: Tableau ends with a full bar from zero to the
+  // final running total (drawn in grey)
+  const catShelf = valueShelf === "rows" ? "cols" : "rows";
+  const totals = vm.fmt.sheetModel && vm.fmt.sheetModel.grandTotals && vm.fmt.sheetModel.grandTotals[catShelf];
+  if (totals && running.length) {
+    const n = running.length;
+    series.forEach(s => { s.values = [...s.values, null]; if (s.pointColors) s.pointColors = [...s.pointColors, null]; });
+    series.push({ name: "Grand Total", type: "bar", values: [...Array(n).fill(null), prev], color: "9E9E9E", labels: labels && !above });
+    cats.levels = cats.levels.map((lv, i) => [...lv, i === 0 ? "Grand Total" : ""]);
+    ends.push(prev); labelValues.push(labelCi === measure.ci ? prev : null);
+  }
   if (above) {
     series.push({ name: label + " (labels)", type: "line", values: ends, color: null, line: false, marker: false, labels: true,
                   labelTexts: labelValues.map(v => v === null ? "" : tfFormatNumber(v, labelFmt)) });
@@ -4520,8 +4575,9 @@ function buildExcelChartSpecs(visualModel, model) {
   } else {
     specs = tvCartesianSpecs(ctx);
   }
-  specs.forEach(s => { s.name = visualModel.metadata.worksheetName; s.rolesSource = roles.source; tvApplyWorkbookAxes(s, ctx); tvApplyReferenceLines(s, ctx);
-                       tvNoteApproximations(s, ctx); });
+  // reference lines last: a line Excel cannot draw adds its note to the conversion the approximations named
+  specs.forEach(s => { s.name = visualModel.metadata.worksheetName; s.rolesSource = roles.source; tvApplyWorkbookAxes(s, ctx); tvNoteApproximations(s, ctx);
+                       tvApplyReferenceLines(s, ctx); });
   return specs;
 }
 
@@ -8509,8 +8565,12 @@ function writeChartData(ws, spec, startRow) {
   const starts = spec.kind === "treemap" ? levels.map(lv => lv.map(() => true)) : levelStarts(levels);
   spec.categories.names.forEach((name, l) => put(startRow, l, name || ""));
   spec.series.forEach((s, k) => put(startRow, L + k, s.name));
+  // a date axis reads real dates
+  const dates = spec.dateAxis ? spec.dateAxis.serials : null;
+  const dateFmt = spec.dateAxis && { years: "yyyy", months: "mmm yyyy", days: "d mmm yyyy" }[spec.dateAxis.base];
   for (let i = 0; i < N; i++) {
-    for (let l = 0; l < L; l++) if (l === L - 1 || starts[l][i]) put(startRow + 1 + i, l, levels[l][i]);
+    if (dates) put(startRow + 1 + i, 0, dates[i], dateFmt);
+    else for (let l = 0; l < L; l++) if (l === L - 1 || starts[l][i]) put(startRow + 1 + i, l, levels[l][i]);
     spec.series.forEach((s, k) => {
       const v = num(s.values[i]);
       if (v !== null) put(startRow + 1 + i, L + k, v, s.secondary ? spec.secondaryNumFmt : spec.numFmt);
@@ -8583,8 +8643,13 @@ function serTx(ref, name) {
 }
 
 /** @param {string} ref @param {any[][]} levels @param {string[] | null} [shown] labels shown instead (Tableau's
- * truncated headers): written into the chart, as Excel re-reads linked category cells when it opens the file */
-function catXml(ref, levels, shown = null) {
+ * truncated headers): written into the chart, as Excel re-reads linked category cells when it opens the file
+ * @param {{ serials: number[] } | null} [dates] a date axis: the dates as serials */
+function catXml(ref, levels, shown = null, dates = null) {
+  if (dates) {
+    return `<c:cat><c:numRef><c:f>${esc(ref)}</c:f><c:numCache><c:formatCode>yyyy\\-mm\\-dd</c:formatCode><c:ptCount val="${dates.serials.length}"/>` +
+      dates.serials.map((v, i) => `<c:pt idx="${i}"><c:v>${v}</c:v></c:pt>`).join("") + `</c:numCache></c:numRef></c:cat>`;
+  }
   if (shown && levels.length <= 1) return `<c:cat><c:strLit>${strCache(shown)}</c:strLit></c:cat>`;
   if (levels.length <= 1) {
     return `<c:cat><c:strRef><c:f>${esc(ref)}</c:f><c:strCache>${strCache(levels[0] || [])}</c:strCache></c:strRef></c:cat>`;
@@ -8663,7 +8728,7 @@ function refLineLabel(spec, rl, pos, valueFlag = "showVal", idx = 0) {
 function refLineXY(spec, rl, k) {
   const lit = vals => `<c:numLit><c:formatCode>General</c:formatCode><c:ptCount val="${vals.length}"/>` +
     vals.map((v, i) => `<c:pt idx="${i}"><c:v>${v}</c:v></c:pt>`).join("") + `</c:numLit>`;
-  return `<c:ser><c:idx val="${k}"/><c:order val="${k}"/><c:tx><c:v>${esc((rl.labelFmt || "Reference line").replace(/"/g, ""))}</c:v></c:tx>` +
+  return `<c:ser><c:idx val="${k}"/><c:order val="${k}"/><c:tx><c:v>${esc(rl.name)}</c:v></c:tx>` +
     `<c:spPr>${refLineLn(rl)}</c:spPr><c:marker><c:symbol val="none"/></c:marker>${refLineLabel(spec, rl, "r", "showCatName")}` +
     `<c:xVal>${lit([rl.value, rl.value])}</c:xVal><c:yVal>${lit([0, 1])}</c:yVal><c:smooth val="0"/></c:ser>`;
 }
@@ -8718,6 +8783,7 @@ function niceUnit(range, ticks) {
  * The primary value axis as Tableau draws it: ticks at the workbook's spacing, else a "nice" step about every
  * 55 px (110 px across); the range starts at zero (without "Include zero": at a tick below the data) and ends
  * just past the data, so no empty tick sits above the marks. Stacked bars / areas count as their totals.
+ * Synchronized axes always get an explicit range: the secondary axis is pinned to it.
  * @param {ChartSpec} spec @param {{ w: number, h: number } | null} axisPlot approximate plot area in px
  * @returns {{ fixed: { min?: number, max?: number }, unit: number | null }}
  */
@@ -8757,7 +8823,7 @@ function valueRange(spec, axisPlot) {
   };
   // the workbook's spacing, unless it would crowd the axis with ticks (data far beyond what it was set for)
   const spacing = span => spec.valueMajorUnit && span / spec.valueMajorUnit <= 40 ? spec.valueMajorUnit : null;
-  if (!vals.length || pinned || !(ticks || spec.includeZero === false || (spec.refLines && spec.refLines.length))) {
+  if (!vals.length || pinned || !(ticks || spec.includeZero === false || spec.secondarySync || (spec.refLines && spec.refLines.length))) {
     const span = pinned ? fixed.max - fixed.min : 0;
     const unit = pinned ? spacing(span) || niceUnit(span, ticks || 5) : spec.valueMajorUnit || null;
     return { fixed, unit: settle(fixed, unit) };
@@ -8798,12 +8864,12 @@ function seriesXml(spec, s, k, refs, type, hiddenLabels) {
       `<c:spPr>${solid(c, opacity)}<a:ln><a:noFill/></a:ln></c:spPr></c:dPt>` : "").join("");
     const pos = spec.labelPos || (spec.stacked ? null : "outEnd");
     return `<c:ser>${head}<c:spPr>${solid(s.color, opacity)}<a:ln><a:noFill/></a:ln></c:spPr><c:invertIfNegative val="0"/>` +
-      `${dpts}${dLbls(spec, s, pos)}${catXml(refs.cat, levels, spec.categoryShown)}${valXml("val", r.val, s.values)}${labelRangeXml(s, r)}</c:ser>`;
+      `${dpts}${dLbls(spec, s, pos)}${catXml(refs.cat, levels, spec.categoryShown, spec.dateAxis)}${valXml("val", r.val, s.values)}${labelRangeXml(s, r)}</c:ser>`;
   }
   if (type === "line" && s.refLine) {         // reference line: flat, no markers; label above the 2nd point, as Tableau's
     const at = Math.min(1, Math.max(0, (s.values || []).length - 1));
     return `<c:ser>${head}<c:spPr>${refLineLn(s.refLine)}</c:spPr><c:marker><c:symbol val="none"/></c:marker>` +
-      `${refLineLabel(spec, s.refLine, "t", "showVal", at)}${catXml(refs.cat, levels, spec.categoryShown)}${valXml("val", r.val, s.values)}<c:smooth val="0"/></c:ser>`;
+      `${refLineLabel(spec, s.refLine, "t", "showVal", at)}${catXml(refs.cat, levels, spec.categoryShown, spec.dateAxis)}${valXml("val", r.val, s.values)}<c:smooth val="0"/></c:ser>`;
   }
   if (type === "line") {
     const lineSp = s.line === false ? `<a:ln w="28575"><a:noFill/></a:ln>`
@@ -8812,17 +8878,17 @@ function seriesXml(spec, s, k, refs, type, hiddenLabels) {
     const size = s.markerSize || 7;
     const dpts = s.marker ? pc.map((c, i) => c ? `<c:dPt><c:idx val="${i}"/>${markerXml(symbol, c, size)}<c:bubble3D val="0"/></c:dPt>` : "").join("") : "";
     return `<c:ser>${head}<c:spPr>${lineSp}</c:spPr>${markerXml(symbol, s.color, size)}${dpts}` +
-      `${dLbls(spec, s, "t", hiddenLabels)}${catXml(refs.cat, levels, spec.categoryShown)}${valXml("val", r.val, s.values)}<c:smooth val="0"/>${labelRangeXml(s, r)}</c:ser>`;
+      `${dLbls(spec, s, "t", hiddenLabels)}${catXml(refs.cat, levels, spec.categoryShown, spec.dateAxis)}${valXml("val", r.val, s.values)}<c:smooth val="0"/>${labelRangeXml(s, r)}</c:ser>`;
   }
   if (type === "area") {
     return `<c:ser>${head}<c:spPr>${solid(s.color, opacity !== null || s.alpha !== undefined ? opacity : spec.stacked ? null : 75000)}<a:ln><a:noFill/></a:ln></c:spPr>` +
-      `${dLbls(spec, s, null)}${catXml(refs.cat, levels, spec.categoryShown)}${valXml("val", r.val, s.values)}</c:ser>`;
+      `${dLbls(spec, s, null)}${catXml(refs.cat, levels, spec.categoryShown, spec.dateAxis)}${valXml("val", r.val, s.values)}</c:ser>`;
   }
   if (type === "pie") {
     const dpts = pc.map((c, i) => `<c:dPt><c:idx val="${i}"/><c:bubble3D val="0"/>` +
       `<c:spPr>${solid(c || s.color)}${line("FFFFFF", 12700)}</c:spPr></c:dPt>`).join("");
     return `<c:ser>${head}${dpts}${dLbls(spec, s, spec.kind === "pie" ? "bestFit" : null)}` +
-      `${catXml(refs.cat, levels, spec.categoryShown)}${valXml("val", r.val, s.values)}${labelRangeXml(s, r)}</c:ser>`;
+      `${catXml(refs.cat, levels, spec.categoryShown, spec.dateAxis)}${valXml("val", r.val, s.values)}${labelRangeXml(s, r)}</c:ser>`;
   }
   if (type === "bubble") {
     // packed bubbles: opaque with a white outline like Tableau; map marks slightly see-through
@@ -8847,6 +8913,7 @@ function seriesXml(spec, s, k, refs, type, hiddenLabels) {
 
 /** @param {ChartSpec} spec @param {number} id @param {number} cross @param {{ deleted?: boolean, rot?: number }} [o] rot: label rotation (60000ths of a degree) */
 function catAxis(spec, id, cross, o = {}) {
+  if (spec.dateAxis) return dateAxisXml(spec, id, cross, o);
   const horizontal = spec.barDir === "bar";
   const multi = spec.categories && spec.categories.levels.length > 1;
   return `<c:catAx><c:axId val="${id}"/><c:scaling><c:orientation val="${horizontal ? "maxMin" : "minMax"}"/></c:scaling>` +
@@ -8856,6 +8923,45 @@ function catAxis(spec, id, cross, o = {}) {
     `<c:tickLblPos val="${o.deleted ? "none" : spec.valueReversed ? "nextTo" : "low"}"/><c:spPr>${spec.axisLine === false ? "<a:ln><a:noFill/></a:ln>" : line("D4D4D4", 9525)}</c:spPr>${txPr(spec.font, { rot: o.rot })}` +
     `<c:crossAx val="${cross}"/><c:crosses val="${spec.valueReversed && !o.deleted ? "max" : "autoZero"}"/><c:auto val="1"/><c:lblAlgn val="ctr"/>` +
     `<c:lblOffset val="100"/>${o.rot !== undefined ? '<c:tickLblSkip val="1"/>' : ""}<c:noMultiLvlLbl val="${multi ? 0 : 1}"/></c:catAx>`;
+}
+
+/** a continuous date axis: Excel's date axis, its labels as far apart as dateTicks found room for
+ * @param {ChartSpec} spec @param {number} id @param {number} cross @param {{ deleted?: boolean, rot?: number }} o */
+function dateAxisXml(spec, id, cross, o) {
+  const t = spec.dateTicks || { majorUnit: 1, majorTimeUnit: "years", numFmt: "yyyy" };
+  return `<c:dateAx><c:axId val="${id}"/><c:scaling><c:orientation val="minMax"/></c:scaling>` +
+    `<c:delete val="${o.deleted ? 1 : 0}"/><c:axPos val="b"/>${o.deleted ? "" : title(spec.categoryTitle, spec.font, false)}` +
+    `<c:numFmt formatCode="${esc(t.numFmt)}" sourceLinked="0"/><c:majorTickMark val="none"/><c:minorTickMark val="none"/>` +
+    `<c:tickLblPos val="${o.deleted ? "none" : spec.valueReversed ? "nextTo" : "low"}"/><c:spPr>${spec.axisLine === false ? "<a:ln><a:noFill/></a:ln>" : line("D4D4D4", 9525)}</c:spPr>${txPr(spec.font, { rot: o.rot })}` +
+    `<c:crossAx val="${cross}"/><c:crosses val="${spec.valueReversed && !o.deleted ? "max" : "autoZero"}"/><c:auto val="0"/><c:lblOffset val="100"/>` +
+    `<c:baseTimeUnit val="${spec.dateAxis.base}"/><c:majorUnit val="${t.majorUnit}"/><c:majorTimeUnit val="${t.majorTimeUnit}"/></c:dateAx>`;
+}
+
+/**
+ * Tableau labels a time axis at whole units – years, else quarters, months or days – as close together as the labels
+ * fit: the first step whose labels fit the plot width.
+ * @param {ChartSpec} spec @param {{ w: number, h: number } | null} axisPlot
+ * @returns {{ majorUnit: number, majorTimeUnit: "days" | "months" | "years", numFmt: string } | null}
+ */
+function dateTicks(spec, axisPlot) {
+  const d = spec.dateAxis;
+  if (!d) return null;
+  const s = d.serials, first = s[0], last = s[s.length - 1];
+  const month = v => { const t = new Date((v - 25569) * 86400000); return t.getUTCFullYear() * 12 + t.getUTCMonth(); };
+  const months = month(last) - month(first), days = last - first;
+  const charPx = ((spec.font && spec.font.size) || 9) * 4 / 3 * 0.55;          // average character of the label font
+  const width = axisPlot ? axisPlot.w : 400;
+  /** @type {[number, "days" | "months" | "years", string][]} */
+  const steps = [
+    ...(d.base === "days" ? /** @type {[number, "days", string][]} */ ([[1, "days", "d mmm"], [7, "days", "d mmm"], [14, "days", "d mmm"]]) : []),
+    ...(d.base !== "years" ? /** @type {[number, "months", string][]} */ ([[1, "months", "mmm yyyy"], [3, "months", "mmm yyyy"], [6, "months", "mmm yyyy"]]) : []),
+    [1, "years", "yyyy"], [2, "years", "yyyy"], [5, "years", "yyyy"], [10, "years", "yyyy"], [25, "years", "yyyy"]
+  ];
+  for (const [unit, of, fmt] of steps) {
+    const count = Math.floor((of === "days" ? days : of === "months" ? months : months / 12) / unit) + 1;
+    if (count * (fmt.length * charPx + 12) <= width) return { majorUnit: unit, majorTimeUnit: of, numFmt: fmt };
+  }
+  return { majorUnit: 50, majorTimeUnit: "years", numFmt: "yyyy" };
 }
 
 /* Tableau axes "include zero" by default; Excel would otherwise auto-scale from a non-zero minimum */
@@ -8887,8 +8993,10 @@ function axisFmt(fmt, values) {
 /**
  * @param {ChartSpec} spec @param {number} id @param {number} cross
  * @param {{ pos?: string, crosses?: string, grid?: boolean, fixed?: { min?: number, max?: number }, title?: string,
- *           numFmt?: string, values?: (number | null)[], deleted?: boolean, lowLabels?: boolean, midCat?: boolean,
- *           majorUnit?: number | null, tickFmt?: string, reversed?: boolean }} [o] tickFmt = the workbook's own tick format, used as is
+ *           numFmt?: string, values?: (number | null)[], deleted?: boolean, hidden?: boolean, lowLabels?: boolean, midCat?: boolean,
+ *           majorUnit?: number | null, tickFmt?: string, reversed?: boolean }} [o] tickFmt = the workbook's own tick format, used as is;
+ *   hidden = kept for its scale but not drawn (no labels, tick marks or line) – Excel draws the series of a deleted value
+ *   axis on the other axis group's value axis
  */
 function valAxis(spec, id, cross, o = {}) {
   const horizontal = spec.barDir === "bar" && spec.kind !== "scatter";
@@ -8903,7 +9011,7 @@ function valAxis(spec, id, cross, o = {}) {
   return `<c:valAx><c:axId val="${id}"/><c:scaling><c:orientation val="${o.reversed ? "maxMin" : "minMax"}"/>${scale}</c:scaling><c:delete val="${o.deleted ? 1 : 0}"/>` +
     `<c:axPos val="${pos}"/>${grid}${title(o.title, spec.font, pos === "l" || pos === "r")}` +
     `<c:numFmt formatCode="${esc(o.tickFmt || axisFmt(o.numFmt || "General", o.values))}" sourceLinked="0"/><c:majorTickMark val="none"/>` +
-    `<c:minorTickMark val="none"/><c:tickLblPos val="${o.lowLabels ? "low" : "nextTo"}"/><c:spPr><a:ln><a:noFill/></a:ln></c:spPr>` +
+    `<c:minorTickMark val="none"/><c:tickLblPos val="${o.hidden ? "none" : o.lowLabels ? "low" : "nextTo"}"/><c:spPr><a:ln><a:noFill/></a:ln></c:spPr>` +
     `${txPr(spec.font)}<c:crossAx val="${cross}"/><c:crosses val="${crosses}"/>` +
     `<c:crossBetween val="${o.midCat ? "midCat" : "between"}"/>${o.majorUnit ? `<c:majorUnit val="${o.majorUnit}"/>` : ""}</c:valAx>`;
 }
@@ -8976,7 +9084,8 @@ function truncatedCategories(spec, axisPlot) {
 /** @param {ChartSpec} spec @param {ChartRefs} refs @param {{ w: number, h: number } | null} [plot] plot area in px (manual layout)
  *  @param {{ w: number, h: number } | null} [axisPlot] approximate plot area of a chart with axes, for Tableau-like tick spacing */
 function plotAreaXml(spec, refs, plot = null, axisPlot = null) {
-  spec.categoryShown = truncatedCategories(spec, axisPlot);
+  spec.categoryShown = spec.dateAxis ? null : truncatedCategories(spec, axisPlot);
+  spec.dateTicks = dateTicks(spec, axisPlot);
   const k = spec.kind;
   if (k === "pie" || k === "doughnut") {
     const ser = seriesXml(spec, spec.series[0], 0, refs, "pie");
@@ -9072,11 +9181,13 @@ function plotAreaXml(spec, refs, plot = null, axisPlot = null) {
     return `<c:lineChart><c:grouping val="standard"/><c:varyColors val="0"/>${sers}${box}<c:marker val="1"/>${ax}</c:lineChart>`;
   }).join("");
   const axisValues = secondary => spec.series.filter(s => !!s.secondary === secondary).flatMap(s => s.values);
-  // reference lines across horizontal bars: XY lines on hidden x2 / y2 axes, x2 pinned to the bars' value range
+  // reference lines across horizontal bars: XY lines on hidden x2 / y2 axes, x2 pinned to the bars' value range – never
+  // beside a secondary axis: Excel cannot open a workbook with a chart of three axis groups (the model leaves those out)
   let overlay = "", overlayAxes = "";
   const targets = spec.barDir === "bar" && spec.targets ? 1 : 0;
   const dots = spec.barDir === "bar" && spec.overlay ? spec.overlay : [];
-  if (spec.barDir === "bar" && ((spec.refLines && spec.refLines.length) || targets || dots.length) && fixed.min !== undefined && fixed.max !== undefined) {
+  if (spec.barDir === "bar" && !hasSecondary && ((spec.refLines && spec.refLines.length) || targets || dots.length) &&
+      fixed.min !== undefined && fixed.max !== undefined) {
     const k0 = spec.series.length + (spec.refLines || []).length + targets;
     overlay = `<c:scatterChart><c:scatterStyle val="lineMarker"/><c:varyColors val="0"/>` +
       (spec.refLines || []).map((rl, i) => refLineXY(spec, rl, spec.series.length + i)).join("") +
@@ -9085,15 +9196,17 @@ function plotAreaXml(spec, refs, plot = null, axisPlot = null) {
       `<c:axId val="${AX.x2}"/><c:axId val="${AX.y2}"/></c:scatterChart>`;
     overlayAxes = hiddenValAx(AX.x2, AX.y2, "t", fixed.min, fixed.max) + hiddenValAx(AX.y2, AX.x2, "r", 0, 1);
   }
+  // a hidden value axis beside a second axis group is kept, not drawn: Excel would draw a deleted axis's series on the
+  // other group's axis, losing the scale Tableau gives each axis
   let axes = catAxis(spec, AX.cat, AX.val, { deleted: spec.categoryAxisHidden, rot: (spec.categoryRotation || 0) * 60000 }) +
     valAxis(spec, AX.val, AX.cat, { title: spec.valueAxisHidden ? null : spec.valueTitle, numFmt: spec.numFmt, values: axisValues(false),
-                                    fixed, deleted: spec.valueAxisHidden, majorUnit: unit, tickFmt: spec.valueAxisNumFmt,
-                                    reversed: spec.valueReversed });
+                                    fixed, deleted: spec.valueAxisHidden && !hasSecondary, hidden: spec.valueAxisHidden && hasSecondary,
+                                    majorUnit: unit, tickFmt: spec.valueAxisNumFmt, reversed: spec.valueReversed });
   if (hasSecondary) {
     axes += catAxis(spec, AX.cat2, AX.val2, { deleted: true }) +
       valAxis(spec, AX.val2, AX.cat2, { pos: spec.barDir === "bar" ? "t" : "r", crosses: "max", grid: false,
         title: spec.secondaryAxisHidden ? null : spec.secondaryTitle, numFmt: spec.secondaryNumFmt || spec.numFmt, values: axisValues(true),
-        deleted: spec.secondaryAxisHidden, tickFmt: spec.secondaryAxisNumFmt,
+        hidden: spec.secondaryAxisHidden, tickFmt: spec.secondaryAxisNumFmt,
         // synchronized: the same range as the primary axis, so both measures are drawn to one scale
         ...(spec.secondarySync ? { fixed, majorUnit: unit } : {}) });
   }
