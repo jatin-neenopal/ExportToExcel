@@ -9600,7 +9600,8 @@ const LIVE_READ_TIMEOUT_MS = TFX_WINDOW.TFX_LIVE_READ_TIMEOUT_MS || 120000;
 const PARALLEL_DASHBOARDS = TFX_WINDOW.TFX_PARALLEL_DASHBOARDS || 3;
 /** "12.3s" – for the timing lines in the console and the panel. */
 const secs = ms => `${(ms / 1000).toFixed(1)}s`;
-// Worksheets of one dashboard read at the same time (same as fetchAllSheetsData uses for the live dashboard).
+// Worksheets of the LIVE dashboard read at the same time (as fetchAllSheetsData does). Hidden (embedded) vizzes
+// are always read one call at a time – Tableau mixes up overlapping reads inside one embedded session.
 const SHEET_READ_CONCURRENCY = TFX_WINDOW.TFX_SHEET_READ_CONCURRENCY || 4;
 let EMBED_LIB_PROMISE = null;
 
@@ -9783,40 +9784,46 @@ function snapshotSheet(name, s) {
  *  wrap(promise, what) bounds each call (live dashboard) or passes it through. */
 async function readSheet(ws, wrap, plain, hidden = false) {
   const s = { summary: null, summaryError: null, visualSpec: null, visualSpecError: null, filters: [], selected: [] };
-  // The calls are independent, so they go out together (one round trip instead of four).
-  const tasks = [
-    // filters: always – the export's filter notes are built from every worksheet, hidden ones included
-    (async () => {
-      try { s.filters = ((await wrap(ws.getFiltersAsync(), `Filters of "${ws.name}"`)) || []).map(f => plain ? plainFilter(f) : f); }
-      catch (e) { /* export works without filter values */ }
-    })()
-  ];
+  const readFilters = async () => {
+    try { s.filters = ((await wrap(ws.getFiltersAsync(), `Filters of "${ws.name}"`)) || []).map(f => plain ? plainFilter(f) : f); }
+    catch (e) { /* export works without filter values */ }
+  };
   if (hidden) {
-    // Hidden on the dashboard (dynamic zone visibility): the export skips it anyway, so its data and
-    // visual specification are not fetched – an empty table lets the export record it as hidden.
+    // Hidden on the dashboard (dynamic zone visibility): the export skips it anyway, so its data and visual
+    // specification are not fetched – an empty table lets the export record it as hidden. Its filters are
+    // still read: the export's filter notes come from every worksheet.
     s.summary = { columns: [], data: [] };
+    await readFilters();
+    return snapshotSheet(ws.name, s);
+  }
+  const readSummary = async () => {
+    try { s.summary = plain ? await wrap(readWorksheetSummary(ws), `Reading "${ws.name}"`)
+                            : await wrap(ws.getSummaryDataAsync({ ignoreSelection: true }), `Reading "${ws.name}"`); }
+    catch (e) { s.summaryError = e; }
+  };
+  const readSpec = async () => {
+    if (typeof ws.getVisualSpecificationAsync !== "function") return;
+    try { s.visualSpec = await wrap(ws.getVisualSpecificationAsync(), `Visual specification of "${ws.name}"`); }
+    catch (e) { s.visualSpecError = e; }
+  };
+  if (plain) {
+    // A hidden (embedded) viz: ONE call at a time. Tableau keeps one data reader per embedded session –
+    // overlapping calls there come back mixed up (wrong columns, internal-error), so nothing overlaps.
+    await readSummary();
+    await readSpec();
+    await readFilters();
+    // a freshly opened hidden viz has nothing selected: its selected marks are always empty – not asked for
   } else {
-    tasks.push((async () => {
-      try { s.summary = plain ? await wrap(readWorksheetSummary(ws), `Reading "${ws.name}"`)
-                              : await wrap(ws.getSummaryDataAsync({ ignoreSelection: true }), `Reading "${ws.name}"`); }
-      catch (e) { s.summaryError = e; }
-    })());
-    if (typeof ws.getVisualSpecificationAsync === "function") {
-      tasks.push((async () => {
-        try { s.visualSpec = await wrap(ws.getVisualSpecificationAsync(), `Visual specification of "${ws.name}"`); }
-        catch (e) { s.visualSpecError = e; }
-      })());
-    }
+    // The live dashboard (Extensions API): data + visual specification together, as fetchAllSheetsData does.
+    await Promise.all([readSummary(), readSpec()]);
+    await readFilters();
     if (typeof ws.getSelectedMarksAsync === "function") {
-      tasks.push((async () => {
-        try {
-          const marks = await wrap(ws.getSelectedMarksAsync(), `Selected marks of "${ws.name}"`);
-          s.selected = ((marks && marks.data) || []).map(t => plain ? plainSummary(t) : t);
-        } catch (e) { /* no selection outline */ }
-      })());
+      try {
+        const marks = await wrap(ws.getSelectedMarksAsync(), `Selected marks of "${ws.name}"`);
+        s.selected = ((marks && marks.data) || []).map(t => plain ? plainSummary(t) : t);
+      } catch (e) { /* no selection outline */ }
     }
   }
-  await Promise.all(tasks);
   return snapshotSheet(ws.name, s);
 }
 
@@ -9825,7 +9832,10 @@ function hiddenWorksheetNames(objects) {
   return new Set((objects || []).filter(o => o && o.type === "worksheet" && o.isVisible === false).map(o => o.name));
 }
 
-/** readSheet for every worksheet, SHEET_READ_CONCURRENCY at a time; results in the worksheets' order. */
+/**
+ * readSheet for every worksheet; results in the worksheets' order. A hidden (embedded) viz: one worksheet at a
+ * time (see readSheet). The live dashboard: SHEET_READ_CONCURRENCY at a time, like fetchAllSheetsData.
+ */
 async function readSheets(worksheets, wrap, plain, objects) {
   const hidden = hiddenWorksheetNames(objects);
   const list = [...(worksheets || [])];
@@ -9837,7 +9847,8 @@ async function readSheets(worksheets, wrap, plain, objects) {
       out[i] = await readSheet(list[i], wrap, plain, hidden.has(list[i].name));
     }
   };
-  await Promise.all(Array.from({ length: Math.min(SHEET_READ_CONCURRENCY, list.length) }, worker));
+  const lanes = plain ? 1 : SHEET_READ_CONCURRENCY;
+  await Promise.all(Array.from({ length: Math.min(lanes, list.length) }, worker));
   return out;
 }
 
