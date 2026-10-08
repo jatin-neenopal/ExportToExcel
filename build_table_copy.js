@@ -9598,6 +9598,8 @@ const SIGNIN_WAIT_MS = TFX_WINDOW.TFX_SIGNIN_WAIT_MS || 300000;
 const LIVE_READ_TIMEOUT_MS = TFX_WINDOW.TFX_LIVE_READ_TIMEOUT_MS || 120000;
 // How many other dashboards load at the same time (each one runs a full Tableau view in the browser).
 const PARALLEL_DASHBOARDS = TFX_WINDOW.TFX_PARALLEL_DASHBOARDS || 3;
+/** "12.3s" – for the timing lines in the console and the panel. */
+const secs = ms => `${(ms / 1000).toFixed(1)}s`;
 let EMBED_LIB_PROMISE = null;
 
 /** Visible dashboards in Tableau tab order, from the workbook XML (<windows>). */
@@ -9978,6 +9980,7 @@ async function collectAllDashboards(current, onProgress) {
   /** Read one dashboard through a hidden viz; never throws – a failure becomes its note. */
   const readOne = async name => {
     if (abort) { results.set(name, { note: `"${name}": skipped (${abort})` }); return; }
+    const tStart = performance.now();
     const view = views.find(v => v.name === name);
     if (!view) { results.set(name, { note: `"${name}": not published as a tab — skipped` }); return; }
     let viz = null;
@@ -9990,7 +9993,9 @@ async function collectAllDashboards(current, onProgress) {
         if (!(await ensureSignedIn(view.embedUrl, name))) throw new Error("Tableau sign-in was skipped");
         viz = await openHiddenViz(view.embedUrl, size);       // signed in now → open hidden again
       }
+      const tOpened = performance.now();
       results.set(name, { target: await readEmbeddedDashboard(viz) });
+      console.log(`[Timing] "${name}": opened in ${secs(tOpened - tStart)}, read in ${secs(performance.now() - tOpened)}`);
     } catch (e) {
       results.set(name, { note: `"${name}": ${e.message}` });
       if (/sign-in|refused|Embedding API|never finished drawing/i.test(e.message)) abort = "same problem as the previous dashboard";
@@ -10001,11 +10006,11 @@ async function collectAllDashboards(current, onProgress) {
     }
   };
 
-  // The first dashboard alone: a needed sign-in is asked once here, and if embedding is broken we find
-  // out after ONE dashboard instead of several. The rest then load PARALLEL_DASHBOARDS at a time.
+  // All of them start together, PARALLEL_DASHBOARDS at a time. A needed sign-in is still asked only once
+  // (ensureSignedIn shares one panel and everyone waits for it), and if embedding is broken they fail
+  // together – no slower than finding out on one dashboard first.
   report(others[0]);
-  if (others.length) await readOne(others[0]);
-  const queue = others.slice(1);
+  const queue = others.slice();
   const pool = Array.from({ length: Math.min(PARALLEL_DASHBOARDS, queue.length) }, async () => {
     while (queue.length) await readOne(queue.shift());
   });
@@ -10095,6 +10100,8 @@ async function exportToExcel() {
     const saveTarget = await chooseSaveTarget(exportFileName);       // opens in the loaded workbook's folder
     if (saveTarget === "cancelled") { setExportStatus("Export cancelled – no file was saved"); return; }
 
+    const tExport = performance.now();                 // timing starts after the save dialog (that waits on the user)
+    let tReadMs = 0;
     const titleMap = getTitleMap();
     console.log(`[Export] Using ${Object.keys(titleMap).length} titles`);
     const fmtModel = await ensureFormatModel();
@@ -10115,6 +10122,7 @@ async function exportToExcel() {
       });
       targets = collected.targets;
       notes = collected.notes || [];
+      tReadMs = performance.now() - tExport;
     }
     btn.textContent = "⏳ Building Excel…";
     if (targets.length > 1) showExportOverlay("Building Excel…", `${targets.length} dashboards, one sheet each.`);
@@ -10136,6 +10144,7 @@ async function exportToExcel() {
       }
     }
     if (!written.length) throw new Error("No data found in any visible worksheet.");
+    const tSheetsDone = performance.now();
 
     if (FORMAT_CONFIG.conversionReport) writeConversionReports(workbook, written.map(w => w.report));
 
@@ -10182,6 +10191,10 @@ async function exportToExcel() {
     updateVisualStatus(visualStatuses, workbookWarning);
     appendExportStatus((multi ? `${written.length} dashboards, one sheet each – ` : "") +
       (saveTarget ? `saved as ${saveTarget.name}` : `downloaded as ${exportFileName}`));
+    const timing = `⏱ ${tReadMs ? `dashboards ${secs(tReadMs)} · ` : ""}sheets ${secs(tSheetsDone - tExport - tReadMs)} · ` +
+      `file ${secs(performance.now() - tSheetsDone)} · total ${secs(performance.now() - tExport)}`;
+    console.log(`[Timing] ${timing}`);
+    appendExportStatus(timing);
     appendExportNotes(notes);
 
     console.log(`✅ Export completed with Tableau formatting and native charts — ${written.length} sheet(s): ${written.map(w => w.worksheet.name).join(", ")}`);
