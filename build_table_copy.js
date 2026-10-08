@@ -466,6 +466,11 @@ function tvApplyWorkbookAxes(spec, ctx) {
     const second = fmt.axisInfo(refs[1], valueShelf, cls);
     if (second.hidden || noTicks(refs[1], cls)) spec.secondaryAxisHidden = true;
     if (second.title !== undefined) spec.secondaryTitle = second.title;
+    // Edit Axis → Fixed on the second axis: Excel's secondary axis gets the same range (else it scales
+    // itself to the data and the line sits at a different height than in Tableau)
+    const s2 = fmt.axisSpace(refs[1], valueShelf, cls);
+    if (/^fixed(min)?$/.test(s2.rangeType || "") && s2.min !== undefined) spec.secondaryMin = s2.min;
+    if (/^fixed(max)?$/.test(s2.rangeType || "") && s2.max !== undefined) spec.secondaryMax = s2.max;
   }
   if (!fmt.gridlinesShown(valueShelf)) spec.gridlines = false;
   // one axis reversed beside another that is not (nor synchronized to it) mirrors two panes – a centred funnel, a
@@ -486,6 +491,10 @@ function tvApplyWorkbookAxes(spec, ctx) {
   const inner = roles[catShelf].dims.filter(d => d.ref && !d.continuous).slice(-1)[0];
   const rot = inner ? fmt.headerOrientation(inner.ref) : null;
   spec.categoryRotation = rot || 0;
+  // Format → Cell width on the category header: Tableau gives every label that much room (a long axis scrolls),
+  // so a label is cut short only if it does not fit that width – not the chart's width shared by all labels
+  const slot = inner && catShelf === "cols" ? fmt.widthPx(inner.ref) : null;
+  if (slot > 0) spec.categorySlotPx = slot;
   if (!fmt.axisLineShown(catShelf)) spec.axisLine = false;
 }
 
@@ -719,6 +728,13 @@ function tfBuildColorScale(fmt, enc, values) {
         const dev = Math.max(Math.abs(max - center), Math.abs(min - center)) || 1;
         pos = 0.5 + (v - center) / (2 * dev);       // symmetric, like "Use full colour range" = off
       } else pos = max === min ? 0.5 : (v - min) / (max - min);
+      // Stepped Color (num-steps): the range in N equal bands, each one solid colour – evenly spaced over the
+      // palette, ends included (2 steps on a diverging palette: its two end colours, below / above the centre)
+      const steps = def && def.steps >= 2 ? Math.round(def.steps) : 0;
+      if (steps) {
+        const band = Math.min(steps - 1, Math.max(0, Math.floor(Math.max(0, Math.min(1, pos)) * steps)));
+        return tfSample(colors, band / (steps - 1));
+      }
       return tfSample(colors, pos);
     };
   }
@@ -753,8 +769,9 @@ const DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", 
  * @returns {string | null}
  */
 function tfFormatDateLabel(raw, text, dv) {
+  const custom = /^\*/.test(String(raw || ""));          // "*mmm'yy": Tableau's own (Excel-style) tokens, not ICU
   const pattern = String(raw || "").replace(/^[i*]/, "");
-  if (!/[yMLdEQq]/.test(pattern)) return null;
+  if (custom ? !/[ymdq]/i.test(pattern) : !/[yMLdEQq]/.test(pattern)) return null;
   const t = String(text || "").trim().toLowerCase();
   let date = null, month = null, weekday = null, quarter = null, year = null;
   const native = dv ? (dv.nativeValue !== undefined ? dv.nativeValue : dv.value) : null;
@@ -774,6 +791,7 @@ function tfFormatDateLabel(raw, text, dv) {
   }
   if (month === null && weekday === null && quarter === null && year === null) return null;
   let missing = false;
+  if (custom) return tfFormatCustomDate(pattern, { date, month, weekday, quarter, year });
   const out = pattern.replace(/'([^']*)'|y{1,4}|M{1,5}|L{1,5}|d{1,2}|E{1,5}|Q{1,4}|q{1,4}/g, (tok, literal) => {
     if (literal !== undefined) return literal;
     const c = tok[0], n = tok.length;
@@ -787,6 +805,39 @@ function tfFormatDateLabel(raw, text, dv) {
     if (c === "d") return need(date) ? "" : String(date.getUTCDate()).padStart(n, "0");
     if (c === "E") return need(weekday) ? "" : n >= 5 ? DAYS[weekday][0] : n === 4 ? DAYS[weekday] : DAYS[weekday].slice(0, 3);
     return need(quarter) ? "" : n >= 3 ? "Q" + quarter : String(quarter);
+  });
+  return missing ? null : out;
+}
+
+
+/**
+ * Tableau's custom date format (the "*" text-formats, Excel-style): yyyy / yy year, m … mmmmm month
+ * (1, 01, Jan, January, J), d / dd day, ddd / dddd weekday, q quarter; "…" and \x are literal text, every
+ * other character (' / - . space …) is printed as it is. Time parts (h, n, s, AM/PM) and weeks are not
+ * rebuilt here – null, so the caller keeps Tableau's own text.
+ * @param {string} pattern @param {{ date: Date | null, month: number | null, weekday: number | null,
+ *   quarter: number | null, year: number | null }} p @returns {string | null}
+ */
+function tfFormatCustomDate(pattern, p) {
+  let missing = false;
+  const need = v => { if (v === null) missing = true; return v === null; };
+  const out = pattern.replace(/"([^"]*)"|\\(.)|am\/pm|ampm|a\/p|y{3,4}|y{1,2}|m{1,5}|d{1,4}|q|h{1,2}|n{1,2}|s{1,2}|w{1,2}/gi, (tok, quoted, escaped) => {
+    if (quoted !== undefined) return quoted;
+    if (escaped !== undefined) return escaped;
+    const c = tok[0].toLowerCase(), n = tok.length;
+    if (c === "y") return need(p.year) ? "" : n <= 2 ? String(p.year).slice(-2) : String(p.year);
+    if (c === "m") {
+      if (need(p.month)) return "";
+      return n >= 5 ? MONTHS[p.month][0] : n === 4 ? MONTHS[p.month] : n === 3 ? MONTHS[p.month].slice(0, 3)
+           : n === 2 ? String(p.month + 1).padStart(2, "0") : String(p.month + 1);
+    }
+    if (c === "d") {
+      if (n >= 3) return need(p.weekday) ? "" : n === 4 ? DAYS[p.weekday] : DAYS[p.weekday].slice(0, 3);
+      return need(p.date) ? "" : String(/** @type {Date} */ (p.date).getUTCDate()).padStart(n, "0");
+    }
+    if (c === "q") return need(p.quarter) ? "" : String(p.quarter);
+    missing = true;                                     // time of day, week number: Tableau's own text is used
+    return "";
   });
   return missing ? null : out;
 }
@@ -1138,7 +1189,12 @@ function createSheetFormatter(model, sheetName, onlyPanes) {
       if (!def) for (const s of pool) { def = s.encodings.find(e => e.field && tfNorm(e.field.name) === tfNorm(ref.name)); if (def) break; }
       const paneRefs = [...p.encodings.filter(e => e.channel === "text" || e.channel === "label").map(e => e.field),
                         ...p.labelRuns.flatMap(r => r.refs)];
-      return { ref, def, markClass: effective, applyTo: /^text$/i.test(effective) ? "font" : "fill", paneRefs,
+      /** a measure's own colour rule – Color on Measure Values gives every measure its own legend @param {FieldRef} r */
+      const defFor = r => {
+        for (const s of pool) { const d = s.encodings.find(e => tfSameField(e.field, r)); if (d) return d; }
+        return null;
+      };
+      return { ref, def, defFor, markClass: effective, applyTo: /^text$/i.test(effective) ? "font" : "fill", paneRefs,
                continuous: ref.type ? /^q/.test(ref.type) : !!(def && def.type === "interpolated") };
     },
 
@@ -1594,6 +1650,7 @@ function tfParseColorEncoding(enc) {
     reverse: a("reverse") === "true" || (cp && cp.getAttribute("reverse") === "true"),
     // optional range settings (only used if present in your TWB)
     center: tfNum(a("center")), min: tfNum(a("min")), max: tfNum(a("max")),
+    steps: tfNum(a("num-steps")),                     // Stepped Color: that many solid colours instead of a gradient
     map
   };
 }
@@ -1698,7 +1755,7 @@ function tfCalcInfo(calc) {
 
 /* Raise when the parser reads something new: a workbook model remembered by an older version is then
    parsed again from its stored XML (ui/workbook-store.js), so an update reaches workbooks loaded before it. */
-const FORMAT_MODEL_VERSION = 5;
+const FORMAT_MODEL_VERSION = 6;
 
 /** @param {string} xmlString the .twb XML @returns {FormatModel} */
 function parseTableauFormatting(xmlString) {
@@ -5457,14 +5514,21 @@ for (const [, group] of rowGroups) {
 // ── Vertical pushes: a row group moves down as a whole, below every earlier group it overlaps
 //    (not only the group just above), so blocks that share a top edge on the dashboard stay level ──
 processedGroups.sort((a, b) => a.minRow - b.minRow);
-const groupsOverlap = (upper, lower) => upper.items.some(u => lower.items.some(l =>
-  u.gridCol < l.gridCol + l.gridW && u.gridCol + u.gridW > l.gridCol));
+// How far `lower` must move to clear the items of `upper` that are really above it (sharing columns). Only
+// those count: a short title beside a tall table must not push what sits under the title below the table.
+const clearance = (upper, lower) => {
+  let need = 0;
+  upper.items.forEach(u => lower.items.forEach(l => {
+    if (u.gridCol < l.gridCol + l.gridW && u.gridCol + u.gridW > l.gridCol) {
+      need = Math.max(need, u.gridRow + getVisualHeight(u) + ROW_GAP - lower.minRow);
+    }
+  }));
+  return need;
+};
 for (let i = 1; i < processedGroups.length; i++) {
   const lower = processedGroups[i];
   let pushBy = 0;
-  for (let j = 0; j < i; j++) {
-    if (groupsOverlap(processedGroups[j], lower)) pushBy = Math.max(pushBy, processedGroups[j].bottom - lower.minRow);
-  }
+  for (let j = 0; j < i; j++) pushBy = Math.max(pushBy, clearance(processedGroups[j], lower));
   if (pushBy > 0) {
     lower.items.forEach(z => { z.gridRow += pushBy; });
     lower.minRow += pushBy;
@@ -5559,6 +5623,24 @@ function buildColorPlan(fmt, colInfo, rows) {
       ? enc.paneRefs.some(r => r.name === "Multiple Values")
       : enc.paneRefs.some(r => tfSameField(r, colInfo[i].ref)));
     if (scoped.length) markIdx = scoped;
+  }
+  // Color on Measure Values: each measure column is coloured by its own measure's rule (its own legend in
+  // Tableau); a measure with no rule of its own keeps its plain style
+  if (enc.ref.name === "Multiple Values" && enc.defFor) {
+    const perCol = new Map();
+    markIdx.forEach(i => {
+      const c = colInfo[i];
+      if (!c.pivoted || !c.ref) return;
+      const def = enc.defFor(c.ref);
+      if (!def) return;
+      const vals = rows.map(row => tfIsNull(row[i]) ? null : tfDvNum(row[i]));
+      const scale = tfBuildColorScale(fmt, { ...enc, ref: c.ref, def, continuous: true }, vals);
+      if (scale) perCol.set(i, vals.map(v => (v === null ? null : scale(v)) || null));
+    });
+    if (perCol.size) {
+      return { enc, markIdx: new Set(markIdx), colorAt: () => null,
+               colorAtCell: (rowIdx, ci) => (perCol.get(ci) || [])[rowIdx] || null };
+    }
   }
   let colorIdx = colInfo.findIndex(c => c.ref && tfSameField(c.ref, enc.ref));
   if (colorIdx < 0) {
@@ -5748,6 +5830,8 @@ function writeRegularTable(worksheet, vm, originRow, originCol, rangeTracker, al
 
     order.forEach((ci, k) => {
       let p = styles[ci];
+      const ownRef = cols[ci].rowStyleRefs && cols[ci].rowStyleRefs[rowIdx];    // a joined indicator column
+      if (ownRef && ownRef !== cols[ci].ref) p = fmt.markCellStyle(ownRef);
       const extra = {
         border: {
           bottom: dividerHere ? borderSide(rowDiv) : undefined,
@@ -5758,9 +5842,10 @@ function writeRegularTable(worksheet, vm, originRow, originCol, rangeTracker, al
       const bandFill = banded ? (cols[ci].isHeader ? band.header : band.pane) : null;
       extra.fill = p.bgColor || bandFill || tableBg || undefined;
       const mk = marks.get(ci);
-      if (rowColor && plan.markIdx.has(ci) && !mk) {
-        if (plan.enc.applyTo === "fill") extra.fill = rowColor;
-        else if (!p.explicitColor) extra.fontColor = rowColor;
+      const markColor = plan.colorAtCell ? plan.colorAtCell(rowIdx, ci) : rowColor;
+      if (markColor && plan.markIdx.has(ci) && !mk) {
+        if (plan.enc.applyTo === "fill") extra.fill = markColor;
+        else if (!p.explicitColor) extra.fontColor = markColor;
       }
       const cellColor = vm.cellFill ? vm.cellFill(rowIdx, ci) : null;     // a matrix: each cell its own mark's colour
       if (cellColor) extra.fill = cellColor;
@@ -7559,17 +7644,46 @@ function markTableHeaders(dash, sheetName, cols, order, fmt) {
     const e = p && p.pane.encodings.find(x => x.channel === "color" && x.field);
     return e ? tfRefKey(e.field) : null;
   };
+  // the pane a column is drawn in: a pane on its own axis is one column of the table in Tableau (its label may
+  // hold several fields, e.g. "12% ▲")
+  const paneOf = ci => {
+    const k = panes.findIndex(x => x.refs.some(r => tfSameField(r, cols[ci].ref)));
+    return k >= 0 ? "pane:" + k : null;
+  };
   const values = order.filter(ci => !cols[ci].isHeader), heads = order.filter(ci => cols[ci].isHeader);
-  /** @type {{ key: string | null, cols: number[] }[]} */
-  const groups = [];
-  values.forEach(ci => {
-    const key = colourOf(ci), last = groups[groups.length - 1];
-    if (last && key && last.key === key) last.cols.push(ci); else groups.push({ key, cols: [ci] });
-  });
-  if (groups.length !== strip.zones.length) return null;
+  /** @param {(ci: number) => string | null} keyOf @returns {{ key: string | null, cols: number[] }[]} */
+  const groupBy = keyOf => {
+    const groups = [];
+    values.forEach(ci => {
+      const key = keyOf(ci), last = groups[groups.length - 1];
+      if (last && key && last.key === key) last.cols.push(ci); else groups.push({ key, cols: [ci] });
+    });
+    return groups;
+  };
+  // A strip that starts at the worksheet's left edge also heads the row-header columns (Department, Race …):
+  // its first boxes go to those, the rest to the value groups – by colour, else by pane
+  let headBoxes = 0, groups = null;
+  if (heads.length && Math.abs(strip.zones[0].x - strip.ws.x) <= TF_ZONE_TOL) {
+    for (const keyOf of [colourOf, paneOf]) {
+      const g = groupBy(keyOf);
+      if (heads.length + g.length === strip.zones.length) { headBoxes = heads.length; groups = g; break; }
+    }
+  }
+  if (!groups) {
+    const g = groupBy(colourOf);
+    if (g.length !== strip.zones.length) return null;
+    groups = g;
+  }
   const px = units => units / 100000 * dash.width;
+  heads.slice(0, headBoxes).forEach((ci, k) => {
+    const z = strip.zones[k];
+    cols[ci].label = z.text;
+    cols[ci].labelProps = z.props;
+    cols[ci].labelRuns = z.runs;
+    cols[ci].zoneWidthPx = px(z.w);
+  });
   groups.forEach((g, k) => {
-    const z = strip.zones[k], first = cols[g.cols[0]];
+    const z = strip.zones[headBoxes + k], first = cols[g.cols[0]];
     first.label = z.text;
     first.labelProps = z.props;
     first.labelRuns = z.runs;
@@ -7579,9 +7693,56 @@ function markTableHeaders(dash, sheetName, cols, order, fmt) {
       cols[ci].zoneWidthPx = px(z.w) / g.cols.length;
     });
   });
-  const left = px(strip.zones[0].x - strip.ws.x);
-  if (heads.length && left > 0) heads.forEach(ci => { cols[ci].zoneWidthPx = left / heads.length; });
+  if (!headBoxes) {
+    const left = px(strip.zones[0].x - strip.ws.x);
+    if (heads.length && left > 0) heads.forEach(ci => { cols[ci].zoneWidthPx = left / heads.length; });
+  }
   return { ids: strip.zones.map(z => z.id), headerPx: Math.max(...strip.zones.map(z => z.h)) / 100000 * (dash.height || 0) };
+}
+
+/**
+ * Indicator fields in one mark label – e.g. a green "▲" field and a red "▼" field after a percentage, only one of
+ * them set on any row – are one spot in Tableau's cell. Written as separate columns they leave a gap wherever the
+ * first is empty, so consecutive ones of the same pane are joined into one column; each cell keeps the style
+ * (colour) of the field it came from. Only short text (≤ 3 characters) that never overlaps on a row is joined.
+ * @param {SheetFormatter} fmt @param {ViewColumn[]} cols @param {any[][]} rows @param {number[]} order
+ * @returns {number[]} the order with each joined run replaced by one new column
+ */
+function mergeIndicatorColumns(fmt, cols, rows, order) {
+  if (!fmt || !fmt.hasModel || !rows.length) return order;
+  const panes = fmt.panesInOrder();
+  const paneOf = ci => cols[ci].ref ? panes.findIndex(x => x.refs.some(r => tfSameField(r, cols[ci].ref))) : -1;
+  const isIndicator = ci => {
+    const c = cols[ci];
+    if (c.isHeader || c.pivoted || !c.ref || paneOf(ci) < 0) return false;
+    return rows.every(r => {
+      const dv = r[ci];
+      if (tfIsNull(dv)) return true;
+      const v = dv.nativeValue !== undefined ? dv.nativeValue : dv.value;
+      return typeof v !== "number" && tfDvText(dv).trim().length <= 3;
+    });
+  };
+  const out = [];
+  for (let k = 0; k < order.length;) {
+    const ci = order[k];
+    let run = [ci];
+    if (isIndicator(ci)) {
+      while (k + run.length < order.length && isIndicator(order[k + run.length]) &&
+             paneOf(order[k + run.length]) === paneOf(ci)) run.push(order[k + run.length]);
+    }
+    const filled = (r, c) => !tfIsNull(r[c]) && tfDvText(r[c]).trim() !== "";
+    const exclusive = run.length > 1 && rows.every(r => run.filter(c => filled(r, c)).length <= 1);
+    if (!exclusive) { out.push(ci); k++; continue; }
+    // the joined column: the first field's identity, each row's value and style from the field that is set
+    const at = cols.length;
+    const srcOf = rows.map(r => run.find(c => filled(r, c)) ?? run[0]);
+    cols.push({ ...cols[run[0]], name: cols[run[0]].name, label: cols[run[0]].label,
+                rowStyleRefs: srcOf.map(c => cols[c].ref), joined: run.map(c => cols[c].name) });
+    rows.forEach((r, i) => { r[at] = r[srcOf[i]]; });
+    out.push(at);
+    k += run.length;
+  }
+  return out;
 }
 
 /* Tableau names a quick table calculation after its measure: a running sum and the plain sum both arrive as
@@ -7801,6 +7962,8 @@ function buildViewModel(model, sheetName, summary, opts = {}) {
     } else c.label = fmt.captionFor(c.ref, c.name);
     if (c.link && c.link.caption) c.label = c.link.caption;
   });
+
+  order = mergeIndicatorColumns(fmt, cols, rows, order);
 
   // ── dashboard text boxes drawn as column headers (strict match, else captions stay) ──
   const dashM = model && opts.dashboardName && model.dashboards && model.dashboards[opts.dashboardName];
@@ -8923,7 +9086,7 @@ function catAxis(spec, id, cross, o = {}) {
     `<c:numFmt formatCode="General" sourceLinked="1"/><c:majorTickMark val="none"/><c:minorTickMark val="none"/>` +
     `<c:tickLblPos val="${o.deleted ? "none" : spec.valueReversed ? "nextTo" : "low"}"/><c:spPr>${spec.axisLine === false ? "<a:ln><a:noFill/></a:ln>" : line("D4D4D4", 9525)}</c:spPr>${txPr(spec.font, { rot: o.rot })}` +
     `<c:crossAx val="${cross}"/><c:crosses val="${spec.valueReversed && !o.deleted ? "max" : "autoZero"}"/><c:auto val="1"/><c:lblAlgn val="ctr"/>` +
-    `<c:lblOffset val="100"/>${o.rot !== undefined ? '<c:tickLblSkip val="1"/>' : ""}<c:noMultiLvlLbl val="${multi ? 0 : 1}"/></c:catAx>`;
+    `<c:lblOffset val="100"/>${o.rot !== undefined || spec.categoryLabelSkip ? `<c:tickLblSkip val="${spec.categoryLabelSkip || 1}"/>` : ""}<c:noMultiLvlLbl val="${multi ? 0 : 1}"/></c:catAx>`;
 }
 
 /** a continuous date axis: Excel's date axis, its labels as far apart as dateTicks found room for
@@ -9077,15 +9240,33 @@ function truncatedCategories(spec, axisPlot) {
   if (!axisPlot || spec.barDir === "bar" || spec.categoryRotation || spec.categoryAxisHidden || levels.length !== 1 || !levels[0].length) return null;
   const names = levels[0].map(c => String(c == null ? "" : c));
   const charPx = ((spec.font && spec.font.size) || 9) * 4 / 3 * 0.5;      // average character of the label font
-  const fit = Math.max(4, Math.floor((axisPlot.w / names.length - 4) / charPx));
+  const slotPx = spec.categorySlotPx || axisPlot.w / names.length;      // the workbook's cell width, else an equal share
+  const fit = Math.max(4, Math.floor((slotPx - 4) / charPx));
   const shown = names.map(n => n.length > fit ? n.slice(0, Math.max(1, fit - 2)).trimEnd() + ".." : n);
   return shown.some((s, i) => s !== names[i]) ? shown : null;
+}
+
+/**
+ * Tableau scrolls a chart whose category cells (Format → Cell width) are wider than the view; an Excel chart cannot
+ * scroll, so every n-th label is shown instead (Excel's "interval between labels"), as many as fit side by side.
+ * Only then – otherwise every label is shown, as before. @returns {number | null}
+ */
+function categoryLabelSkip(spec, axisPlot) {
+  const levels = spec.categories ? spec.categories.levels : [];
+  if (!axisPlot || !spec.categorySlotPx || spec.barDir === "bar" || spec.categoryRotation || levels.length !== 1) return null;
+  const n = levels[0].length;
+  if (!n || spec.categorySlotPx * n <= axisPlot.w) return null;            // Tableau does not scroll: unchanged
+  const charPx = ((spec.font && spec.font.size) || 9) * 4 / 3 * 0.5;
+  const widest = Math.max(...levels[0].map(c => String(c == null ? "" : c).length)) * charPx + 8;
+  const skip = Math.ceil(widest / (axisPlot.w / n));
+  return skip > 1 ? skip : null;
 }
 
 /** @param {ChartSpec} spec @param {ChartRefs} refs @param {{ w: number, h: number } | null} [plot] plot area in px (manual layout)
  *  @param {{ w: number, h: number } | null} [axisPlot] approximate plot area of a chart with axes, for Tableau-like tick spacing */
 function plotAreaXml(spec, refs, plot = null, axisPlot = null) {
   spec.categoryShown = spec.dateAxis ? null : truncatedCategories(spec, axisPlot);
+  spec.categoryLabelSkip = spec.dateAxis ? null : categoryLabelSkip(spec, axisPlot);
   spec.dateTicks = dateTicks(spec, axisPlot);
   const k = spec.kind;
   if (k === "pie" || k === "doughnut") {
@@ -9208,8 +9389,11 @@ function plotAreaXml(spec, refs, plot = null, axisPlot = null) {
       valAxis(spec, AX.val2, AX.cat2, { pos: spec.barDir === "bar" ? "t" : "r", crosses: "max", grid: false,
         title: spec.secondaryAxisHidden ? null : spec.secondaryTitle, numFmt: spec.secondaryNumFmt || spec.numFmt, values: axisValues(true),
         hidden: spec.secondaryAxisHidden, tickFmt: spec.secondaryAxisNumFmt,
-        // synchronized: the same range as the primary axis, so both measures are drawn to one scale
-        ...(spec.secondarySync ? { fixed, majorUnit: unit } : {}) });
+        // synchronized: the same range as the primary axis, so both measures are drawn to one scale;
+        // else the workbook's own fixed range on the second axis, if it has one
+        ...(spec.secondarySync ? { fixed, majorUnit: unit }
+          : (spec.secondaryMin !== undefined || spec.secondaryMax !== undefined)
+            ? { fixed: { min: spec.secondaryMin, max: spec.secondaryMax } } : {}) });
   }
   return xml + overlay + axes + overlayAxes;
 }
@@ -10550,10 +10734,18 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
         // KPI tile: rebuilt from its Tableau label and filling its zone (null = drawn as a label | value table)
         const kpiCard = isKPI ? buildKpiCard(vm, sheet.name, layout) : null;
         const kpiW = kpiCard && layout && layout.widthPx ? Math.max(kpiCard.tiles.length, layout.gridRight - layout.gridCol) : null;
+        // a table whose column headers are dashboard text boxes above its zone starts where those boxes start –
+        // in Tableau the headers sit there, directly under the title, not at the top of the worksheet zone
+        let placed = layout;
+        if (layout && !box && !kpiCard && vm.headerZoneIds && vm.headerZoneIds.length) {
+          const tops = vm.headerZoneIds.map(id => layoutMap.get(`text:${id}`)).filter(Boolean).map(l => l.gridRow);
+          const top = tops.length ? Math.min(...tops) : layout.gridRow;
+          if (top < layout.gridRow) placed = { ...layout, gridRow: top };
+        }
         dataWorksheetItems.push({
           name: sheet.name,
           visualName: vm.title.text,
-          layout,
+          layout: placed,
           isKPI,
           kpiCard,
           type: "worksheet",
