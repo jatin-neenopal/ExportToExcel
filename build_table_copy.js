@@ -236,7 +236,8 @@ const FORMAT_CONFIG = {
   tableauTextScale: null,         // Tableau label text vs its pixels (Windows display scaling) for pie label placement; null = the browser's devicePixelRatio
   conversionReport: true,         // a "Conversion Report" sheet: every visual, how it was converted (NATIVE … TABLE_FALLBACK) and why
   fallbackNotes: true,            // a note on each visual exported as its data table, naming the Tableau visual and the reason
-  debug: true                     // true: dump the parsed workbook model and [Format] traces to the console
+  showTiming: false,              // true: also show the "⏱ dashboards … · sheets … · file …" line in the panel (always in the console)
+  debug: false                    // true: dump the parsed workbook model, [Format] traces and full visual specs to the console
 };
 
 const VISUAL_TYPES = Object.freeze({
@@ -9603,7 +9604,6 @@ const secs = ms => `${(ms / 1000).toFixed(1)}s`;
 // Worksheets of the LIVE dashboard read at the same time (as fetchAllSheetsData does). Hidden (embedded) vizzes
 // are always read one call at a time – Tableau mixes up overlapping reads inside one embedded session.
 const SHEET_READ_CONCURRENCY = TFX_WINDOW.TFX_SHEET_READ_CONCURRENCY || 4;
-let EMBED_LIB_PROMISE = null;
 
 /** Visible dashboards in Tableau tab order, from the workbook XML (<windows>). */
 function dashboardTabOrder(xmlString) {
@@ -9638,15 +9638,50 @@ function dashboardPixelSize(xmlString, name) {
   return { width: num("maxwidth") || num("minwidth") || 1200, height: num("maxheight") || num("minheight") || 900 };
 }
 
-function loadEmbeddingApi(libUrl) {
-  if (window.customElements && customElements.get("tableau-viz")) return Promise.resolve();
-  if (!EMBED_LIB_PROMISE) {
-    EMBED_LIB_PROMISE = import(libUrl).catch(e => {
-      EMBED_LIB_PROMISE = null;
-      throw new Error(`could not load Tableau's Embedding API (${e.message})`);
-    });
+/* -----------------------------------------------------------------------------
+ * The embed room: a same-origin child frame that holds Tableau's Embedding API and every hidden /
+ * sign-in viz. Loaded into this page, the Embedding API also answers the messages meant for the
+ * Extensions API – after the first multi-dashboard export, every read of the live dashboard went
+ * unanswered (the second export hung on "Choose where to save…"). In its own frame it hears only
+ * its vizzes. The room is removed after each export, so the next one starts clean.
+ * --------------------------------------------------------------------------- */
+/** @type {{ frame: HTMLIFrameElement, ready: Promise<Window>, lib?: Promise<void> } | null} */
+let EMBED_ROOM = null;
+const ROOM_HIDDEN_CSS = "position:fixed;left:0;top:0;width:100vw;height:100vh;border:0;opacity:0;pointer-events:none;";
+const ROOM_DEBUG_CSS = "position:fixed;left:0;top:0;width:100vw;height:100vh;border:0;z-index:9999;background:#fff;outline:3px dashed #b3261e;";
+
+/** The room's window (created on first use). */
+function embedRoom() {
+  if (EMBED_ROOM && EMBED_ROOM.frame.isConnected) return EMBED_ROOM.ready;
+  const frame = document.createElement("iframe");
+  frame.id = "tfx_embed_room";
+  frame.setAttribute("aria-hidden", "true");
+  frame.setAttribute("title", "Tableau dashboards being read");
+  frame.style.cssText = ROOM_HIDDEN_CSS;
+  const ready = new Promise(resolve => frame.addEventListener("load", () => resolve(/** @type {Window} */ (frame.contentWindow)), { once: true }));
+  frame.srcdoc = "<!doctype html><html><head><meta charset=\"utf-8\"><style>html,body{margin:0;padding:0;background:#fff}</style></head><body></body></html>";
+  document.body.appendChild(frame);
+  EMBED_ROOM = { frame, ready };
+  return ready;
+}
+
+/** Tableau's Embedding API (pod-specific URL), loaded INSIDE the room. */
+async function loadEmbeddingApi(libUrl) {
+  const win = await embedRoom();
+  if (win.customElements && win.customElements.get("tableau-viz")) return;
+  const room = /** @type {any} */ (EMBED_ROOM);
+  if (!room.lib) {
+    room.lib = withTimeout(new Promise((resolve, reject) => {
+      const script = win.document.createElement("script");
+      script.type = "module";
+      script.src = libUrl;
+      script.onload = () => resolve(undefined);
+      script.onerror = () => reject(new Error("the script did not load"));
+      win.document.head.appendChild(script);
+    }).then(() => win.customElements.whenDefined("tableau-viz")), 60000, "Loading Tableau's Embedding API")
+      .catch(e => { room.lib = null; throw new Error(`could not load Tableau's Embedding API (${e.message})`); });
   }
-  return EMBED_LIB_PROMISE;
+  return room.lib;
 }
 
 /**
@@ -9669,20 +9704,11 @@ function clearDebugVizSwitch() {
  * Chrome pauses rendering of cross-origin frames that are off-screen, and a paused
  * Tableau viz never becomes interactive — so "off-screen" is not an option.
  */
-function hiddenVizHost() {
-  let host = document.getElementById("tfx_viz_host");
-  if (!host) {
-    host = document.createElement("div");
-    host.id = "tfx_viz_host";
-    host.setAttribute("aria-hidden", "true");
-    document.body.appendChild(host);
-  }
-  host.style.cssText = debugVizOn()
-    ? "position:fixed;left:0;top:0;width:100%;height:100%;overflow:auto;z-index:9999;background:#fff;outline:3px dashed #b3261e;"
-    // Explicit size: the vizzes inside are absolutely positioned (stacked at the top-left), so without
-    // one this box collapses to 0×0, overflow clips them away, and Chrome pauses frames it can't see.
-    : "position:fixed;left:0;top:0;width:100vw;height:100vh;overflow:hidden;opacity:0;pointer-events:none;";
-  return host;
+async function hiddenVizHost() {
+  const win = await embedRoom();
+  // on screen but transparent: Chrome pauses frames it can't see, and a paused viz never finishes loading
+  /** @type {any} */ (EMBED_ROOM).frame.style.cssText = debugVizOn() ? ROOM_DEBUG_CSS : ROOM_HIDDEN_CSS;
+  return win.document.body;
 }
 
 /**
@@ -9690,9 +9716,10 @@ function hiddenVizHost() {
  * Tracks Tableau's earlier "size known" event so a timeout can say WHICH stage failed:
  * never loaded (sign-in / cookies / embedding blocked) vs loaded but never finished drawing.
  */
-function openHiddenViz(embedUrl, size) {
+async function openHiddenViz(embedUrl, size) {
+  const host = await hiddenVizHost();
   return new Promise((resolve, reject) => {
-    const viz = /** @type {any} */ (document.createElement("tableau-viz"));
+    const viz = /** @type {any} */ (host.ownerDocument.createElement("tableau-viz"));
     viz.setAttribute("src", embedUrl);
     viz.setAttribute("toolbar", "hidden");
     viz.setAttribute("hide-tabs", "");
@@ -9729,12 +9756,15 @@ function openHiddenViz(embedUrl, size) {
       try { detail = JSON.stringify(detail); } catch (x) { /* keep as is */ }
       reject(new Error("Tableau refused to open it: " + detail));
     });
-    hiddenVizHost().appendChild(viz);
+    host.appendChild(viz);
   });
 }
 
 /* ── plain copies: only what the export uses, so nothing keeps a reference to a closed viz ──────── */
-const plainValue = v => (v ? { value: v.value, nativeValue: v.nativeValue, formattedValue: v.formattedValue } : v);
+/** A Date made in another frame (the embed room) fails `instanceof Date` here – rebuilt as this frame's Date. */
+const ownRealm = x => (x && typeof x === "object" && !(x instanceof Date) && Object.prototype.toString.call(x) === "[object Date]")
+  ? new Date(x.getTime()) : x;
+const plainValue = v => (v ? { value: ownRealm(v.value), nativeValue: ownRealm(v.nativeValue), formattedValue: v.formattedValue } : v);
 
 /** a DataTable (summary data, selected marks): columns incl. fieldId (pies match measures by it) */
 function plainSummary(t) {
@@ -9745,12 +9775,12 @@ function plainSummary(t) {
   };
 }
 function plainFilter(f) {
-  const fv = v => (v ? { formattedValue: v.formattedValue, value: v.value } : v);
+  const fv = v => (v ? { formattedValue: v.formattedValue, value: ownRealm(v.value) } : v);
   return { fieldName: f.fieldName, filterType: f.filterType,
            appliedValues: (f.appliedValues || []).map(fv), minValue: fv(f.minValue), maxValue: fv(f.maxValue) };
 }
 function plainParameter(p) {
-  return { name: p.name, currentValue: p.currentValue ? { value: p.currentValue.value, formattedValue: p.currentValue.formattedValue } : null };
+  return { name: p.name, currentValue: p.currentValue ? { value: ownRealm(p.currentValue.value), formattedValue: p.currentValue.formattedValue } : null };
 }
 /** a DashboardObject: what the layout uses (the id is the zone id in the workbook – text boxes / images need it) */
 function plainObject(o) {
@@ -9940,7 +9970,7 @@ async function snapshotLiveDashboard(current) {
  * explanation) and wait until it becomes interactive = signed in. Resolves true / false (skipped).
  */
 function promptTableauSignIn(embedUrl) {
-  return new Promise(resolve => {
+  return new Promise(async resolve => {
     const overlay = document.createElement("div");
     overlay.id = "tfx_signin";
     overlay.style.cssText = "position:fixed;inset:0;z-index:10000;background:#fff;display:flex;flex-direction:column;";
@@ -9955,31 +9985,35 @@ function promptTableauSignIn(embedUrl) {
     skip.textContent = "Skip";
     bar.appendChild(msg);
     bar.appendChild(skip);
-    const box = document.createElement("div");
-    box.style.cssText = "flex:1;min-height:0;overflow:auto;";
     overlay.appendChild(bar);
-    overlay.appendChild(box);
     document.body.appendChild(overlay);
 
-    const viz = document.createElement("tableau-viz");
+    // the viz lives in the embed room (with the Embedding API): the room is shown under the bar meanwhile
+    const win = await embedRoom();
+    const room = /** @type {any} */ (EMBED_ROOM).frame;
+    const top = bar.offsetHeight || 40;
+    room.style.cssText = `position:fixed;left:0;top:${top}px;width:100vw;height:calc(100vh - ${top}px);border:0;z-index:10001;background:#fff;`;
+    const viz = win.document.createElement("tableau-viz");
     viz.setAttribute("src", embedUrl);
     viz.setAttribute("toolbar", "hidden");
     viz.setAttribute("hide-tabs", "");
-    viz.setAttribute("width", String(Math.max(300, box.clientWidth || 0)));
-    viz.setAttribute("height", String(Math.max(300, box.clientHeight || 0)));
+    viz.setAttribute("width", String(Math.max(300, room.clientWidth || 0)));
+    viz.setAttribute("height", String(Math.max(300, room.clientHeight || 0)));
 
     let finished = false;
     const finish = ok => {
       if (finished) return;
       finished = true;
       clearTimeout(timer);
+      viz.remove();
+      room.style.cssText = debugVizOn() ? ROOM_DEBUG_CSS : ROOM_HIDDEN_CSS;
       overlay.remove();
       resolve(ok);
     };
     const timer = setTimeout(() => finish(false), SIGNIN_WAIT_MS);
     viz.addEventListener("firstinteractive", () => finish(true));
     skip.addEventListener("click", () => finish(false));
-    box.appendChild(viz);
+    win.document.body.appendChild(viz);
   });
 }
 
@@ -10084,8 +10118,7 @@ async function collectAllDashboards(current, onProgress) {
 
 /** Remove the hidden-viz host once reading is done, so nothing (debug view included) covers the extension. */
 function removeHiddenVizHost() {
-  const host = document.getElementById("tfx_viz_host");
-  if (host) host.remove();
+  if (EMBED_ROOM) { EMBED_ROOM.frame.remove(); EMBED_ROOM = null; }
 }
 
 /* =============================================================================
@@ -10247,7 +10280,7 @@ async function exportToExcel() {
     const timing = `⏱ ${tReadMs ? `dashboards ${secs(tReadMs)} · ` : ""}sheets ${secs(tSheetsDone - tExport - tReadMs)} · ` +
       `file ${secs(performance.now() - tSheetsDone)} · total ${secs(performance.now() - tExport)}`;
     console.log(`[Timing] ${timing}`);
-    appendExportStatus(timing);
+    if (FORMAT_CONFIG.showTiming) appendExportStatus(timing);
     appendExportNotes(notes);
 
     console.log(`✅ Export completed with Tableau formatting and native charts — ${written.length} sheet(s): ${written.map(w => w.worksheet.name).join(", ")}`);
@@ -10423,7 +10456,7 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
         // ── NEW: rebuild the visual table (pivot, merge, sort, visible columns, title) ──
         const visualModel = buildVisualModel(fmtModel, sheet.name, summaryData,
           { dashboardName: dashboard.name, displayName: visualName, visualSpec, visualSpecError, layout });
-        console.log(`[VisualSpec] ${sheet.name}:`, {
+        if (FORMAT_CONFIG.debug) console.log(`[VisualSpec] ${sheet.name}:`, {
           available: visualModel.metadata.visualSpecAvailable,
           keys: visualModel.metadata.visualSpecKeys,
           type: visualModel.type,
