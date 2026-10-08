@@ -9600,6 +9600,8 @@ const LIVE_READ_TIMEOUT_MS = TFX_WINDOW.TFX_LIVE_READ_TIMEOUT_MS || 120000;
 const PARALLEL_DASHBOARDS = TFX_WINDOW.TFX_PARALLEL_DASHBOARDS || 3;
 /** "12.3s" – for the timing lines in the console and the panel. */
 const secs = ms => `${(ms / 1000).toFixed(1)}s`;
+// Worksheets of one dashboard read at the same time (same as fetchAllSheetsData uses for the live dashboard).
+const SHEET_READ_CONCURRENCY = TFX_WINDOW.TFX_SHEET_READ_CONCURRENCY || 4;
 let EMBED_LIB_PROMISE = null;
 
 /** Visible dashboards in Tableau tab order, from the workbook XML (<windows>). */
@@ -9779,24 +9781,64 @@ function snapshotSheet(name, s) {
 
 /** Reads one worksheet completely: data, visual specification, filters, selected marks.
  *  wrap(promise, what) bounds each call (live dashboard) or passes it through. */
-async function readSheet(ws, wrap, plain) {
+async function readSheet(ws, wrap, plain, hidden = false) {
   const s = { summary: null, summaryError: null, visualSpec: null, visualSpecError: null, filters: [], selected: [] };
-  try { s.summary = plain ? await wrap(readWorksheetSummary(ws), `Reading "${ws.name}"`)
-                          : await wrap(ws.getSummaryDataAsync({ ignoreSelection: true }), `Reading "${ws.name}"`); }
-  catch (e) { s.summaryError = e; }
-  if (typeof ws.getVisualSpecificationAsync === "function") {
-    try { s.visualSpec = await wrap(ws.getVisualSpecificationAsync(), `Visual specification of "${ws.name}"`); }
-    catch (e) { s.visualSpecError = e; }
+  // The calls are independent, so they go out together (one round trip instead of four).
+  const tasks = [
+    // filters: always – the export's filter notes are built from every worksheet, hidden ones included
+    (async () => {
+      try { s.filters = ((await wrap(ws.getFiltersAsync(), `Filters of "${ws.name}"`)) || []).map(f => plain ? plainFilter(f) : f); }
+      catch (e) { /* export works without filter values */ }
+    })()
+  ];
+  if (hidden) {
+    // Hidden on the dashboard (dynamic zone visibility): the export skips it anyway, so its data and
+    // visual specification are not fetched – an empty table lets the export record it as hidden.
+    s.summary = { columns: [], data: [] };
+  } else {
+    tasks.push((async () => {
+      try { s.summary = plain ? await wrap(readWorksheetSummary(ws), `Reading "${ws.name}"`)
+                              : await wrap(ws.getSummaryDataAsync({ ignoreSelection: true }), `Reading "${ws.name}"`); }
+      catch (e) { s.summaryError = e; }
+    })());
+    if (typeof ws.getVisualSpecificationAsync === "function") {
+      tasks.push((async () => {
+        try { s.visualSpec = await wrap(ws.getVisualSpecificationAsync(), `Visual specification of "${ws.name}"`); }
+        catch (e) { s.visualSpecError = e; }
+      })());
+    }
+    if (typeof ws.getSelectedMarksAsync === "function") {
+      tasks.push((async () => {
+        try {
+          const marks = await wrap(ws.getSelectedMarksAsync(), `Selected marks of "${ws.name}"`);
+          s.selected = ((marks && marks.data) || []).map(t => plain ? plainSummary(t) : t);
+        } catch (e) { /* no selection outline */ }
+      })());
+    }
   }
-  try { s.filters = ((await wrap(ws.getFiltersAsync(), `Filters of "${ws.name}"`)) || []).map(f => plain ? plainFilter(f) : f); }
-  catch (e) { /* export works without filter values */ }
-  if (typeof ws.getSelectedMarksAsync === "function") {
-    try {
-      const marks = await wrap(ws.getSelectedMarksAsync(), `Selected marks of "${ws.name}"`);
-      s.selected = ((marks && marks.data) || []).map(t => plain ? plainSummary(t) : t);
-    } catch (e) { /* no selection outline */ }
-  }
+  await Promise.all(tasks);
   return snapshotSheet(ws.name, s);
+}
+
+/** Worksheets hidden on a dashboard by dynamic zone visibility (isVisible === false). */
+function hiddenWorksheetNames(objects) {
+  return new Set((objects || []).filter(o => o && o.type === "worksheet" && o.isVisible === false).map(o => o.name));
+}
+
+/** readSheet for every worksheet, SHEET_READ_CONCURRENCY at a time; results in the worksheets' order. */
+async function readSheets(worksheets, wrap, plain, objects) {
+  const hidden = hiddenWorksheetNames(objects);
+  const list = [...(worksheets || [])];
+  const out = new Array(list.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < list.length) {
+      const i = next++;
+      out[i] = await readSheet(list[i], wrap, plain, hidden.has(list[i].name));
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(SHEET_READ_CONCURRENCY, list.length) }, worker));
+  return out;
 }
 
 /** Read every worksheet of the dashboard shown in `viz` into the export's input shape. */
@@ -9804,8 +9846,7 @@ async function readEmbeddedDashboard(viz) {
   const sheet = viz.workbook.activeSheet;
   if (!sheet || sheet.sheetType !== "dashboard") throw new Error("opened view is not a dashboard");
   const pass = p => p;
-  const sheets = [];
-  for (const ws of sheet.worksheets || []) sheets.push(await readSheet(ws, pass, true));
+  const sheets = await readSheets(sheet.worksheets, pass, true, sheet.objects);
   let params = [];
   try {
     const wb = viz.workbook;
@@ -9871,8 +9912,7 @@ function withTimeout(promise, ms, what) {
  */
 async function snapshotLiveDashboard(current) {
   const bounded = (p, what) => withTimeout(p, LIVE_READ_TIMEOUT_MS, what);
-  const sheets = [];
-  for (const ws of current.sheets) sheets.push(await readSheet(ws, bounded, false));
+  const sheets = await readSheets(current.sheets, bounded, false, current.dashboard && current.dashboard.objects);
   let params = [];
   try {
     const d = current.dashboard;
@@ -9949,7 +9989,9 @@ async function collectAllDashboards(current, onProgress) {
   }
 
   // Current dashboard first — before any embedded viz exists in this frame.
+  const tLive = performance.now();
   current = await snapshotLiveDashboard(current);
+  console.log(`[Timing] "${current.dashboard.name}" (this dashboard): read in ${secs(performance.now() - tLive)}`);
 
   let views, libUrl;
   try {
