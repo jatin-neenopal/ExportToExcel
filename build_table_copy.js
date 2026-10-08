@@ -9674,7 +9674,9 @@ function hiddenVizHost() {
   }
   host.style.cssText = debugVizOn()
     ? "position:fixed;left:0;top:0;width:100%;height:100%;overflow:auto;z-index:9999;background:#fff;outline:3px dashed #b3261e;"
-    : "position:fixed;left:0;top:0;overflow:hidden;opacity:0;pointer-events:none;";
+    // Explicit size: the vizzes inside are absolutely positioned (stacked at the top-left), so without
+    // one this box collapses to 0×0, overflow clips them away, and Chrome pauses frames it can't see.
+    : "position:fixed;left:0;top:0;width:100vw;height:100vh;overflow:hidden;opacity:0;pointer-events:none;";
   return host;
 }
 
