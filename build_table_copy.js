@@ -9596,6 +9596,8 @@ const SIGNIN_DETECT_MS = TFX_WINDOW.TFX_SIGNIN_DETECT_MS || 15000;
 const SIGNIN_WAIT_MS = TFX_WINDOW.TFX_SIGNIN_WAIT_MS || 300000;
 // Upper bound for one live Extensions API read of the current dashboard.
 const LIVE_READ_TIMEOUT_MS = TFX_WINDOW.TFX_LIVE_READ_TIMEOUT_MS || 120000;
+// How many other dashboards load at the same time (each one runs a full Tableau view in the browser).
+const PARALLEL_DASHBOARDS = TFX_WINDOW.TFX_PARALLEL_DASHBOARDS || 3;
 let EMBED_LIB_PROMISE = null;
 
 /** Visible dashboards in Tableau tab order, from the workbook XML (<windows>). */
@@ -9689,6 +9691,9 @@ function openHiddenViz(embedUrl, size) {
     viz.setAttribute("hide-tabs", "");
     viz.setAttribute("width", String(size.width));
     viz.setAttribute("height", String(size.height));
+    // Parallel vizzes overlap at the top-left so every one stays inside the visible area –
+    // Chrome pauses frames that are off-screen, and a paused viz never finishes loading.
+    if (!debugVizOn()) viz.style.cssText = "position:absolute;left:0;top:0;";
     let sizeKnown = false;
     viz.addEventListener("firstvizsizeknown", () => { sizeKnown = true; });
     // Signed-out embeds never report a size (Tableau shows its sign-in page instead).
@@ -9953,16 +9958,26 @@ async function collectAllDashboards(current, onProgress) {
     return { targets: [current], notes: [`Other dashboards skipped: ${e.message}`] };
   }
 
-  const targets = [];
   const others = order.filter(n => n !== current.dashboard.name);
-  let done = 0, abort = null;
-  for (const name of order) {
-    if (name === current.dashboard.name) { targets.push(current); continue; }
-    done++;
-    if (abort) { notes.push(`"${name}": skipped (${abort})`); continue; }
+  /** @type {Map<string, { target?: any, note?: string }>} name → what reading it gave */
+  const results = new Map();
+  let finished = 0, abort = null, signInPromise = null;
+  const report = (name, stage) => { if (onProgress) onProgress(name, finished, others.length, stage); };
+
+  /** One-time sign-in shared by the parallel readers: only one panel, everyone waits for it. */
+  const ensureSignedIn = (embedUrl, name) => {
+    if (!signInPromise) {
+      report(name, "signin");
+      signInPromise = promptTableauSignIn(embedUrl);
+    }
+    return signInPromise;
+  };
+
+  /** Read one dashboard through a hidden viz; never throws – a failure becomes its note. */
+  const readOne = async name => {
+    if (abort) { results.set(name, { note: `"${name}": skipped (${abort})` }); return; }
     const view = views.find(v => v.name === name);
-    if (!view) { notes.push(`"${name}": not published as a tab — skipped`); continue; }
-    if (onProgress) onProgress(name, done, others.length);
+    if (!view) { results.set(name, { note: `"${name}": not published as a tab — skipped` }); return; }
     let viz = null;
     try {
       const size = dashboardPixelSize(wb.xml, name);
@@ -9970,18 +9985,37 @@ async function collectAllDashboards(current, onProgress) {
         viz = await openHiddenViz(view.embedUrl, size);
       } catch (e) {
         if (e.code !== "SIGN_IN_NEEDED") throw e;
-        if (onProgress) onProgress(name, done, others.length, "signin");
-        if (!(await promptTableauSignIn(view.embedUrl))) throw new Error("Tableau sign-in was skipped");
-        if (onProgress) onProgress(name, done, others.length);
+        if (!(await ensureSignedIn(view.embedUrl, name))) throw new Error("Tableau sign-in was skipped");
         viz = await openHiddenViz(view.embedUrl, size);       // signed in now → open hidden again
       }
-      targets.push(await readEmbeddedDashboard(viz));
+      results.set(name, { target: await readEmbeddedDashboard(viz) });
     } catch (e) {
-      notes.push(`"${name}": ${e.message}`);
+      results.set(name, { note: `"${name}": ${e.message}` });
       if (/sign-in|refused|Embedding API|never finished drawing/i.test(e.message)) abort = "same problem as the previous dashboard";
     } finally {
       if (viz) viz.remove();
+      finished++;
+      report(name);
     }
+  };
+
+  // The first dashboard alone: a needed sign-in is asked once here, and if embedding is broken we find
+  // out after ONE dashboard instead of several. The rest then load PARALLEL_DASHBOARDS at a time.
+  report(others[0]);
+  if (others.length) await readOne(others[0]);
+  const queue = others.slice(1);
+  const pool = Array.from({ length: Math.min(PARALLEL_DASHBOARDS, queue.length) }, async () => {
+    while (queue.length) await readOne(queue.shift());
+  });
+  await Promise.all(pool);
+
+  // Tableau tab order, whatever order they finished in (the notes too).
+  const targets = [];
+  for (const name of order) {
+    if (name === current.dashboard.name) { targets.push(current); continue; }
+    const r = results.get(name);
+    if (r && r.target) targets.push(r.target);
+    else if (r && r.note) notes.push(r.note);
   }
   removeHiddenVizHost();
   clearDebugVizSwitch();
@@ -10074,8 +10108,8 @@ async function exportToExcel() {
           hideExportOverlay();                       // the sign-in panel needs to be seen
           return;
         }
-        btn.textContent = `⏳ Reading "${name}" (${i}/${n})…`;
-        showExportOverlay(`Reading dashboard ${i} of ${n}`, `"${name}" — opening it in the background to read its tables and charts.`);
+        btn.textContent = `⏳ Reading dashboards (${i}/${n} done)…`;
+        showExportOverlay(`Reading dashboards — ${i} of ${n} done`, `Opening them in the background (up to ${PARALLEL_DASHBOARDS} at a time) to read their tables and charts.`);
       });
       targets = collected.targets;
       notes = collected.notes || [];
