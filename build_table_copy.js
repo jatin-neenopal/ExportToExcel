@@ -236,6 +236,7 @@ const FORMAT_CONFIG = {
   tableauTextScale: null,         // Tableau label text vs its pixels (Windows display scaling) for pie label placement; null = the browser's devicePixelRatio
   conversionReport: true,         // a "Conversion Report" sheet: every visual, how it was converted (NATIVE … TABLE_FALLBACK) and why
   fallbackNotes: true,            // a note on each visual exported as its data table, naming the Tableau visual and the reason
+  filterCards: true,              // dashboard filter controls → a card with their title and current selection ("(All)", "East, West" …)
   showTiming: false,              // true: also show the "⏱ dashboards … · sheets … · file …" line in the panel (always in the console)
   debug: false                    // true: dump the parsed workbook model, [Format] traces and full visual specs to the console
 };
@@ -5403,8 +5404,7 @@ function buildLayoutMap(dashboardObjects, titleMap = {}) {
     // text boxes and images have no unique name – keyed by their zone id
     const key = kind === "text" || kind === "image" ? `${kind}:${obj.id}` : obj.name || `filter_${gridRow}_${gridCol}`;
     // a quick filter can carry its worksheet's name – the worksheet keeps its own position and size
-    if (kind !== "worksheet" && map.has(key) && map.get(key).type === "worksheet") return;
-    map.set(key, {
+    const entry = {
       type: kind,
       id: obj.id,
       gridRow: Math.max(0, gridRow),
@@ -5419,7 +5419,10 @@ function buildLayoutMap(dashboardObjects, titleMap = {}) {
       yPx: px.y,
       displayName,
       originalName: obj.name
-    });
+    };
+    if (kind === "filter") map.set(`filter:${obj.id}`, entry);       // the filter card's own spot, by zone id
+    if (kind !== "worksheet" && map.has(key) && map.get(key).type === "worksheet") return;
+    map.set(key, entry);
   });
 
   return map;
@@ -6611,9 +6614,16 @@ async function backendFetch(path, init = {}) {
   if (!url) throw new Error("No backend URL configured");
   const headers = { ...(init.headers || {}) };
   if (key) headers["X-Spike-Key"] = key;
+  // a backend that never answers (tunnel down, laptop asleep) must not leave the workbook "loading" for ever
+  const ctrl = typeof AbortController === "function" ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), BACKEND_TIMEOUT_MS) : null;
   let res;
-  try { res = await fetch(url + path, { ...init, headers }); }
-  catch (e) { throw new Error(`Could not reach the backend (${url}) — is it running?`); }
+  try { res = await fetch(url + path, { ...init, headers, ...(ctrl ? { signal: ctrl.signal } : {}) }); }
+  catch (e) {
+    if (ctrl && ctrl.signal.aborted) throw new Error(`The backend (${url}) did not answer within ${Math.round(BACKEND_TIMEOUT_MS / 1000)}s — is it running?`);
+    throw new Error(`Could not reach the backend (${url}) — is it running?`);
+  }
+  finally { if (timer) clearTimeout(timer); }
   if (!res.ok) {
     let text = "";
     try { text = await res.text(); } catch (e) { /* ignore */ }
@@ -6676,8 +6686,20 @@ async function resolveWorkbook(dashboard) {
   throw new Error(`no published workbook contains dashboard "${dashboard.name}"`);
 }
 
-/** Several workbooks match (e.g. copies in two projects): let the user pick once. */
+/** the open "pick a workbook" prompt – a newer load or a manual 📁 load closes it (its promise gets null) */
+/** @type {{ box: HTMLElement, resolve: (v: any) => void } | null} */
+let PENDING_PICKER = null;
+function cancelWorkbookPicker() {
+  if (!PENDING_PICKER) return;
+  const p = PENDING_PICKER;
+  PENDING_PICKER = null;
+  p.box.remove();
+  p.resolve(null);
+}
+
+/** Several workbooks match (e.g. copies in two projects): let the user pick once. Resolves null if cancelled. */
 function askUserToChooseWorkbook(candidates) {
+  cancelWorkbookPicker();
   return new Promise(resolve => {
     const label = document.getElementById("twb_file_label");
     const box = document.createElement("div");
@@ -6693,11 +6715,63 @@ function askUserToChooseWorkbook(candidates) {
     const ok = document.createElement("button");
     ok.className = "btn-load";
     ok.textContent = "Use this workbook";
-    ok.addEventListener("click", () => { box.remove(); resolve(candidates[Number(select.value)]); });
+    ok.addEventListener("click", () => {
+      PENDING_PICKER = null;
+      box.remove();
+      resolve(candidates[Number(select.value)]);
+    });
     box.appendChild(select);
     box.appendChild(ok);
     if (label && label.parentNode) label.parentNode.insertBefore(box, label.nextSibling);
     else document.body.appendChild(box);
+    PENDING_PICKER = { box, resolve };
+  });
+}
+
+/* -----------------------------------------------------------------------------
+ * Export button state. Export is clickable only once the workbook is ready (loaded, or its loading has
+ * ended – failed or not set up – so the export can still run); while it loads, or while the user still has
+ * to pick between workbooks, the button is disabled and says why. A running export is never started twice.
+ * --------------------------------------------------------------------------- */
+/** @type {"loading" | "choosing" | "ready"} */
+let WORKBOOK_PHASE = "ready";
+let EXPORT_RUNNING = false;
+/** @type {string | null} the button's own label ("Export to EXCEL") */
+let EXPORT_LABEL = null;
+/** every new workbook load gets a number: an older one that ends late must not undo a newer state */
+let WORKBOOK_LOAD_GEN = 0;
+
+function refreshExportButton() {
+  const b = /** @type {HTMLButtonElement | null} */ (document.getElementById("export_button"));
+  if (!b || EXPORT_RUNNING) return;
+  if (EXPORT_LABEL === null) EXPORT_LABEL = b.textContent;
+  if (WORKBOOK_PHASE === "loading") { b.disabled = true; b.textContent = "⏳ Loading workbook…"; }
+  else if (WORKBOOK_PHASE === "choosing") { b.disabled = true; b.textContent = "⬆ Pick the workbook above, then click \u201cUse this workbook\u201d"; }
+  else { b.disabled = false; b.textContent = EXPORT_LABEL; }
+}
+/** @param {"loading" | "choosing" | "ready"} phase */
+function setWorkbookPhase(phase) { WORKBOOK_PHASE = phase; refreshExportButton(); }
+
+/**
+ * Track a workbook load: Export waits (disabled) until it ends. A load still running after
+ * WORKBOOK_WATCHDOG_MS releases Export anyway, with a note – never a button that stays grey for ever.
+ * @param {() => Promise<any>} start begins the load – called after this load's number is taken, so the
+ *   load sees itself as the newest one @returns {Promise<any>}
+ */
+function trackWorkbookLoad(start) {
+  const mine = ++WORKBOOK_LOAD_GEN;
+  setWorkbookPhase("loading");
+  let promise;
+  try { promise = start(); } catch (e) { promise = Promise.reject(e); }
+  const watchdog = setTimeout(() => {
+    if (mine === WORKBOOK_LOAD_GEN && WORKBOOK_PHASE === "loading") {
+      showWorkbookStatus("⚠️ The workbook is taking long to load — you can export now, but Tableau formatting may be missing", true);
+      setWorkbookPhase("ready");
+    }
+  }, WORKBOOK_WATCHDOG_MS);
+  return Promise.resolve(promise).catch(() => {}).then(() => {
+    clearTimeout(watchdog);
+    if (mine === WORKBOOK_LOAD_GEN) setWorkbookPhase("ready");
   });
 }
 
@@ -6716,13 +6790,18 @@ async function autoLoadWorkbook(dashboard) {
     return;
   }
 
+  const gen = WORKBOOK_LOAD_GEN;                        // a newer load (or a manual 📁 load) supersedes this one
   try {
     for (let attempt = 0; attempt < 2; attempt++) {
       showWorkbookStatus("⏳ Finding this workbook on Tableau Cloud…");
       let wb = await resolveWorkbook(dashboard);
+      if (gen !== WORKBOOK_LOAD_GEN) return;
       if (wb.ambiguous) {
-        showWorkbookStatus(`${wb.candidates.length} published workbooks contain this dashboard — pick the right one:`);
+        showWorkbookStatus(`${wb.candidates.length} published workbooks contain this dashboard — pick the right one, then click \u201cUse this workbook\u201d:`);
+        setWorkbookPhase("choosing");
         wb = await askUserToChooseWorkbook(wb.candidates);
+        if (!wb || gen !== WORKBOOK_LOAD_GEN) return;        // closed by a newer load / a manual load
+        setWorkbookPhase("loading");
       }
 
       showWorkbookStatus(`⏳ Downloading "${wb.name}" from Tableau Cloud…`);
@@ -6745,6 +6824,7 @@ async function autoLoadWorkbook(dashboard) {
         throw new Error("the downloaded workbook doesn't contain this dashboard");
       }
 
+      if (gen !== WORKBOOK_LOAD_GEN) return;                // superseded while downloading: keep the newer workbook
       const { titleMap, formatModel, images } = await applyWorkbookXml(xml, wb.name, false);
       setLoadedWorkbookId(wb.id);            // lets Phase 3 find the other dashboards' views
       if (!wb.fromSaved) await writeSaved({ twbWorkbookId: wb.id, twbWorkbookName: wb.name });
@@ -6753,13 +6833,14 @@ async function autoLoadWorkbook(dashboard) {
     }
     throw new Error("could not identify this workbook");
   } catch (e) {
+    if (gen !== WORKBOOK_LOAD_GEN) return;
     console.warn("[AutoFetch]", e);
     showWorkbookStatus(`⚠️ Auto-load failed: ${e.message}${fallback}`, true);
   }
 }
 
 /** Advanced panel: backend URL + key, saved with the workbook. Saving reconnects.
- *  onReload(promise) receives the new auto-load, so Export can wait for it. */
+ *  onReload(start) runs the new auto-load (start) so Export waits for it, and returns its promise. */
 function setupBackendSettings(dashboard, onReload) {
   const urlIn = /** @type {HTMLInputElement} */ (document.getElementById("backend_url"));
   const keyIn = /** @type {HTMLInputElement} */ (document.getElementById("backend_key"));
@@ -6772,9 +6853,8 @@ function setupBackendSettings(dashboard, onReload) {
   saveBtn.addEventListener("click", async () => {
     saveBtn.disabled = true;
     await writeSaved({ backendUrl: urlIn.value.trim(), backendKey: keyIn.value.trim() });
-    const reload = autoLoadWorkbook(dashboard);
-    if (onReload) onReload(reload);
-    await reload;
+    const start = () => autoLoadWorkbook(dashboard);
+    await (onReload ? onReload(start) : start());
     saveBtn.disabled = false;
   });
 }
@@ -9587,6 +9667,91 @@ function dropEmptyRichTextRuns(workbook) {
   if (dropped) console.log(`[Export] ${dropped} empty rich-text run(s) removed (Excel rejects them)`);
 }
 
+/* -----------------------------------------------------------------------------
+ * Filter cards: a dashboard filter control as its title and current selection, at its dashboard spot.
+ * --------------------------------------------------------------------------- */
+const FILTER_CARD_MAX_VALUES = 3;
+
+/** What a filter control shows as its selection – "(All)", "East, West", "1/1/2023 – 12/31/2024",
+ *  "Last 3 months" … – or null when it cannot be told (that card is left out). @param {any} f a Tableau filter */
+function filterCardText(f) {
+  const day = v => String(v == null ? "" : v).replace(/\s+12:00:00\s*AM$|\s+00:00:00$/i, "");
+  const fv = v => (v ? day(v.formattedValue !== undefined && v.formattedValue !== null ? v.formattedValue : v.value) : "");
+  const type = String(f.filterType || "").toLowerCase().replace(/[^a-z]/g, "");
+  if (type === "categorical") {
+    if (f.isAllSelected === true) return "(All)";
+    const vals = (f.appliedValues || []).map(fv).filter(x => x !== "");
+    if (!vals.length) return f.isExcludeMode ? "(All)" : "(None)";
+    const shown = vals.slice(0, FILTER_CARD_MAX_VALUES).join(", ") +
+                  (vals.length > FILTER_CARD_MAX_VALUES ? ` (+${vals.length - FILTER_CARD_MAX_VALUES} more)` : "");
+    return f.isExcludeMode ? `All except ${shown}` : shown;
+  }
+  if (type === "range") {
+    const a = fv(f.minValue), b = fv(f.maxValue);
+    return a || b ? `${a} – ${b}` : "(All)";
+  }
+  if (type === "relativedate") {
+    const unit = String(f.periodType || "").toLowerCase().replace(/s$/, "");
+    const n = Number(f.rangeN) || 0, r = String(f.rangeType || "").toLowerCase();
+    if (!unit) return null;
+    if (r === "current") return `This ${unit}`;
+    if (r === "todate") return `${unit[0].toUpperCase()}${unit.slice(1)} to date`;
+    if (r === "last") return `Last ${unit}`;
+    if (r === "next") return `Next ${unit}`;
+    if (r === "lastn") return `Last ${n} ${unit}s`;
+    if (r === "nextn") return `Next ${n} ${unit}s`;
+    return null;
+  }
+  return null;
+}
+
+/**
+ * The dashboard's filter controls as cards: the twb tells which worksheet and field each control filters
+ * (and its custom title); the worksheet's filters tell the selection. A control whose filter can't be found
+ * is left out – a card never shows a guess.
+ * @param {any} dashboard @param {any[]} sheets @param {any} fmtModel @param {Map<string, any>} layoutMap
+ * @returns {Promise<ExportItem[]>}
+ */
+async function buildFilterCards(dashboard, sheets, fmtModel, layoutMap) {
+  const dash = fmtModel && fmtModel.dashboards && fmtModel.dashboards[dashboard.name];
+  if (!dash) return [];
+  const shown = new Set((dashboard.objects || []).filter(o => OBJECT_KIND[o.type] === "filter" && o.isVisible !== false).map(o => String(o.id)));
+  const norm = x => String(x || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const seen = new Set(), cards = [], filtersOf = new Map();
+  for (const z of dash.zones) {
+    if (z.type !== "filter" || !z.param || z.hidden || seen.has(String(z.id))) continue;
+    seen.add(String(z.id));
+    const layout = layoutMap.get(`filter:${z.id}`);
+    if (!shown.has(String(z.id)) || !layout) continue;                 // not on screen (or hidden by the user)
+    const ref = tfParseFieldRef(z.param);
+    if (!ref) continue;
+    const ws = sheets.find(s => s.name === z.name);
+    if (!ws || typeof ws.getFiltersAsync !== "function") continue;
+    if (!filtersOf.has(ws.name)) {
+      try { filtersOf.set(ws.name, (await ws.getFiltersAsync()) || []); } catch (e) { filtersOf.set(ws.name, []); }
+    }
+    const filters = filtersOf.get(ws.name);
+    const info = tfFieldInfo(fmtModel, ref);
+    const names = [info && info.caption, ref.name].filter(Boolean).map(norm);
+    let f = filters.find(x => names.includes(norm(x.fieldName)));
+    if (!f) {                                                            // a date part: "MONTH(Date)" for [tmn:Date]
+      const near = filters.filter(x => names.some(n => n && norm(x.fieldName).includes(n)));
+      if (near.length === 1) f = near[0];
+    }
+    if (!f) { console.log(`[Filters] "${z.name}" – no filter on ${ref.name}: card left out`); continue; }
+    const text = filterCardText(f);
+    if (text === null) { console.log(`[Filters] ${f.fieldName}: a ${f.filterType} filter – card left out`); continue; }
+    // the card's title: its custom title (Edit Title…), else the field's name; none when the title is hidden
+    const sheetRules = (fmtModel.sheets[z.name] && fmtModel.sheets[z.name].style && fmtModel.sheets[z.name].style.rules) || {};
+    const custom = (sheetRules["quick-filter"] || []).find(r => r.attr === "title" && r.field && tfSameField(tfParseFieldRef(r.field), ref));
+    const title = !z.showTitle ? "" : (custom && custom.value) || f.fieldName || (info && info.caption) || ref.name;
+    cards.push({ type: "filterValue", isFilterCard: true, name: `filter:${z.id}`, visualName: title || f.fieldName,
+                 filterName: title, values: [text], layout, rowCount: 2 });
+  }
+  if (cards.length) console.log(`[Filters] ${cards.length} filter card(s): ${cards.map(c => `${c.visualName} = ${c.values[0]}`).join(" | ")}`);
+  return cards;
+}
+
 /** the package with every worksheet's <sheetPr> in schema order and row groups in Excel's own form
  * (unchanged buffer when nothing moves) @param {ArrayBuffer | Uint8Array} buffer */
 async function fixSheetProperties(buffer) {
@@ -9847,6 +10012,9 @@ const LIVE_READ_TIMEOUT_MS = TFX_WINDOW.TFX_LIVE_READ_TIMEOUT_MS || 120000;
 const PARALLEL_DASHBOARDS = TFX_WINDOW.TFX_PARALLEL_DASHBOARDS || 3;
 /** "12.3s" – for the timing lines in the console and the panel. */
 const secs = ms => `${(ms / 1000).toFixed(1)}s`;
+// the backend's answer time limit, and how long Export may wait for a workbook before it is released anyway
+const BACKEND_TIMEOUT_MS = TFX_WINDOW.TFX_BACKEND_TIMEOUT_MS || 60000;
+const WORKBOOK_WATCHDOG_MS = TFX_WINDOW.TFX_WORKBOOK_WATCHDOG_MS || 120000;
 // Worksheets of the LIVE dashboard read at the same time (as fetchAllSheetsData does). Hidden (embedded) vizzes
 // are always read one call at a time – Tableau mixes up overlapping reads inside one embedded session.
 const SHEET_READ_CONCURRENCY = TFX_WINDOW.TFX_SHEET_READ_CONCURRENCY || 4;
@@ -10023,7 +10191,9 @@ function plainSummary(t) {
 function plainFilter(f) {
   const fv = v => (v ? { formattedValue: v.formattedValue, value: ownRealm(v.value) } : v);
   return { fieldName: f.fieldName, filterType: f.filterType,
-           appliedValues: (f.appliedValues || []).map(fv), minValue: fv(f.minValue), maxValue: fv(f.maxValue) };
+           appliedValues: (f.appliedValues || []).map(fv), minValue: fv(f.minValue), maxValue: fv(f.maxValue),
+           isAllSelected: f.isAllSelected, isExcludeMode: f.isExcludeMode,           // filter cards: "(All)", "All except …"
+           periodType: f.periodType, rangeType: f.rangeType, rangeN: f.rangeN };
 }
 function plainParameter(p) {
   return { name: p.name, currentValue: p.currentValue ? { value: ownRealm(p.currentValue.value), formattedValue: p.currentValue.formattedValue } : null };
@@ -10849,6 +11019,28 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
       console.warn("[Parameters] could not read parameters:", err.message);
     }
 
+    // ── dashboard filter controls (Select Chain: (All) …): a card each, where Tableau shows it ──
+    if (FORMAT_CONFIG.filterCards && fmtModel) {
+      try {
+        const taken = new Set(filterValueItems.map(it => it.layout).filter(Boolean));   // a spot already used (filter-like sheet)
+        // a card only fills empty space: one that would sit on a worksheet, text box, image or parameter control
+        // (e.g. a filter floating over a chart) is left out, so the rest of the layout never moves for it
+        const blocks = [];
+        layoutMap.forEach((l, key) => { if (l && /^(worksheet|text|image|parameter)$/.test(l.type) && !key.startsWith("filter:")) blocks.push(l); });
+        const rect = l => ({ r0: l.gridRow, r1: l.gridRow + Math.max(1, l.gridH || 1), c0: l.gridCol, c1: Math.max(l.gridCol + 1, l.gridRight || l.gridCol + (l.gridW || 1)) });
+        const hits = (a, b) => a.r0 < b.r1 && b.r0 < a.r1 && a.c0 < b.c1 && b.c0 < a.c1;
+        (await buildFilterCards(dashboard, sheets, fmtModel, layoutMap)).forEach(card => {
+          if (taken.has(card.layout)) return;
+          const me = { ...rect(card.layout), r1: card.layout.gridRow + 2 };
+          const under = blocks.find(b => b !== card.layout && hits(me, rect(b)));
+          if (under) { console.log(`[Filters] "${card.visualName}" sits on "${under.originalName || under.type}" – card left out`); return; }
+          filterValueItems.push(card);
+        });
+      } catch (err) {
+        console.warn("[Filters] filter cards left out:", err.message);
+      }
+    }
+
     // Tableau's number + trend tile: a chart in the zone right under / over a KPI card, same position and
     // width, takes the card's columns so the two line up as one card
     const near = (a, b) => Math.abs(a - b) <= 8;
@@ -11517,31 +11709,36 @@ document.addEventListener("DOMContentLoaded", () => {
       loadBtn.addEventListener("click", async () => {
         loadBtn.disabled = true;
         loadBtn.textContent = "⏳ Loading...";
-        await loadWorkbookFile();
+        const before = FORMAT_MODEL_CACHE;
+        try { await loadWorkbookFile(); } catch (e) { console.warn("[Workbook] manual load failed:", e); }
+        // a workbook loaded by hand wins: close an open "pick a workbook" prompt, stop a running auto-load
+        if (FORMAT_MODEL_CACHE && FORMAT_MODEL_CACHE !== before) {
+          WORKBOOK_LOAD_GEN++;
+          cancelWorkbookPicker();
+          setWorkbookPhase("ready");
+        }
         loadBtn.disabled = false;
         loadBtn.textContent = "📁 Load workbook file manually (.twb / .twbx)";
       });
     }
 
-    // the remembered workbook first, then Phase 1: fetch the workbook from Tableau Cloud automatically
-    // (falls back to 📁 on any problem; Tableau Desktop keeps the manual load)
-    WORKBOOK_READY = restoreWorkbookLabel()
-      .catch(err => console.warn("[Workbook] could not restore the remembered workbook:", err))
-      .then(() => autoLoadWorkbook(dashboard));
-    setupBackendSettings(dashboard, reload => { WORKBOOK_READY = reload; });
-
     const exportBtn = /** @type {HTMLButtonElement} */ (document.getElementById("export_button"));
+    if (exportBtn) EXPORT_LABEL = exportBtn.textContent;
+
+    // the remembered workbook first, then Phase 1: fetch the workbook from Tableau Cloud automatically
+    // (falls back to 📁 on any problem; Tableau Desktop keeps the manual load). Export stays disabled meanwhile.
+    WORKBOOK_READY = trackWorkbookLoad(() => restoreWorkbookLabel()
+      .catch(err => console.warn("[Workbook] could not restore the remembered workbook:", err))
+      .then(() => autoLoadWorkbook(dashboard)));
+    setupBackendSettings(dashboard, start => (WORKBOOK_READY = trackWorkbookLoad(start)));
+
     if (exportBtn) {
       exportBtn.addEventListener("click", async () => {
-        // If the auto-load is still running, wait for it so the export uses the right formatting.
-        const original = exportBtn.textContent;
-        exportBtn.disabled = true;
-        exportBtn.textContent = "⏳ Loading workbook…";
-        try { await WORKBOOK_READY; } finally {
-          exportBtn.textContent = original;
-          exportBtn.disabled = false;
-        }
-        exportToExcel();
+        // only a ready workbook, and never twice at once (the button is disabled then anyway)
+        if (WORKBOOK_PHASE !== "ready" || EXPORT_RUNNING) return;
+        EXPORT_RUNNING = true;
+        try { await exportToExcel(); }
+        finally { EXPORT_RUNNING = false; refreshExportButton(); }
       });
     }
 
