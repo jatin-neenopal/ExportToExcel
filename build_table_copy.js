@@ -9525,14 +9525,76 @@ function orderSheetPr(xml) {
   });
 }
 
-/** the package with every worksheet's <sheetPr> in schema order (unchanged buffer when nothing moves)
- * @param {ArrayBuffer | Uint8Array} buffer */
+/**
+ * Row groups the way Excel itself writes them. ExcelJS marks every grouped row collapsed="1" and leaves the
+ * sheet's outlineLevelRow at 0 – Excel then reports "a problem with some content" and repairs the file. Excel's
+ * own form: <sheetFormatPr outlineLevelRow> = the deepest level; the hidden detail rows carry only hidden +
+ * outlineLevel; collapsed="1" sits on the summary row next to each hidden group (above it when summaryBelow="0").
+ * @param {string} xml a worksheet part @returns {string}
+ */
+function fixRowOutlines(xml) {
+  const rowTag = /<row\b[^>]*?(\/?)>/g;
+  const levelOf = tag => +((tag.match(/\soutlineLevel="(\d+)"/) || [])[1] || 0);
+  const numOf = tag => +((tag.match(/\sr="(\d+)"/) || [])[1] || 0);
+  const tags = [...xml.matchAll(rowTag)].map(m => m[0]);
+  const deepest = Math.max(0, ...tags.map(levelOf));
+  if (!deepest) return xml;
+  const above = /<outlinePr\b[^>]*\ssummaryBelow="(0|false)"/.test(xml);
+  // hidden grouped rows → their summary rows (the row just before / after each unbroken run)
+  const grouped = new Set(tags.filter(t => levelOf(t) && /\shidden="1"/.test(t)).map(numOf));
+  const summaries = new Set();
+  grouped.forEach(r => {
+    if (above && !grouped.has(r - 1) && r > 1) summaries.add(r - 1);
+    if (!above && !grouped.has(r + 1)) summaries.add(r + 1);
+  });
+  const present = new Set(tags.map(numOf));
+  let out = xml.replace(rowTag, tag => {
+    let t = tag.replace(/\scollapsed="(1|true)"/, "");
+    if (summaries.has(numOf(t))) t = t.replace(/^<row\b/, '<row collapsed="1"');
+    return t;
+  });
+  // a summary row with no cells has no <row> yet: an empty one, in row order
+  const missing = [...summaries].filter(r => !present.has(r)).sort((a, b) => a - b);
+  missing.forEach(r => {
+    const next = [...out.matchAll(rowTag)].find(m => numOf(m[0]) > r);
+    const empty = `<row r="${r}" collapsed="1"/>`;
+    out = next ? out.slice(0, next.index) + empty + out.slice(next.index)
+               : out.replace("</sheetData>", empty + "</sheetData>");
+  });
+  return out.replace(/<sheetFormatPr\b[^>]*?\/?>/, tag =>
+    /\soutlineLevelRow="/.test(tag) ? tag.replace(/\soutlineLevelRow="\d+"/, ` outlineLevelRow="${deepest}"`)
+                                    : tag.replace(/^<sheetFormatPr\b/, `<sheetFormatPr outlineLevelRow="${deepest}"`));
+}
+
+/**
+ * Rich text with an empty run – e.g. a KPI line "vs Prev = 5 | ▲ 12%" whose arrow field is empty on this row –
+ * makes Excel report "a problem with some content" ("Repaired Records: String properties from
+ * /xl/sharedStrings.xml"): every run needs at least one character. Empty runs are dropped from every cell;
+ * a cell left with no run at all keeps its style and no value. Runs of spaces stay (they are visible).
+ * @param {any} workbook an ExcelJS workbook
+ */
+function dropEmptyRichTextRuns(workbook) {
+  let dropped = 0;
+  workbook.eachSheet(ws => ws.eachRow({ includeEmpty: false }, row => row.eachCell({ includeEmpty: false }, cell => {
+    if (cell.master && cell.master !== cell) return;                    // merged: only the top-left cell owns the value
+    const v = cell.value;
+    if (!v || typeof v !== "object" || !Array.isArray(v.richText)) return;
+    const runs = v.richText.filter(r => r && r.text !== undefined && r.text !== null && String(r.text) !== "");
+    if (runs.length === v.richText.length) return;
+    dropped += v.richText.length - runs.length;
+    cell.value = runs.length ? { ...v, richText: runs } : null;
+  })));
+  if (dropped) console.log(`[Export] ${dropped} empty rich-text run(s) removed (Excel rejects them)`);
+}
+
+/** the package with every worksheet's <sheetPr> in schema order and row groups in Excel's own form
+ * (unchanged buffer when nothing moves) @param {ArrayBuffer | Uint8Array} buffer */
 async function fixSheetProperties(buffer) {
   const zip = await JSZip.loadAsync(buffer);
   let changed = false;
   for (const name of Object.keys(zip.files).filter(n => /^xl\/worksheets\/sheet\d+\.xml$/.test(n))) {
     const xml = await zip.file(name).async("string");
-    const fixed = orderSheetPr(xml);
+    const fixed = fixRowOutlines(orderSheetPr(xml));
     if (fixed !== xml) { zip.file(name, fixed); changed = true; }
   }
   return changed ? zip.generateAsync({ type: "uint8array", compression: "DEFLATE" }) : buffer;
@@ -10419,10 +10481,12 @@ async function exportToExcel() {
     if (FORMAT_CONFIG.conversionReport) writeConversionReports(workbook, written.map(w => w.report));
 
     setExportStatus("Building the Excel file…");
+    dropEmptyRichTextRuns(workbook);
     /** @type {any} the XLSX bytes: ExcelJS's buffer, then injectCharts' Uint8Array */
     let buffer = await workbook.xlsx.writeBuffer();
     // fit-to-page next to collapsed row groups: ExcelJS writes <sheetPr> out of order – put it right
-    if (written.some(w => w.worksheet.pageSetup.fitToPage && w.worksheet.properties.outlineProperties)) buffer = await fixSheetProperties(buffer);
+    // and row groups in Excel's own form (else Excel asks to repair the file)
+    if (written.some(w => w.worksheet.properties.outlineProperties)) buffer = await fixSheetProperties(buffer);
     // native charts, sheet by sheet: sized to their blocks now that the final column widths / row heights are known
     for (const w of written) {
       const jobs = w.finalizeCharts();
