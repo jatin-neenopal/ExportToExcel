@@ -9671,6 +9671,8 @@ function dropEmptyRichTextRuns(workbook) {
  * Filter cards: a dashboard filter control as its title and current selection, at its dashboard spot.
  * --------------------------------------------------------------------------- */
 const FILTER_CARD_MAX_VALUES = 3;
+/** time limit for asking Tableau a filtered field's full list of values (filter cards' "(All)") */
+const FILTER_DOMAIN_TIMEOUT_MS = (typeof window !== "undefined" && /** @type {any} */ (window).TFX_FILTER_DOMAIN_TIMEOUT_MS) || 10000;
 
 /** What a filter control shows as its selection – "(All)", "East, West", "1/1/2023 – 12/31/2024",
  *  "Last 3 months" … – or null when it cannot be told (that card is left out). @param {any} f a Tableau filter */
@@ -9717,7 +9719,7 @@ async function buildFilterCards(dashboard, sheets, fmtModel, layoutMap) {
   if (!dash) return [];
   const shown = new Set((dashboard.objects || []).filter(o => OBJECT_KIND[o.type] === "filter" && o.isVisible !== false).map(o => String(o.id)));
   const norm = x => String(x || "").toLowerCase().replace(/[^a-z0-9]/g, "");
-  const seen = new Set(), cards = [], filtersOf = new Map();
+  const seen = new Set(), cards = [], filtersOf = new Map(), domains = new Map();
   for (const z of dash.zones) {
     if (z.type !== "filter" || !z.param || z.hidden || seen.has(String(z.id))) continue;
     seen.add(String(z.id));
@@ -9728,7 +9730,11 @@ async function buildFilterCards(dashboard, sheets, fmtModel, layoutMap) {
     const ws = sheets.find(s => s.name === z.name);
     if (!ws || typeof ws.getFiltersAsync !== "function") continue;
     if (!filtersOf.has(ws.name)) {
-      try { filtersOf.set(ws.name, (await ws.getFiltersAsync()) || []); } catch (e) { filtersOf.set(ws.name, []); }
+      try {
+        const raw = (await ws.getFiltersAsync()) || [];
+        const all = await allSelectedFields(raw, p => p, domains);
+        filtersOf.set(ws.name, raw.map(f => all.has(f.fieldName) ? { ...plainFilter(f), isAllSelected: true } : f));
+      } catch (e) { filtersOf.set(ws.name, []); }
     }
     const filters = filtersOf.get(ws.name);
     const info = tfFieldInfo(fmtModel, ref);
@@ -10228,10 +10234,40 @@ function snapshotSheet(name, s) {
 
 /** Reads one worksheet completely: data, visual specification, filters, selected marks.
  *  wrap(promise, what) bounds each call (live dashboard) or passes it through. */
-async function readSheet(ws, wrap, plain, hidden = false) {
+/**
+ * Filters whose every value is selected – Tableau's "(All)". Tableau's isAllSelected is not always set
+ * (it is often missing for embedded views, and not set when each value was checked one by one), so a
+ * categorical filter without it is compared with its field's full list of values (asked once per field).
+ * Any problem: the field is simply not marked (its card then lists the values, as before).
+ * @param {any[]} raw Tableau filter objects @param {(p: Promise<any>, what: string) => Promise<any>} wrap
+ * @param {Map<string, Promise<number>>} domains value counts per field, shared by the dashboard's worksheets
+ * @returns {Promise<Set<string>>} the field names of filters with all values selected
+ */
+async function allSelectedFields(raw, wrap, domains) {
+  const all = new Set();
+  for (const f of raw || []) {
+    if (!f || String(f.filterType || "").toLowerCase() !== "categorical" || f.isAllSelected === true || f.isExcludeMode) continue;
+    const applied = (f.appliedValues || []).length;
+    if (!applied || typeof f.getDomainAsync !== "function" || /^Measure (Names|Values)$/.test(f.fieldName || "")) continue;
+    if (!domains.has(f.fieldName)) {
+      domains.set(f.fieldName, withTimeout(wrap(f.getDomainAsync("database"), `Values of "${f.fieldName}"`), FILTER_DOMAIN_TIMEOUT_MS, "Filter values")
+        .then(d => (d && Array.isArray(d.values) ? d.values.length : 0)).catch(() => 0));
+    }
+    const total = await domains.get(f.fieldName);
+    if (total > 0 && applied >= total) all.add(f.fieldName);
+  }
+  return all;
+}
+
+async function readSheet(ws, wrap, plain, hidden = false, domains = new Map()) {
   const s = { summary: null, summaryError: null, visualSpec: null, visualSpecError: null, filters: [], selected: [] };
   const readFilters = async () => {
-    try { s.filters = ((await wrap(ws.getFiltersAsync(), `Filters of "${ws.name}"`)) || []).map(f => plain ? plainFilter(f) : f); }
+    try {
+      const raw = (await wrap(ws.getFiltersAsync(), `Filters of "${ws.name}"`)) || [];
+      const all = FORMAT_CONFIG.filterCards ? await allSelectedFields(raw, wrap, domains) : new Set();
+      // a filter with every value selected carries isAllSelected (a plain copy then – Tableau's object is kept otherwise)
+      s.filters = raw.map(f => all.has(f.fieldName) ? { ...plainFilter(f), isAllSelected: true } : plain ? plainFilter(f) : f);
+    }
     catch (e) { /* export works without filter values */ }
   };
   if (hidden) {
@@ -10284,13 +10320,15 @@ function hiddenWorksheetNames(objects) {
  */
 async function readSheets(worksheets, wrap, plain, objects) {
   const hidden = hiddenWorksheetNames(objects);
+  /** @type {Map<string, Promise<number>>} each filtered field's value count, asked once for the dashboard */
+  const domains = new Map();
   const list = [...(worksheets || [])];
   const out = new Array(list.length);
   let next = 0;
   const worker = async () => {
     while (next < list.length) {
       const i = next++;
-      out[i] = await readSheet(list[i], wrap, plain, hidden.has(list[i].name));
+      out[i] = await readSheet(list[i], wrap, plain, hidden.has(list[i].name), domains);
     }
   };
   const lanes = plain ? 1 : SHEET_READ_CONCURRENCY;
