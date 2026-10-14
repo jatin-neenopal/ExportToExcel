@@ -6793,9 +6793,14 @@ async function backendFetch(path, init = {}) {
   if (!url) throw new Error("No backend URL configured");
   const headers = { ...(init.headers || {}) };
   if (key) headers["X-Spike-Key"] = key;
-  const tk = tenantKey(), uid = userIdForSeats();
-  if (tk) headers["X-Tenant-Key"] = tk;
-  if (uid) headers["X-User-Id"] = uid;
+  // licence headers only with a licence key (marketplace backend): a single-client backend's CORS allows just
+  // Content-Type and X-Spike-Key – any other header makes the browser block the request ("could not reach")
+  const tk = tenantKey();
+  if (tk) {
+    headers["X-Tenant-Key"] = tk;
+    const uid = userIdForSeats();
+    if (uid) headers["X-User-Id"] = uid;
+  }
   // a backend that never answers (tunnel down, laptop asleep) must not leave the workbook "loading" for ever
   const ctrl = typeof AbortController === "function" ? new AbortController() : null;
   const timer = ctrl ? setTimeout(() => ctrl.abort(), BACKEND_TIMEOUT_MS) : null;
