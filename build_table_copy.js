@@ -226,6 +226,9 @@ const FORMAT_CONFIG = {
   applyFallbackHeatmap: false,    // old red/green heatmap when Tableau has no color (not in Tableau → off)
   nativeCharts: true,             // bar/line/area/pie/scatter/combo → editable native Excel charts
   chartPolicy: "data",            // charts that cannot be drawn: "skip" | "data" (export their data as a plain table)
+  visualsAsTables: false,         // default of the panel's "Charts as tables" switch (each workbook / browser remembers its choice)
+  crosstabKeepsSparklines: true,  // with "Charts as tables": charts in zones shorter than SPARKLINE_MAX_HEIGHT_PX stay charts
+                                  // (KPI trend lines – a table would not fit there)
   groupOverflowRows: true,        // collapse rows beyond ROW_GROUP_THRESHOLD into an expandable [+]/[-] group
   autoFilter: "largest",          // Excel allows ONE autofilter per sheet: "largest" table | "none"
   textBoxHeaders: true,           // dashboard text boxes over a table as its column headers (one box per column or per group of panes)
@@ -6525,7 +6528,9 @@ function updateVisualStatus(statuses, note) {
     const order = ["NATIVE", "CONSTRUCTED", "APPROXIMATE", "TABLE_FALLBACK", "IMAGE_FALLBACK", "UNSUPPORTED", "FAILED"];
     const words = { NATIVE: "native", CONSTRUCTED: "constructed", APPROXIMATE: "approximated", TABLE_FALLBACK: "as data tables",
                     IMAGE_FALLBACK: "as pictures", UNSUPPORTED: "unsupported", FAILED: "failed" };
-    const parts = order.map(s => [statuses.filter(item => item.strategy === s).length, words[s]]).filter(([n]) => n);
+    const tables = statuses.filter(item => item.asTable).length;          // "Charts as tables": chosen, not a fallback
+    const parts = order.map(s => [statuses.filter(item => item.strategy === s && !item.asTable).length, words[s]]).filter(([n]) => n);
+    if (tables) parts.push([tables, "as tables (Charts as tables)"]);
     const flagged = statuses.filter(item => item.strategy !== "NATIVE" && item.strategy !== "CONSTRUCTED");
     target.textContent = `${statuses.length} visuals: ${parts.map(([n, w]) => `${n} ${w}`).join(", ")} – see the Conversion Report sheet`;
     target.title = flagged.map(w => `${w.worksheet} (${w.visual}): ${w.strategy} – ${w.reason}`).join("\n");
@@ -6577,7 +6582,17 @@ function appendExportNotes(notes) {
  * The PAT never reaches this file — only the backend holds it.
  * ============================================================================= */
 
-const DEFAULT_BACKEND_URL = "";      // production: the hosted Worker URL, e.g. "https://export-backend.example.workers.dev"
+const DEFAULT_BACKEND_URL = "";      // production: the hosted Worker URL, e.g. "https://export-to-excel-backend.<account>.workers.dev"
+const EXTENSION_VERSION = "2.0.0";
+/** Links shown with the licence status (leave "" to hide). */
+const PRODUCT_LINKS = { buy: "", help: "" };
+
+/** The "Advanced: backend connection" box is for development: hidden once DEFAULT_BACKEND_URL is set,
+ *  unless this browser opts in with localStorage tfx_showAdvanced = "1". */
+function advancedBackendAllowed() {
+  if (!DEFAULT_BACKEND_URL) return true;
+  try { return localStorage.getItem("tfx_showAdvanced") === "1"; } catch (e) { return false; }
+}
 
 /** Read a value saved by this extension: workbook settings first, then this browser. */
 function readSaved(key) {
@@ -6602,10 +6617,174 @@ async function writeSaved(pairs) {
 }
 
 function getBackendConfig() {
+  // with a production URL built in, an old saved (tunnel) address must not override it
+  const saved = advancedBackendAllowed() ? readSaved("backendUrl") : "";
   return {
-    url: (readSaved("backendUrl") || DEFAULT_BACKEND_URL).trim().replace(/\/+$/, ""),
+    url: (saved || DEFAULT_BACKEND_URL).trim().replace(/\/+$/, ""),
     key: readSaved("backendKey").trim(),
   };
+}
+
+/* -----------------------------------------------------------------------------
+ * Licence (marketplace backend). The workbook author saves a licence key once (it is stored with the
+ * workbook); every backend call sends it, with Tableau's anonymous uniqueUserId for seat counting.
+ * A single-client backend has no /licence route: LICENCE then stays null and nothing here shows.
+ * --------------------------------------------------------------------------- */
+/** @type {null | { valid: boolean, reason?: string|null, message?: string, plan?: string, tenant?: string,
+ *   daysLeft?: number, expiresAt?: string, seats?: number, seatsUsed?: number }} */
+let LICENCE = null;
+
+class LicenceError extends Error {
+  constructor(info) { super(info.message || "Licence problem"); this.licence = info; }
+}
+function tenantKey() { return readSaved("tenantKey").trim(); }
+function userIdForSeats() {
+  try { return String((tableau.extensions.environment || {}).uniqueUserId || ""); } catch (e) { return ""; }
+}
+/** Lite mode: a marketplace backend that says the licence is missing, invalid or over. */
+function liteMode() { return !!(LICENCE && LICENCE.valid === false); }
+
+const LICENCE_REASONS = {
+  missing_key: "no licence key yet",
+  invalid_key: "the licence key is not valid",
+  trial_expired: "the trial has ended",
+  expired: "the licence has expired",
+  canceled: "the subscription was cancelled",
+  suspended: "the licence is suspended",
+  seat_limit: "all licensed users for this month are in use",
+};
+
+/** Ask the backend for the licence. Sets LICENCE (null when the backend has no licensing). */
+async function checkLicence() {
+  if (!getBackendConfig().url) { LICENCE = null; return LICENCE; }
+  try {
+    const res = await backendFetch("/licence");
+    LICENCE = await res.json();
+  } catch (e) {
+    if (e instanceof LicenceError) LICENCE = e.licence;                 // missing / invalid key, ended licence
+    else if (/^Backend 404/.test(e.message)) LICENCE = null;           // single-client backend: no licensing
+    else { console.warn("[Licence] check failed:", e.message); LICENCE = null; }   // backend down: export as before
+  }
+  refreshLicenceBox();
+  applyLiteMode();
+  return LICENCE;
+}
+
+/** Lite mode turns off "All dashboards" (it needs the backend); this dashboard still exports. */
+function applyLiteMode() {
+  const allBox = /** @type {HTMLInputElement | null} */ (document.getElementById("export_all"));
+  if (!allBox) return;
+  if (liteMode()) {
+    allBox.checked = false;
+    allBox.disabled = true;
+    allBox.title = "Needs a valid licence";
+  } else if (allBox.title === "Needs a valid licence") {
+    allBox.disabled = false;
+    allBox.title = "";
+  }
+}
+
+function licenceLine() {
+  const L = LICENCE;
+  if (!L) return "";
+  const users = Number.isFinite(L.seatsUsed) && L.seats ? ` · ${L.seatsUsed}/${L.seats} users this month` : "";
+  if (L.valid) {
+    const until = L.expiresAt ? new Date(L.expiresAt).toLocaleDateString() : "";
+    if (L.plan === "trial") return `🕒 Trial${L.tenant ? " — " + L.tenant : ""} · ${L.daysLeft} day${L.daysLeft === 1 ? "" : "s"} left${users}`;
+    return `✅ Pro licence${L.tenant ? " — " + L.tenant : ""}${until ? " · valid until " + until : ""}${users}`;
+  }
+  const why = LICENCE_REASONS[L.reason] || L.message || "licence problem";
+  return `⚠️ Lite mode — ${why}. This dashboard still exports; Tableau formatting from the cloud and "All dashboards" need a licence.`;
+}
+
+/** The licence panel: a status line for everyone, and the key box for the workbook author. */
+function ensureLicenceBox() {
+  let box = document.getElementById("licence_box");
+  if (box) return box;
+  const exportBtn = document.getElementById("export_button");
+  if (!exportBtn || !exportBtn.parentNode) return null;
+  box = document.createElement("div");
+  box.id = "licence_box";
+  box.style.cssText = "margin:6px 0 8px;font-size:11px;line-height:1.4;";
+  box.innerHTML = `<div id="licence_line" style="color:#3c4a44"></div>
+    <div id="licence_links" style="margin-top:2px"></div>
+    <div id="licence_setup" style="display:none;margin-top:6px">
+      <label for="licence_key" style="display:block;font-weight:600;margin-bottom:2px">Licence key</label>
+      <div style="display:flex;gap:6px">
+        <input id="licence_key" type="password" autocomplete="off" spellcheck="false" placeholder="eox_…"
+               style="flex:1;min-width:0;font-size:11px;padding:4px 6px">
+        <button id="licence_save" class="btn-load" style="width:auto;padding:4px 10px">Save</button>
+      </div>
+      <div style="color:#6b7a73;margin-top:2px">Saved with this workbook, so viewers don't need it.</div>
+    </div>
+    <div style="color:#9aa6a0;margin-top:2px">v${EXTENSION_VERSION}</div>`;
+  exportBtn.parentNode.insertBefore(box, exportBtn);
+  return box;
+}
+function refreshLicenceBox() {
+  const box = ensureLicenceBox();
+  if (!box) return;
+  const line = /** @type {HTMLElement} */ (box.querySelector("#licence_line"));
+  line.textContent = licenceLine();
+  const links = /** @type {HTMLElement} */ (box.querySelector("#licence_links"));
+  links.innerHTML = "";
+  const addLink = (href, text) => {
+    if (!href) return;
+    const a = document.createElement("a");
+    a.href = href; a.target = "_blank"; a.rel = "noopener"; a.textContent = text; a.style.marginRight = "10px";
+    links.appendChild(a);
+  };
+  if (LICENCE && (!LICENCE.valid || LICENCE.plan === "trial")) addLink(PRODUCT_LINKS.buy, "Buy or renew a licence");
+  if (LICENCE) addLink(PRODUCT_LINKS.help, "Help");
+  // the key box: only where the workbook can be saved (authoring), and only with a marketplace backend
+  let authoring = false;
+  try { authoring = (tableau.extensions.environment || {}).mode === "authoring"; } catch (e) { /* ignore */ }
+  const setup = /** @type {HTMLElement} */ (box.querySelector("#licence_setup"));
+  setup.style.display = authoring && LICENCE ? "block" : "none";
+}
+
+/** Wire the key box; saving a key re-checks the licence and reloads the workbook. */
+function setupLicence(dashboard, onReload) {
+  const box = ensureLicenceBox();
+  if (!box) return;
+  const input = /** @type {HTMLInputElement} */ (box.querySelector("#licence_key"));
+  const save = /** @type {HTMLButtonElement} */ (box.querySelector("#licence_save"));
+  input.value = tenantKey();
+  save.addEventListener("click", async () => {
+    save.disabled = true;
+    await writeSaved({ tenantKey: input.value.trim() });
+    await checkLicence();
+    const start = () => autoLoadWorkbook(dashboard);
+    await (onReload ? onReload(start) : start());
+    save.disabled = false;
+  });
+}
+/** The panel's "Charts as tables" switch, under "All dashboards". Remembered per workbook (and browser). */
+function setupVisualsAsTables() {
+  if (document.getElementById("visuals_as_tables")) return;
+  const allBox = document.getElementById("export_all");
+  const anchor = allBox ? (allBox.closest("label") || allBox.parentElement) : document.getElementById("export_button");
+  if (!anchor || !anchor.parentNode) return;
+  const row = document.createElement("label");
+  row.id = "visuals_as_tables_row";
+  row.style.cssText = "display:flex;align-items:center;gap:6px;margin:4px 0 6px;font-size:12px;cursor:pointer;";
+  row.title = "Off: charts are exported as Excel charts. On: each chart is exported as a table of its data, " +
+              "coloured with the chart's Tableau colours.";
+  row.innerHTML = `<input type="checkbox" id="visuals_as_tables"><span>Charts as tables (Tableau colours)</span>`;
+  if (allBox) anchor.parentNode.insertBefore(row, anchor.nextSibling);
+  else anchor.parentNode.insertBefore(row, anchor);
+  const box = /** @type {HTMLInputElement} */ (row.querySelector("input"));
+  box.checked = visualsAsTables();
+  box.addEventListener("change", () => { writeSaved({ visualsAs: box.checked ? "tables" : "charts" }); });
+}
+
+/** Tableau's "Configure…" menu: show the licence key box. */
+function openLicenceSetup() {
+  const box = ensureLicenceBox();
+  if (!box) return;
+  /** @type {HTMLElement} */ (box.querySelector("#licence_setup")).style.display = "block";
+  try { if (typeof box.scrollIntoView === "function") box.scrollIntoView({ block: "center" }); } catch (e) { /* ignore */ }
+  /** @type {HTMLElement} */ (box.querySelector("#licence_key")).focus();
 }
 
 /** Call the backend. Throws a readable Error on network failure or non-2xx. */
@@ -6614,6 +6793,9 @@ async function backendFetch(path, init = {}) {
   if (!url) throw new Error("No backend URL configured");
   const headers = { ...(init.headers || {}) };
   if (key) headers["X-Spike-Key"] = key;
+  const tk = tenantKey(), uid = userIdForSeats();
+  if (tk) headers["X-Tenant-Key"] = tk;
+  if (uid) headers["X-User-Id"] = uid;
   // a backend that never answers (tunnel down, laptop asleep) must not leave the workbook "loading" for ever
   const ctrl = typeof AbortController === "function" ? new AbortController() : null;
   const timer = ctrl ? setTimeout(() => ctrl.abort(), BACKEND_TIMEOUT_MS) : null;
@@ -6627,8 +6809,15 @@ async function backendFetch(path, init = {}) {
   if (!res.ok) {
     let text = "";
     try { text = await res.text(); } catch (e) { /* ignore */ }
-    let msg = text;
-    try { msg = JSON.parse(text).error || text; } catch (e) { /* not JSON */ }
+    let msg = text, body = null;
+    try { body = JSON.parse(text); msg = body.error || text; } catch (e) { /* not JSON */ }
+    if (body && body.error === "licence") {
+      // the licence ran out (or no key): switch to Lite mode and say why
+      const info = { valid: false, reason: body.reason, message: body.message, ...(body.licence || {}) };
+      info.valid = false;
+      if (path !== "/licence") { LICENCE = info; refreshLicenceBox(); applyLiteMode(); }
+      throw new LicenceError(info);
+    }
     throw new Error(`Backend ${res.status}: ${String(msg).slice(0, 300)}`);
   }
   return res;
@@ -6789,6 +6978,12 @@ async function autoLoadWorkbook(dashboard) {
     if (!savedFile) showWorkbookStatus("Auto-load not set up (Advanced → Backend URL)" + fallback, true);
     return;
   }
+  await checkLicence();
+  if (liteMode()) {
+    showWorkbookStatus(`Lite mode (${LICENCE_REASONS[LICENCE.reason] || "licence problem"})` +
+      (savedFile ? ` — using previously loaded ${savedFile}` : " — use 📁 to load the workbook for Tableau formatting"), true);
+    return;
+  }
 
   const gen = WORKBOOK_LOAD_GEN;                        // a newer load (or a manual 📁 load) supersedes this one
   try {
@@ -6846,6 +7041,11 @@ function setupBackendSettings(dashboard, onReload) {
   const keyIn = /** @type {HTMLInputElement} */ (document.getElementById("backend_key"));
   const saveBtn = /** @type {HTMLButtonElement} */ (document.getElementById("backend_save"));
   if (!urlIn || !keyIn || !saveBtn) return;
+  if (!advancedBackendAllowed()) {                       // production build: the backend address is built in
+    const holder = urlIn.closest("details") || urlIn.parentElement;
+    if (holder) /** @type {HTMLElement} */ (holder).style.display = "none";
+    return;
+  }
   const cfg = getBackendConfig();
   urlIn.value = readSaved("backendUrl");
   urlIn.placeholder = DEFAULT_BACKEND_URL || "https://…trycloudflare.com";
@@ -8145,11 +8345,31 @@ function buildVisualModel(model, sheetName, summary, opts = {}) {
   };
 }
 
-/* cell-native → cells; mappable charts → native Excel chart; the rest → Tableau image → data table */
-/** @param {VisualModel} visualModel @returns {RendererDecision} */
-function chooseVisualRenderer(visualModel) {
+/* -----------------------------------------------------------------------------
+ * "Charts as tables" (panel switch): every chart is exported as a crosstab – a table of its marks, coloured
+ * with the chart's Tableau colours (colour encoding: category colours or the colour scale) – instead of a
+ * native Excel chart. Tables, KPI cards and heat maps are cells either way. Charts in very small zones (KPI
+ * trend lines) stay charts while FORMAT_CONFIG.crosstabKeepsSparklines is on.
+ * --------------------------------------------------------------------------- */
+const SPARKLINE_MAX_HEIGHT_PX = 80;
+
+/** The panel's choice for this workbook / browser, else FORMAT_CONFIG.visualsAsTables. */
+function visualsAsTables() {
+  const saved = readSaved("visualsAs");
+  return saved ? saved === "tables" : !!FORMAT_CONFIG.visualsAsTables;
+}
+/** A chart small enough to be a KPI trend line (sparkline): its dashboard zone is very short. */
+function isSparklineZone(layout) {
+  return !!(layout && layout.heightPx && layout.heightPx < SPARKLINE_MAX_HEIGHT_PX);
+}
+
+/* cell-native → cells; mappable charts → native Excel chart; the rest → Tableau image → data table;
+ * opts.asTable ("Charts as tables") → every chart as a table */
+/** @param {VisualModel} visualModel @param {{ asTable?: boolean }} [opts] @returns {RendererDecision} */
+function chooseVisualRenderer(visualModel, opts = {}) {
   const type = visualModel.type;
   if (VISUAL_RENDERERS.cellTypes.has(type)) return VISUAL_RENDERERS.cell;
+  if (opts.asTable) return VISUAL_RENDERERS.crosstab;
   if (FORMAT_CONFIG.nativeCharts && VISUAL_RENDERERS.chartTypes.has(type)) return VISUAL_RENDERERS.chart;
   return imageOrFallback(visualModel);
 }
@@ -8180,7 +8400,9 @@ const VISUAL_RENDERERS = Object.freeze({
   // exported as a table of their marks (data-fallback)
   imageTypes: /** @type {Set<VisualType>} */ (new Set([VISUAL_TYPES.BAR, VISUAL_TYPES.COLUMN, VISUAL_TYPES.LINE, VISUAL_TYPES.AREA, VISUAL_TYPES.SCATTER,
                        VISUAL_TYPES.COMBO, VISUAL_TYPES.HISTOGRAM, VISUAL_TYPES.TREEMAP, VISUAL_TYPES.BUBBLE])),
-  fallback: Object.freeze({ renderer: "data-fallback", status: "warning", reason: "visual renderer not implemented yet" })
+  fallback: Object.freeze({ renderer: "data-fallback", status: "warning", reason: "visual renderer not implemented yet" }),
+  // chosen, not a fallback: the table is the requested output
+  crosstab: Object.freeze({ renderer: "data-fallback", status: "success", reason: "exported as a table (Charts as tables)", crosstab: true })
 });
 
 
@@ -8492,6 +8714,10 @@ function conversionOf(visualModel, semantics) {
   }
   if (renderer === "tableau-image") return make(STRATEGY.IMAGE_FALLBACK, "Picture (Tableau-rendered) + its data on the Visual Data sheet",
                                                   why || "no editable Excel equivalent");
+  if (renderer === "data-fallback" && visualModel.crosstab) {
+    return make(STRATEGY.CONSTRUCTED, "Table (crosstab) with the chart's Tableau colours",
+                "Chosen in the panel: Charts as tables – every mark as a row, coloured like the chart", "Exact data");
+  }
   if (renderer === "data-fallback") return make(STRATEGY.TABLE_FALLBACK, "Data table", fallbackReason(visualModel, semantics, why));
   if (renderer === "cell") {
     const vm = visualModel.viewModel;
@@ -10760,7 +10986,7 @@ async function exportToExcel() {
 function wantsAllDashboards() {
   const allBox = /** @type {HTMLInputElement} */ (document.getElementById("export_all"));
   const env = tableau.extensions.environment || {};
-  if ((allBox && !allBox.checked) || env.context === "desktop") return false;
+  if ((allBox && !allBox.checked) || env.context === "desktop" || liteMode()) return false;
   const wb = loadedWorkbook();
   return !!(wb && wb.xml && dashboardTabOrder(wb.xml).length > 1);
 }
@@ -10921,9 +11147,13 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
           error: visualModel.metadata.visualSpecError,
           spec: visualModel.source.visualSpec
         });
-        let renderDecision = chooseVisualRenderer(visualModel);
+        // "Charts as tables": this chart as a crosstab (KPI trend lines in tiny zones stay charts)
+        const asTable = visualsAsTables() && !VISUAL_RENDERERS.cellTypes.has(visualModel.type) &&
+                        !(FORMAT_CONFIG.crosstabKeepsSparklines && isSparklineZone(layout));
+        visualModel.crosstab = asTable;
+        let renderDecision = chooseVisualRenderer(visualModel, { asTable });
         // a pie or donut (one or two layers): drawn the way Tableau draws it – slices, labels, hole, tooltips
-        if (fmtModel && FORMAT_CONFIG.nativeCharts && visualModel.viewModel.fmt.pieLayers()) {
+        if (!asTable && fmtModel && FORMAT_CONFIG.nativeCharts && visualModel.viewModel.fmt.pieLayers()) {
           const pie = buildPieModel(fmtModel, sheet.name, summaryData, {
             dashboardName: dashboard.name, selectedTables: await fetchSelectedMarks(sheet),
             dataOf: name => (allSheetsData.find(x => x.sheet.name === name) || { data: null }).data
@@ -10968,7 +11198,7 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
         console.log(`[Visual] ${sheet.name}: ${visualModel.type} -> ${renderDecision.renderer} (${renderDecision.reason})`);
 
         if (renderDecision.renderer === "data-fallback" && visualModel.viewModel.kind === "chart" &&
-            FORMAT_CONFIG.chartPolicy === "skip") {
+            FORMAT_CONFIG.chartPolicy === "skip" && !asTable) {
           console.warn(`[Export] "${sheet.name}" is a chart - skipped by FORMAT_CONFIG.chartPolicy`);
           skipped.push({ name: sheet.name, reason: `UNSUPPORTED – ${renderDecision.reason} (chartPolicy "skip")` });
           continue;
@@ -11246,6 +11476,9 @@ while (FORMAT_CONFIG.groupOverflowRows && snapChanged && snapPass < MAX_SNAP_PAS
       }
     }
   }
+  // a table moved below another's collapsed rows can now sit on what was under it: everything below moves
+  // down with it (resolveCollisions only ever moves items down, and only where they really overlap)
+  if (snapChanged) resolveCollisions(placedItems);
 }
 setTableVisibleRows(placedItems);
 
@@ -11428,7 +11661,7 @@ setTableVisibleRows(placedItems);
       const conversion = conversionOf(item.visualModel, semantics);
       reportVisuals.push({ worksheet: item.name, semantics, ...conversion });
       const status = visualStatuses.find(entry => entry.worksheet === item.name);
-      if (status) Object.assign(status, { strategy: conversion.strategy, visual: semantics.visual });
+      if (status) Object.assign(status, { strategy: conversion.strategy, visual: semantics.visual, asTable: !!item.visualModel.crosstab });
       if (FORMAT_CONFIG.fallbackNotes && conversion.strategy === STRATEGY.TABLE_FALLBACK) {
         worksheet.getCell(item.gridRow + 1, item.gridCol + 1).note =
           `Tableau visual: ${semantics.visual}\nExported as: its data (TABLE_FALLBACK)\nWhy: ${conversion.reason}`;
@@ -11737,7 +11970,7 @@ function restoreWorkbookLabel() {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
-  tableau.extensions.initializeAsync().then(() => {
+  tableau.extensions.initializeAsync({ configure: () => openLicenceSetup() }).then(() => {
     const dashboard = tableau.extensions.dashboardContent.dashboard;
     /** the export waits on this while the workbook is being loaded automatically */
     let WORKBOOK_READY = Promise.resolve();
@@ -11769,6 +12002,8 @@ document.addEventListener("DOMContentLoaded", () => {
       .catch(err => console.warn("[Workbook] could not restore the remembered workbook:", err))
       .then(() => autoLoadWorkbook(dashboard)));
     setupBackendSettings(dashboard, start => (WORKBOOK_READY = trackWorkbookLoad(start)));
+    setupLicence(dashboard, start => (WORKBOOK_READY = trackWorkbookLoad(start)));
+    setupVisualsAsTables();
 
     if (exportBtn) {
       exportBtn.addEventListener("click", async () => {
