@@ -10738,8 +10738,8 @@ async function collectAllDashboards(current, onProgress) {
   /** @type {Map<string, { target?: any, note?: string }>} name → what reading it gave */
   const results = new Map();
   let finished = 0, abort = null, signInPromise = null;
-  const report = (name, stage) => { if (onProgress) onProgress(name, finished, others.length, stage); };
-
+  // count the current dashboard too (it is already read), so 2 dashboards show "1 of 2", then "2 of 2"
+  const report = (name, stage) => { if (onProgress) onProgress(name, finished + 1, others.length + 1, stage); };
   /** One-time sign-in shared by the parallel readers: only one panel, everyone waits for it. */
   const ensureSignedIn = (embedUrl, name) => {
     if (!signInPromise) {
