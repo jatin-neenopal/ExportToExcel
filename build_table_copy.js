@@ -4112,7 +4112,8 @@ function buildPieCharts(pie, block, paneRefs, o) {
     const holeTip = holeD && pie.hole.tipFor(pts);
     out.push({ x, y, w: pw, h: ph, name: o.name, xml: pieChartXml(spec),
                shapes: texts.length ? userShapesXml(texts, { w: pw, h: ph }) : null,
-               tips: [...tipsOf(shown, D, holeD || (innerPts.length ? innerD : 0), { w: pw, h: ph }),
+               // a gauge stays a plain, editable Excel chart: no tooltip wedges grouped over it
+               tips: pie.gauge ? [] : [...tipsOf(shown, D, holeD || (innerPts.length ? innerD : 0), { w: pw, h: ph }),
                       ...(holeTip ? [{ x: (pw - holeD) / 2, y: (ph - holeD) / 2, w: holeD, h: holeD, prst: "ellipse", text: holeTip, link: o.link }] : [])] });
     if (!innerPts.length) return;
     // nested donut: the inner pie is its own see-through chart exactly over the ring's hole (drawn after = on top);
@@ -4650,9 +4651,31 @@ function buildMapGaugeModel(model, sheetName, summary) {
     }
     shapes.sort((a, b) => a.first - b.first);                 // Tableau draws in summary order: later on top
     const all = shapes.flatMap(s => s.pts);
-    const c = tfFitDialCentre(all, shapes.map(sh => sh.pts));
+    // first centre: the median of the outlines' arc centres (robust: a needle or hub does not pull it off)
+    let c = tfArcCentreGuess(shapes.map(sh => sh.pts)) || tfFitDialCentre(all, shapes.map(sh => sh.pts));
     if (!c) return no("no circle fits the polygons");
-    const radii = all.map(([x, y]) => Math.hypot(x - c.cx, y - c.cy));
+    // what each polygon is: a dial band (an arc between two radii), the needle (a thin shape from the centre
+    // outwards – often a triangle) or the hub (a small shape round the centre); anything else → not a gauge
+    const dist = ([x, y]) => Math.hypot(x - c.cx, y - c.cy);
+    const Rall = Math.max(...all.map(dist));
+    shapes.forEach(sh => {
+      const d = sh.pts.map(dist), hi = Math.max(...d), lo = Math.min(...d);
+      if (hi < 0.25 * Rall) { sh.role = "hub"; return; }
+      const far = sh.pts.filter((p, i) => d[i] > 0.3 * hi);
+      const fr = far.length > 1 ? tfAngularRange(far, c) : { from: 0, to: 0 };
+      if (lo < 0.2 * Rall && hi > 0.35 * Rall && fr && fr.to - fr.from < 25) { sh.role = "needle"; return; }
+      const inner = d.filter(v => v > 0.03 * hi), loArc = inner.length ? Math.min(...inner) : 0;
+      const onEdge = d.filter(v => Math.abs(v - hi) < 0.04 * hi || Math.abs(v - loArc) < 0.04 * hi || v < 0.03 * hi).length;
+      sh.role = onEdge >= 0.85 * d.length ? "band" : "other";
+    });
+    const odd = shapes.find(sh => sh.role === "other");
+    if (odd) return no(`polygon "${odd.name}" is neither a dial band, a needle nor a hub`);
+    const bandShapes = shapes.filter(sh => sh.role === "band");
+    if (!bandShapes.length) return no("no polygon is a dial arc");
+    // the centre again from the arcs alone (the needle and hub only disturb the fit)
+    c = tfFitDialCentre(bandShapes.flatMap(sh => sh.pts), bandShapes.map(sh => sh.pts)) || c;
+    const arcPts = bandShapes.flatMap(sh => sh.pts);
+    const radii = arcPts.map(([x, y]) => Math.hypot(x - c.cx, y - c.cy));
     const R = Math.max(...radii);
     if (!(R > 0)) return no("zero radius");
     const inner = radii.filter(r => r > 0.03 * R);
@@ -4660,7 +4683,7 @@ function buildMapGaugeModel(model, sheetName, summary) {
     // a dial: (almost) every outline point lies on the outer or the inner circle, or at the centre
     const onCircle = radii.filter(r => Math.abs(r - R) < 0.04 * R || (r0 > 0 && Math.abs(r - r0) < 0.04 * R) || r < 0.03 * R).length;
     if (onCircle < 0.85 * radii.length) return no("the polygons are not arcs of one circle");
-    const ranges = shapes.map(s => ({ ...s, range: tfAngularRange(s.pts, c) })).filter(s => s.range && s.range.to - s.range.from > 0.5);
+    const ranges = bandShapes.map(s => ({ ...s, range: tfAngularRange(s.pts, c) })).filter(s => s.range && s.range.to - s.range.from > 0.5);
     if (!ranges.length) return no("no arc has an angular range");
     // one angle frame for all arcs: the first arc's, the others shifted by whole turns to overlap it
     const ref = (ranges[0].range.from + ranges[0].range.to) / 2;
@@ -4692,7 +4715,16 @@ function buildMapGaugeModel(model, sheetName, summary) {
 
     // the other layers: a needle (a line from the centre outwards) and text
     const toUnit = ([x, y]) => [(x - c.cx) / R, (y - c.cy) / R];
-    let needle = null;
+    const wrap = a => { while (a < start - 180) a += 360; while (a > start + 180) a -= 360; return a; };
+    let needle = null, hub = null;
+    const needleShape = shapes.find(sh => sh.role === "needle");
+    if (needleShape) {
+      const d = needleShape.pts.map(([x, y]) => Math.hypot(x - c.cx, y - c.cy)), far = Math.max(...d);
+      const tip = needleShape.pts[d.indexOf(far)];
+      needle = { angle: wrap(tfGaugeAngle(tip[0], tip[1], c)), length: far / R, color: needleShape.color };
+    }
+    const hubShape = shapes.find(sh => sh.role === "hub");
+    if (hubShape) hub = { color: hubShape.color, ratio: Math.max(...hubShape.pts.map(([x, y]) => Math.hypot(x - c.cx, y - c.cy))) / R };
     const texts = [];
     const extentPts = all.map(toUnit);
     for (const pane of panes) {
@@ -4707,10 +4739,7 @@ function buildMapGaugeModel(model, sheetName, summary) {
         const near = Math.min(...d), far = Math.max(...d);
         if (near < 0.2 && far > 0.4 && (!needle || far > needle.length)) {
           const tip = marks[d.indexOf(far)];
-          let angle = tfGaugeAngle(tip.xy[0], tip.xy[1], c);
-          while (angle < start - 180) angle += 360;
-          while (angle > start + 180) angle -= 360;
-          needle = { angle, length: far, color: pfmt.markColor().toUpperCase() };
+          needle = { angle: wrap(tfGaugeAngle(tip.xy[0], tip.xy[1], c)), length: far, color: pfmt.markColor().toUpperCase() };
         }
         continue;
       }
@@ -4747,9 +4776,9 @@ function buildMapGaugeModel(model, sheetName, summary) {
     const strokeRule = (polyPanes[0].style && polyPanes[0].style.rules && polyPanes[0].style.rules.mark || [])
       .find(r => r.attr === "stroke-color");
     tfLog(`Gauge (map): ${ranges.length} arcs → ${bands.length} bands over ${span.toFixed(1)}° from ${start.toFixed(1)}°, ` +
-          `hole ${(r0 / R).toFixed(2)}, needle ${needle ? needle.angle.toFixed(1) + "°" : "none"}, ${texts.length} texts`);
+          `hole ${(r0 / R).toFixed(2)}, needle ${needle ? needle.angle.toFixed(1) + "°" : "none"}, hub ${hub ? "yes" : "no"}, ${texts.length} texts`);
     return {
-      kind: "map", start, span, bands, holeRatio: r0 / R, needle, texts,
+      kind: "map", start, span, bands, holeRatio: r0 / R, needle, hub, texts,
       extent: { x0: Math.min(...xs), x1: Math.max(...xs), y0: Math.min(...ys), y1: Math.max(...ys) },
       stroke: strokeRule ? (tfArgb(strokeRule.value) || "").slice(2) || null : null,
       font: pieFont(fmt.labelFont({}))
@@ -4876,9 +4905,9 @@ function buildGaugeCharts(gauge, block, refs, o) {
     texts.push({ x: Math.max(0, Math.min(w - tw, x - tw / 2)), y: Math.max(0, Math.min(h - th, y - th / 2)), w: tw, h: th,
                  lines, anchor: "ctr", align: "ctr" });
   });
-  if (gauge.needle) {                                          // the pivot: a small disc in the needle's colour
-    const hub = Math.max(6, D * 0.05);
-    texts.push({ x: cx - hub / 2, y: cy - hub / 2, w: hub, h: hub, shape: "ellipse", fill: gauge.needle.color, lines: [] });
+  if (gauge.hub || gauge.needle) {                             // the pivot: Tableau's hub, else a small disc in the needle's colour
+    const hub = gauge.hub ? Math.max(6, D * gauge.hub.ratio) : Math.max(6, D * 0.05);
+    texts.push({ x: cx - hub / 2, y: cy - hub / 2, w: hub, h: hub, shape: "ellipse", fill: gauge.hub ? gauge.hub.color : gauge.needle.color, lines: [] });
   }
   const startInt = Math.round(((gauge.start % 360) + 360) % 360) % 360;
   const spec = {
