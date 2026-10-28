@@ -1369,6 +1369,11 @@ function createSheetFormatter(model, sheetName, onlyPanes) {
       const isPieP = p => /^pie$/i.test(p.markClass || "");
       if (drawn.length === 1) return isPieP(drawn[0]) ? { outer: drawn[0], hole: null, inner: null } : null;
       if (drawn.length !== 2) return null;
+      // a gauge's hole: a Circle layer never splits into wedges, whatever is on its Color (often Measure Names)
+      const wedgeP = p => isPieP(p) && p.encodings.some(e => e.channel === "wedge-size");
+      const wi = drawn.findIndex(wedgeP);
+      if (wi >= 0 && /^circle$/i.test(drawn[1 - wi].markClass || "") && !drawn[1 - wi].encodings.some(e => e.channel === "wedge-size"))
+        return { outer: drawn[wi], hole: 1 - wi > wi ? drawn[1 - wi] : null, inner: null };
       const splits = p => p.encodings.some(e => e.channel === "wedge-size" || (/^(color|lod)$/.test(e.channel) && e.field.type !== "qk"));
       const oi = drawn.findIndex(splits), hi = 1 - oi;
       if (oi < 0) return null;
@@ -1754,12 +1759,13 @@ function tfCalcInfo(calc) {
   if (cls === "bin") return { bin: true };
   if (cls === "categorical-bin") return { group: true };
   if (!formula) return {};
-  return { constant: tfConstantFormula(calc), calcKind: tfCalcKind(formula), formula: formula.length > 160 ? formula.slice(0, 157) + "…" : formula };
+  return { constant: tfConstantFormula(calc), calcKind: tfCalcKind(formula), formula: formula.length > 160 ? formula.slice(0, 157) + "…" : formula,
+           ...(formula.length > 160 ? { formulaFull: formula } : {}) };
 }
 
 /* Raise when the parser reads something new: a workbook model remembered by an older version is then
    parsed again from its stored XML (ui/workbook-store.js), so an update reaches workbooks loaded before it. */
-const FORMAT_MODEL_VERSION = 6;
+const FORMAT_MODEL_VERSION = 7;
 
 /** @param {string} xmlString the .twb XML @returns {FormatModel} */
 function parseTableauFormatting(xmlString) {
@@ -1873,6 +1879,7 @@ function parseTableauFormatting(xmlString) {
         yIndex: tfNum(p.getAttribute("y-index")),
         yAxisName: p.getAttribute("y-axis-name") || null,     // dual axis / multi-pane: which measure this pane draws
         markClass: mark ? mark.getAttribute("class") : "Automatic",
+        hidden: p.getAttribute("hidden") === "true",          // a map layer switched off in Tableau
         encodings,
         labelRuns: labelRuns.map(r => ({ refs: tfExtractRefs(r.text.replace(/^<|>$/g, "")), text: r.text, props: r.props })),
         tooltipRuns,
@@ -3539,7 +3546,7 @@ function pieChartXml(spec) {
   const dPts = (spec.points || []).map((p, i) =>
     `<c:dPt><c:idx val="${i}"/><c:bubble3D val="0"/><c:spPr>${fillXml(p.color)}` +
     (p.selected ? `<a:ln w="19050"><a:solidFill><a:srgbClr val="000000"/></a:solidFill></a:ln>`
-                : `<a:ln w="9525"><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill></a:ln>`) +
+                : !p.color ? NO_LINE : `<a:ln w="9525"><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill></a:ln>`) +
     `</c:spPr></c:dPt>`).join("");
   const ser = `<c:ser><c:idx val="0"/><c:order val="0"/><c:tx><c:v>${esc(spec.seriesName || "")}</c:v></c:tx>` +
     `${dPts}${pieCatXml(spec.categories, spec.ref)}${pieValXml(spec.values, spec.ref)}</c:ser>`;
@@ -3985,6 +3992,7 @@ function buildPieModel(model, sheetName, summary, opts) {
   if (!pie) return null;
   if (layers.hole) pie.hole = buildHoleSpec(scoped(layers.hole), pie);
   if (layers.inner) pie.inner = buildPieSpec(scoped(layers.inner), summary, opts);
+  pie.gauge = !layers.inner && pieIsGauge(pie, (fmt.tableBackground() || "FFFFFFFF").slice(2));
   const fit = fmt.fitMode(opts.dashboardName);                 // Entire View / Fit Width / Fit Height → the pane fills the zone
   if (/^(entire-view|fit-width)$/.test(fit || "")) pie.stretch.w = true;
   if (/^(entire-view|fit-height)$/.test(fit || "")) pie.stretch.h = true;
@@ -4081,7 +4089,11 @@ function buildPieCharts(pie, block, paneRefs, o) {
     if (!pts.length || !refs) return;
     const innerPts = innerD && refs.innerRef ? pie.inner.points.filter(p => p.rowKey === rk && p.colKey === ck) : [];
     // labels of the two rings are culled per ring, not against each other
-    const texts = [...labelsOf(pts, D / 2, pie.cullLabels), ...(innerPts.length ? labelsOf(innerPts, innerD / 2, pie.inner.cullLabels) : [])];
+    // a gauge's slice in the background colour hides part of the dial: see-through (on any background); its label
+    // and tooltip stay as Tableau shows them
+    const bgU = String(o.bg || "").toUpperCase();
+    const shown = pts.map(p => pie.gauge && p.color && String(p.color).toUpperCase() === bgU ? { ...p, hidden: true } : p);
+    const texts = [...labelsOf(shown, D / 2, pie.cullLabels), ...(innerPts.length ? labelsOf(innerPts, innerD / 2, pie.inner.cullLabels) : [])];
     // Excel's hole is see-through (it shows the chart background): a hole in another colour is a filled circle
     // under the labels
     if (holeD && pie.hole.color.toUpperCase() !== o.bg.toUpperCase())
@@ -4095,12 +4107,12 @@ function buildPieCharts(pie, block, paneRefs, o) {
       title: [rk, ck].filter(Boolean).join(" | ") || null, titleFont: pie.font, font: pie.font, bg: o.bg,
       plot: { x: (1 - D / pw) / 2, y: (1 - D / ph) / 2, w: D / pw, h: D / ph },
       holeSize: holeD ? 100 * holeD / D : innerPts.length ? 100 * innerD / D : null,
-      points: pts.map(p => ({ color: p.color, selected: p.selected })), hasShapes: texts.length > 0
+      points: shown.map(p => ({ color: p.hidden ? null : p.color, selected: p.selected })), hasShapes: texts.length > 0
     };
     const holeTip = holeD && pie.hole.tipFor(pts);
     out.push({ x, y, w: pw, h: ph, name: o.name, xml: pieChartXml(spec),
                shapes: texts.length ? userShapesXml(texts, { w: pw, h: ph }) : null,
-               tips: [...tipsOf(pts, D, holeD || (innerPts.length ? innerD : 0), { w: pw, h: ph }),
+               tips: [...tipsOf(shown, D, holeD || (innerPts.length ? innerD : 0), { w: pw, h: ph }),
                       ...(holeTip ? [{ x: (pw - holeD) / 2, y: (ph - holeD) / 2, w: holeD, h: holeD, prst: "ellipse", text: holeTip, link: o.link }] : [])] });
     if (!innerPts.length) return;
     // nested donut: the inner pie is its own see-through chart exactly over the ring's hole (drawn after = on top);
@@ -4116,6 +4128,776 @@ function buildPieCharts(pie, block, paneRefs, o) {
                tips: tipsOf(innerPts, innerD, 0, { w: innerD, h: innerD }) });
   }));
   return out;
+}
+
+
+
+/* ═══ charts/model/gauge.js ════════════════════════════════════════════════════════════════════════ */
+/* Gauges. Tableau has no gauge mark, so authors build one of two ways:
+ *  (a) from pies – a value slice, a remainder, often a thin "pointer" slice (the needle) and a slice painted the
+ *      background colour that hides the bottom half, with a circle on top as the hole. That goes through the pie
+ *      path (pieLayers accepts the coloured circle hole; a slice in the background colour is written see-through).
+ *  (b) from map layers or polygons – band arcs drawn as polygons from MAKEPOINT(r·SIN θ, −r·COS θ) points, a
+ *      needle line, tick lines and text marks. The summary data only carries the points' inputs (level, value,
+ *      point …), not their positions, so this module recomputes every layer's points by evaluating the sheet's
+ *      Tableau calculations row by row, measures the dial (centre, radii, band angles), the needle and the labels
+ *      from that geometry, and writes Excel's own gauge: a doughnut dial – the bands plus a see-through remainder –
+ *      and a pie needle, both turned to the dial's start angle, with Tableau's labels as text boxes.
+ * Anything it cannot evaluate or recognise returns null, and the sheet is exported exactly as before. */
+
+/* ── a small Tableau calculation evaluator ─────────────────────────────── */
+/* Enough of the calculation language for geometry: numbers, strings, booleans, NULL, fields, parameters,
+ * + − * / % ^, comparisons, AND / OR / NOT, IN (…), IF / ELSEIF / ELSE, CASE … WHEN [IN (…)], IIF, LOD braces
+ * {FIXED …: expr} (one value: the gauge's KPI), the math functions, MIN / MAX, aggregations over one mark,
+ * MAKEPOINT and MAKELINE. Anything else throws, and the caller gives up. */
+class TfCalcError extends Error {}
+
+function tfCalcTokens(src) {
+  const out = [];
+  const s = String(src);
+  let i = 0;
+  while (i < s.length) {
+    const c = s[i];
+    if (/\s/.test(c)) { i++; continue; }
+    if (c === "/" && s[i + 1] === "/") { while (i < s.length && s[i] !== "\n") i++; continue; }        // comment
+    if (c === "/" && s[i + 1] === "*") { const e = s.indexOf("*/", i + 2); i = e < 0 ? s.length : e + 2; continue; }
+    if (/[0-9]/.test(c) || (c === "." && /[0-9]/.test(s[i + 1] || ""))) {
+      const m = /^(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?/.exec(s.slice(i));
+      out.push({ t: "num", v: parseFloat(m[0]) }); i += m[0].length; continue;
+    }
+    if (c === "'" || c === '"') {
+      let j = i + 1, v = "";
+      while (j < s.length) { if (s[j] === c && s[j + 1] === c) { v += c; j += 2; continue; } if (s[j] === c) break; v += s[j++]; }
+      out.push({ t: "str", v }); i = j + 1; continue;
+    }
+    if (c === "[") {                                           // [field] or [ds].[field]; ]] escapes ]
+      const parts = [];
+      let j = i;
+      for (;;) {
+        let k = j + 1, v = "";
+        while (k < s.length) { if (s[k] === "]" && s[k + 1] === "]") { v += "]"; k += 2; continue; } if (s[k] === "]") break; v += s[k++]; }
+        parts.push(v); j = k + 1;
+        if (s[j] === "." && s[j + 1] === "[") { j++; continue; }
+        break;
+      }
+      out.push({ t: "field", v: parts }); i = j; continue;
+    }
+    const two = s.slice(i, i + 2);
+    if (["<=", ">=", "<>", "!=", "=="].includes(two)) { out.push({ t: "op", v: two === "==" ? "=" : two === "!=" ? "<>" : two }); i += 2; continue; }
+    if ("+-*/%^=<>(),{}:".includes(c)) { out.push({ t: c === "(" || c === ")" || c === "," || c === "{" || c === "}" || c === ":" ? c : "op", v: c }); i++; continue; }
+    const m = /^[A-Za-z_][A-Za-z0-9_]*/.exec(s.slice(i));
+    if (!m) throw new TfCalcError(`unexpected "${c}"`);
+    out.push({ t: "id", v: m[0].toUpperCase() }); i += m[0].length;
+  }
+  return out;
+}
+
+/** formula text → AST @param {string} src */
+function tfCalcParse(src) {
+  const tk = tfCalcTokens(src);
+  let p = 0;
+  const peek = () => tk[p] || { t: "eof" };
+  const isKw = (k) => peek().t === "id" && peek().v === k;
+  const take = (t, v) => {
+    const x = peek();
+    if (x.t !== t || (v !== undefined && x.v !== v)) throw new TfCalcError(`expected ${v || t}`);
+    p++; return x;
+  };
+  const kw = k => { if (!isKw(k)) throw new TfCalcError(`expected ${k}`); p++; };
+  const list = () => { take("("); const a = []; if (peek().t !== ")") { a.push(expr()); while (peek().t === ",") { p++; a.push(expr()); } } take(")"); return a; };
+  const expr = () => or();
+  const or = () => { let l = and(); while (isKw("OR")) { p++; l = { k: "or", l, r: and() }; } return l; };
+  const and = () => { let l = not(); while (isKw("AND")) { p++; l = { k: "and", l, r: not() }; } return l; };
+  const not = () => isKw("NOT") ? (p++, { k: "not", a: not() }) : cmp();
+  const cmp = () => {
+    let l = add();
+    for (;;) {
+      if (peek().t === "op" && ["=", "<>", "<", "<=", ">", ">="].includes(peek().v)) { const op = tk[p++].v; l = { k: "bin", op, l, r: add() }; continue; }
+      if (isKw("IN")) { p++; l = { k: "in", a: l, list: list() }; continue; }
+      return l;
+    }
+  };
+  const add = () => { let l = mul(); while (peek().t === "op" && (peek().v === "+" || peek().v === "-")) { const op = tk[p++].v; l = { k: "bin", op, l, r: mul() }; } return l; };
+  const mul = () => { let l = pow(); while (peek().t === "op" && ["*", "/", "%"].includes(peek().v)) { const op = tk[p++].v; l = { k: "bin", op, l, r: pow() }; } return l; };
+  const pow = () => { const l = unary(); if (peek().t === "op" && peek().v === "^") { p++; return { k: "bin", op: "^", l, r: pow() }; } return l; };
+  const unary = () => {
+    if (peek().t === "op" && (peek().v === "-" || peek().v === "+")) { const op = tk[p++].v; const a = unary(); return op === "-" ? { k: "neg", a } : a; }
+    return primary();
+  };
+  const primary = () => {
+    const x = peek();
+    if (x.t === "num") { p++; return { k: "lit", v: x.v }; }
+    if (x.t === "str") { p++; return { k: "lit", v: x.v }; }
+    if (x.t === "field") { p++; return { k: "field", parts: x.v }; }
+    if (x.t === "(") { p++; const e = expr(); take(")"); return e; }
+    if (x.t === "{") {                                         // LOD: one value for the whole view
+      p++;
+      if (isKw("FIXED") || isKw("INCLUDE") || isKw("EXCLUDE")) {
+        p++;
+        while (peek().t !== ":" && peek().t !== "eof") p++;   // the dimensions do not matter for one gauge
+        take(":");
+      }
+      const e = expr(); take("}"); return { k: "lod", a: e };
+    }
+    if (x.t === "id") {
+      p++;
+      if (x.v === "TRUE") return { k: "lit", v: true };
+      if (x.v === "FALSE") return { k: "lit", v: false };
+      if (x.v === "NULL") return { k: "lit", v: null };
+      if (x.v === "IF") {
+        const arms = [];
+        const c = expr(); kw("THEN"); arms.push([c, expr()]);
+        let other = { k: "lit", v: null };
+        for (;;) {
+          if (isKw("ELSEIF")) { p++; const c2 = expr(); kw("THEN"); arms.push([c2, expr()]); continue; }
+          if (isKw("ELSE")) { p++; other = expr(); }
+          kw("END"); break;
+        }
+        return { k: "if", arms, other };
+      }
+      if (x.v === "CASE") {
+        const subject = expr();
+        const arms = [];
+        let other = { k: "lit", v: null };
+        while (isKw("WHEN")) {
+          p++;
+          let match;
+          if (isKw("IN")) { p++; match = { inList: list() }; }
+          else { const vals = [expr()]; while (peek().t === ",") { p++; vals.push(expr()); } match = { vals }; }
+          kw("THEN"); arms.push([match, expr()]);
+        }
+        if (isKw("ELSE")) { p++; other = expr(); }
+        kw("END");
+        return { k: "case", subject, arms, other };
+      }
+      if (peek().t === "(") return { k: "call", f: x.v, args: list() };
+      throw new TfCalcError(`unknown word ${x.v}`);
+    }
+    throw new TfCalcError("unexpected end of formula");
+  };
+  const ast = expr();
+  if (peek().t !== "eof") throw new TfCalcError("unexpected text after the formula");
+  return ast;
+}
+
+const TF_CALC_NUM = v => (typeof v === "number" && isFinite(v) ? v : v === null || v === undefined ? null : typeof v === "boolean" ? +v : NaN);
+const TF_CALC_FN = {
+  PI: () => Math.PI, SIN: Math.sin, COS: Math.cos, TAN: Math.tan, ASIN: Math.asin, ACOS: Math.acos, ATAN: Math.atan,
+  ATAN2: Math.atan2, SQRT: Math.sqrt, ABS: Math.abs, EXP: Math.exp, LN: Math.log, SIGN: Math.sign, FLOOR: Math.floor,
+  CEILING: Math.ceil, INT: Math.trunc, FLOAT: v => v, SQUARE: v => v * v, RADIANS: v => v * Math.PI / 180,
+  DEGREES: v => v * 180 / Math.PI, POWER: (a, b) => Math.pow(a, b), LOG: (a, b) => b === undefined ? Math.log10(a) : Math.log(a) / Math.log(b),
+  ROUND: (a, n) => { const k = Math.pow(10, n || 0); return Math.round(a * k) / k; },
+  DIV: (a, b) => Math.trunc(a / b)
+};
+const TF_CALC_AGG = new Set(["SUM", "AVG", "MEDIAN", "ATTR", "MIN", "MAX", "AGG", "TOTAL", "WINDOW_SUM", "WINDOW_AVG", "WINDOW_MAX", "WINDOW_MIN"]);
+
+/**
+ * Evaluate an AST. env.field(parts) → a field's value for the current mark (throws when it cannot be found).
+ * One mark at a time: an aggregation of one mark is its value; MIN / MAX with two or more arguments compare them.
+ * @param {any} n @param {{ field: (parts: string[]) => any }} env
+ */
+function tfCalcEval(n, env) {
+  const ev = x => tfCalcEval(x, env);
+  switch (n.k) {
+    case "lit": return n.v;
+    case "field": return env.field(n.parts);
+    case "lod": return ev(n.a);
+    case "neg": { const v = TF_CALC_NUM(ev(n.a)); return v === null ? null : -v; }
+    case "not": { const v = ev(n.a); return v === null ? null : !v; }
+    case "and": { const l = ev(n.l); if (l === false) return false; const r = ev(n.r); return l === null || r === null ? (r === false ? false : null) : !!(l && r); }
+    case "or": { const l = ev(n.l); if (l === true) return true; const r = ev(n.r); return l === null || r === null ? (r === true ? true : null) : !!(l || r); }
+    case "in": { const a = ev(n.a); return a === null ? null : n.list.some(x => ev(x) === a); }
+    case "bin": {
+      const l = ev(n.l), r = ev(n.r);
+      if (l === null || r === null) return null;
+      if (["=", "<>", "<", "<=", ">", ">="].includes(n.op)) {
+        const a = typeof l === "string" || typeof r === "string" ? String(l) : TF_CALC_NUM(l);
+        const b = typeof l === "string" || typeof r === "string" ? String(r) : TF_CALC_NUM(r);
+        switch (n.op) { case "=": return a === b; case "<>": return a !== b; case "<": return a < b; case "<=": return a <= b; case ">": return a > b; default: return a >= b; }
+      }
+      if (n.op === "+" && (typeof l === "string" || typeof r === "string")) return String(l) + String(r);
+      const a = TF_CALC_NUM(l), b = TF_CALC_NUM(r);
+      if (isNaN(a) || isNaN(b)) throw new TfCalcError(`not a number in ${n.op}`);
+      switch (n.op) {
+        case "+": return a + b; case "-": return a - b; case "*": return a * b;
+        case "/": return b === 0 ? null : a / b; case "%": return b === 0 ? null : a % b; default: return Math.pow(a, b);
+      }
+    }
+    case "if": {
+      for (const [c, v] of n.arms) if (ev(c) === true) return ev(v);
+      return ev(n.other);
+    }
+    case "case": {
+      const s = ev(n.subject);
+      for (const [m, v] of n.arms) {
+        const hit = m.inList ? m.inList.some(x => ev(x) === s) : m.vals.some(x => ev(x) === s);
+        if (s !== null && hit) return ev(v);
+      }
+      return ev(n.other);
+    }
+    case "call": {
+      const f = n.f, args = n.args;
+      if (f === "IIF") { const c = ev(args[0]); return c === true ? ev(args[1]) : c === false ? ev(args[2]) : (args[3] ? ev(args[3]) : null); }
+      if (f === "IFNULL") { const v = ev(args[0]); return v === null ? ev(args[1]) : v; }
+      if (f === "ZN") { const v = ev(args[0]); return v === null ? 0 : v; }
+      if (f === "ISNULL") return ev(args[0]) === null;
+      if (f === "MAKEPOINT") {
+        const lat = TF_CALC_NUM(ev(args[0])), lon = TF_CALC_NUM(ev(args[1]));
+        return lat === null || lon === null || isNaN(lat) || isNaN(lon) ? null : { point: [lon, lat] };   // x = longitude, y = latitude
+      }
+      if (f === "MAKELINE") { const a = ev(args[0]), b = ev(args[1]); return a && b && a.point && b.point ? { line: [a.point, b.point] } : null; }
+      if ((f === "MIN" || f === "MAX") && args.length > 1) {
+        const vals = args.map(a => TF_CALC_NUM(ev(a)));
+        if (vals.some(v => v === null)) return null;
+        return f === "MIN" ? Math.min(...vals) : Math.max(...vals);
+      }
+      if (TF_CALC_AGG.has(f) && args.length === 1) return ev(args[0]);
+      if (f === "COUNT" || f === "COUNTD") return ev(args[0]) === null ? 0 : 1;
+      if (TF_CALC_FN[f]) {
+        const vals = args.map(a => TF_CALC_NUM(ev(a)));
+        if (vals.some(v => v === null)) return null;
+        if (vals.some(v => isNaN(v))) throw new TfCalcError(`${f}: not a number`);
+        const v = TF_CALC_FN[f](...vals);
+        return typeof v === "number" && !isFinite(v) ? null : v;
+      }
+      throw new TfCalcError(`function ${f} is not supported`);
+    }
+    default: throw new TfCalcError("unknown expression");
+  }
+}
+
+/* ── the sheet's fields for the evaluator ───────────────────────────────── */
+/**
+ * Resolves a field reference for one summary row: a parameter's current value, the row's own column, a calculated
+ * field evaluated from its formula, or – for an aggregate the row does not carry (a gauge's KPI) – the field's one
+ * value anywhere in the summary data.
+ * @param {FormatModel} model @param {any} summary @param {any[]} cols [{ name, ref, numeric }]
+ */
+function tfCalcContext(model, summary, cols) {
+  const fields = model.fields || {};
+  // a calculation's name can exist in several data sources with different formulas: the field of the given data
+  // source wins, then any data source's; a parameter is never a field
+  const fieldInfo = (name, ds) => {
+    const lower = String(name).toLowerCase();
+    const own = ds && fields[ds + "|" + lower];
+    if (own && !own.param) return own;
+    const k = Object.keys(fields).find(key => key.endsWith("|" + lower) && fields[key] && !fields[key].param);
+    return k ? fields[k] : null;
+  };
+  const paramInfo = name => fields["Parameters|" + String(name).toLowerCase()] || null;
+  const strip = s => String(s || "").replace(/^(sum|avg|min|max|agg|attr|median|count|countd|none|usr|clct|year|month|day|quarter|week)\(\s*(.*)\)$/i, "$2");
+  const colIndex = new Map();
+  const colFor = (name, ds) => {
+    const key = String(ds || "") + "|" + String(name).toLowerCase();
+    if (colIndex.has(key)) return colIndex.get(key);
+    const info = fieldInfo(name, ds);
+    const wanted = new Set([String(name).toLowerCase(), info && info.caption ? String(info.caption).toLowerCase() : null].filter(Boolean));
+    let i = cols.findIndex(c => c.ref && wanted.has(String(c.ref.name).toLowerCase()));
+    if (i < 0) i = cols.findIndex(c => wanted.has(String(c.name).toLowerCase()) || wanted.has(strip(c.name).toLowerCase()));
+    colIndex.set(key, i);
+    return i;
+  };
+  const scalar = new Map();
+  const anyValue = ci => {
+    if (scalar.has(ci)) return scalar.get(ci);
+    const r = (summary.data || []).find(row => !tfIsNull(row[ci]));
+    const v = r ? (cols[ci].numeric ? tfDvNum(r[ci]) : tfDvText(r[ci])) : null;
+    scalar.set(ci, v);
+    return v;
+  };
+  const asts = new Map();
+  const astOf = (name, formula) => {
+    if (!asts.has(name)) asts.set(name, tfCalcParse(formula));
+    return asts.get(name);
+  };
+  const formulaOf = info => {
+    const f = info && (info.formulaFull || info.formula);
+    return f && !/…$/.test(f) ? f : null;
+  };
+  /** an evaluator bound to one summary row (null: no row – the KPI-level values only) */
+  const forRow = (row, dsHint) => {
+    const memo = new Map();
+    const dsStack = [dsHint || ""];
+    const env = {
+      depth: 0,
+      field(parts) {
+        const name = parts[parts.length - 1];
+        const ds = parts.length > 1 ? parts[0] : dsStack[dsStack.length - 1];
+        if (/^parameters$/i.test(ds) || (!ds && paramInfo(name) && !fieldInfo(name))) {
+          const p = paramInfo(name);
+          if (!p) throw new TfCalcError(`unknown parameter ${name}`);
+          const v = p.constant !== undefined ? p.constant : p.value;
+          const n = typeof v === "number" ? v : parseFloat(String(v).replace(/^"|"$/g, ""));
+          return isFinite(n) ? n : String(v).replace(/^"|"$/g, "");
+        }
+        const mkey = ds + "|" + name;
+        if (memo.has(mkey)) return memo.get(mkey);
+        const ci = colFor(name, ds);
+        const info = fieldInfo(name, ds), formula = formulaOf(info);
+        const located = !!formula && (info.datatype === "spatial" || /MAKEPOINT|MAKELINE/i.test(formula));
+        let v;
+        if (row && ci >= 0 && !tfIsNull(row[ci]) && !located) v = cols[ci].numeric ? tfDvNum(row[ci]) : tfDvText(row[ci]);
+        else {
+          if (formula) {
+            if (++env.depth > 40) throw new TfCalcError("calculations nest too deep");
+            dsStack.push(info.ds || ds);
+            try { v = tfCalcEval(astOf((info.ds || ds) + "|" + name, formula), env); }
+            finally { dsStack.pop(); env.depth--; }
+          } else if (ci >= 0) v = anyValue(ci);              // an aggregate the row does not carry: its one value
+          else throw new TfCalcError(`field ${name} not found`);
+        }
+        memo.set(mkey, v);
+        return v;
+      }
+    };
+    return env;
+  };
+  return { forRow, colFor, fieldInfo, formulaOf, paramInfo };
+}
+
+/* ── geometry ───────────────────────────────────────────────────────────── */
+/** least-squares circle through points (Kåsa): { cx, cy } @param {number[][]} pts */
+function tfFitCircleCentre(pts) {
+  let sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0, sxz = 0, syz = 0, sz = 0;
+  const n = pts.length;
+  for (const [x, y] of pts) {
+    const z = x * x + y * y;
+    sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y; sxz += x * z; syz += y * z; sz += z;
+  }
+  // solve [sxx sxy sx; sxy syy sy; sx sy n] [D E F]ᵀ = −[sxz syz sz]ᵀ  (x² + y² + Dx + Ey + F = 0)
+  const A = [[sxx, sxy, sx], [sxy, syy, sy], [sx, sy, n]], b = [-sxz, -syz, -sz];
+  const det = m => m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+  const d = det(A);
+  if (Math.abs(d) < 1e-12) return null;
+  const col = k => A.map((r, i) => r.map((v, j) => j === k ? b[i] : v));
+  const D = det(col(0)) / d, E = det(col(1)) / d;
+  return { cx: -D / 2, cy: -E / 2 };
+}
+
+/**
+ * A dial's centre from its outlines: three points along one arc define the arc's centre exactly; triples that
+ * straddle a corner (outer arc → inner arc) do not, so the median of all triples' centres wins.
+ * @param {number[][][]} paths ordered outlines @returns {{ cx: number, cy: number } | null}
+ */
+function tfArcCentreGuess(paths) {
+  const xs = [], ys = [];
+  for (const path of paths) {
+    const n = path.length;
+    if (n < 6) continue;
+    const k = Math.max(1, Math.floor(n / 40));                 // points a little apart: less rounding noise
+    for (let i = 0; i + 2 * k < n; i += k) {
+      const [ax, ay] = path[i], [bx, by] = path[i + k], [cx, cy] = path[i + 2 * k];
+      const d = 2 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by));
+      const span = Math.hypot(cx - ax, cy - ay);
+      if (Math.abs(d) < 1e-12 * Math.max(1, span * span)) continue;   // straight: no circle
+      const a2 = ax * ax + ay * ay, b2 = bx * bx + by * by, c2 = cx * cx + cy * cy;
+      xs.push((a2 * (by - cy) + b2 * (cy - ay) + c2 * (ay - by)) / d);
+      ys.push((a2 * (cx - bx) + b2 * (ax - cx) + c2 * (bx - ax)) / d);
+    }
+  }
+  if (xs.length < 3) return null;
+  const med = v => { const s = v.slice().sort((p, q) => p - q); return s[Math.floor(s.length / 2)]; };
+  return { cx: med(xs), cy: med(ys) };
+}
+
+/**
+ * The centre of a dial: its band outlines lie on two concentric circles (outer and inner edge) – a plain circle
+ * fit is biased on such partial arcs. Starting from the algebraic fit, the origin and the points' centroid, each
+ * guess is refined (Gauss–Newton) so every point lies on one of the two circles; the best fit wins.
+ * @param {number[][]} pts @returns {{ cx: number, cy: number, rms: number } | null}
+ */
+function tfFitDialCentre(pts, paths) {
+  if (pts.length < 3) return null;
+  const mean = pts.reduce((a, [x, y]) => [a[0] + x / pts.length, a[1] + y / pts.length], [0, 0]);
+  const guesses = [tfArcCentreGuess(paths || [pts]), tfFitCircleCentre(pts), { cx: 0, cy: 0 }, { cx: mean[0], cy: mean[1] }].filter(Boolean);
+  let best = null;
+  for (const g of guesses) {
+    let c = { cx: g.cx, cy: g.cy }, rms = Infinity;
+    for (let it = 0; it < 40; it++) {
+      const d = pts.map(([x, y]) => Math.hypot(x - c.cx, y - c.cy));
+      const hi = Math.max(...d), lo = Math.min(...d.filter(v => v > 0.03 * hi));
+      const two = hi - lo > 0.05 * hi, mid = (hi + lo) / 2;
+      const group = d.map(v => v <= 0.03 * hi ? -1 : two && v < mid ? 0 : 1);   // −1: the centre itself
+      const rad = [0, 1].map(k => { const ix = d.map((v, i) => i).filter(i => group[i] === k); return ix.length ? ix.reduce((s, i) => s + d[i], 0) / ix.length : 0; });
+      let a11 = 0, a12 = 0, a22 = 0, b1 = 0, b2 = 0, sse = 0, n = 0;
+      d.forEach((di, i) => {
+        if (group[i] < 0) return;
+        const ux = (pts[i][0] - c.cx) / di, uy = (pts[i][1] - c.cy) / di, e = di - rad[group[i]];
+        a11 += ux * ux; a12 += ux * uy; a22 += uy * uy; b1 += ux * e; b2 += uy * e; sse += e * e; n++;
+      });
+      rms = n ? Math.sqrt(sse / n) / (hi || 1) : Infinity;
+      const det = a11 * a22 - a12 * a12;
+      if (Math.abs(det) < 1e-12) break;
+      const dx = (a22 * b1 - a12 * b2) / det, dy = (a11 * b2 - a12 * b1) / det;
+      c = { cx: c.cx + dx, cy: c.cy + dy };
+      if (Math.hypot(dx, dy) < 1e-10 * (hi || 1)) break;
+    }
+    if (!best || rms < best.rms) best = { ...c, rms };
+  }
+  return best;
+}
+
+/** degrees clockwise from 12 o'clock of (x, y) around the centre */
+const tfGaugeAngle = (x, y, c) => Math.atan2(x - c.cx, y - c.cy) * 180 / Math.PI;
+
+/** a polygon's angular range [from, to] (degrees clockwise from 12), unwrapped along its outline */
+function tfAngularRange(pts, c) {
+  let prev = null, off = 0, lo = Infinity, hi = -Infinity;
+  for (const [x, y] of pts) {
+    if (Math.hypot(x - c.cx, y - c.cy) < 1e-9) continue;     // the centre itself has no angle
+    let a = tfGaugeAngle(x, y, c) + off;
+    if (prev !== null) {
+      while (a - prev > 180) { a -= 360; off -= 360; }
+      while (a - prev < -180) { a += 360; off += 360; }
+    }
+    prev = a;
+    lo = Math.min(lo, a); hi = Math.max(hi, a);
+  }
+  return isFinite(lo) ? { from: lo, to: hi } : null;
+}
+
+/** Tableau's "Automatic" number format: thousands separators; whole numbers from 1,000 up, else up to 2 decimals */
+function tfAutoNumber(v) {
+  const dec = Math.abs(v) >= 1000 || Number.isInteger(v) ? 0 : 2;
+  return v.toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: dec });
+}
+
+/* ── map / polygon gauge model ───────────────────────────────────────────── */
+/**
+ * A gauge drawn with map layers or polygons, rebuilt from its own calculations; null when the sheet is not one
+ * (or anything cannot be evaluated). The result describes the dial in degrees clockwise from 12 o'clock:
+ *   { kind: "map", start, span, bands: [{ from, to, color, name }], holeRatio, needle: { angle, color } | null,
+ *     texts: [{ x, y (gauge units, centre 0,0, radius 1), lines, size }], extent: { x0, x1, y0, y1 }, stroke }
+ * @param {FormatModel} model @param {string} sheetName @param {any} summary
+ */
+function buildMapGaugeModel(model, sheetName, summary) {
+  const no = why => { tfLog(`Gauge (map) ${sheetName}: not rebuilt – ${why}`); return null; };
+  try {
+    const fmt = createSheetFormatter(model, sheetName);
+    const sheet = model.sheets && model.sheets[sheetName];
+    if (!sheet || !summary || !(summary.data || []).length) return no("no sheet or no data");
+    const panes = (sheet.panes || []).filter(p => p.encodings && p.encodings.length && !p.hidden);   // hidden layers are not drawn
+    const polyPanes = panes.filter(p => /^polygon$/i.test(p.markClass || ""));
+    if (!polyPanes.length) return no("no polygon layer");
+    const cols = (summary.columns || []).map((c, i) => {
+      const name = c.fieldName || c.fieldId || `Col${i + 1}`;
+      const byId = /:(qk|nk|ok)(:\d+)?\]$/.test(c.fieldId || "") ? tfParseFieldRef(c.fieldId) : null;
+      return { name, ref: byId || fmt.matchName(name), numeric: /^(int|float|real|integer|number)$/i.test(String(c.dataType || "")) };
+    });
+    const ctx = tfCalcContext(model, summary, cols);
+    const xyRefs = { x: (sheet.cols || []).find(r => r.type === "qk"), y: (sheet.rows || []).find(r => r.type === "qk") };
+    const geoGenerated = r => r && /\(generated\)$/i.test(r.name || "");
+
+    /** a pane's marks: the summary rows that belong to it, each with its evaluated position */
+    const marksOf = pane => {
+      const enc = pane.encodings;
+      const spatial = enc.map(e => e.field).find(f => {
+        const info = ctx.fieldInfo(f.name, f.ds);
+        return info && (info.datatype === "spatial" || /MAKEPOINT|MAKELINE/i.test(ctx.formulaOf(info) || ""));
+      });
+      const useXY = !spatial && xyRefs.x && xyRefs.y && !geoGenerated(xyRefs.x) && !geoGenerated(xyRefs.y);
+      if (!spatial && !useXY) return null;
+      // this pane's rows: its location field (or both axis fields) has a value
+      const keyCols = spatial ? [ctx.colFor(spatial.name, spatial.ds)] : [ctx.colFor(xyRefs.x.name, xyRefs.x.ds), ctx.colFor(xyRefs.y.name, xyRefs.y.ds)];
+      if (keyCols.some(ci => ci < 0)) return null;
+      // layers share columns (two text layers on one location field): a layer's rows carry all of its own fields
+      enc.forEach(e => {
+        if (/^parameters$/i.test(e.field.ds || "")) return;
+        const ci = ctx.colFor(e.field.name, e.field.ds);
+        if (ci >= 0 && !keyCols.includes(ci)) keyCols.push(ci);
+      });
+      const out = [];
+      (summary.data || []).forEach((row, ri) => {
+        if (keyCols.some(ci => tfIsNull(row[ci]))) return;
+        let xy = null;
+        if (spatial) { const v = ctx.forRow(row, spatial.ds).field([spatial.name]); xy = v && v.point; }
+        else {
+          const env = ctx.forRow(row, xyRefs.x.ds);
+          const x = env.field([xyRefs.x.name]), y = env.field([xyRefs.y.name]);
+          xy = typeof x === "number" && typeof y === "number" ? [x, y] : null;
+        }
+        if (xy && xy.every(isFinite)) out.push({ row, ri, xy });
+      });
+      return out;
+    };
+
+    // dial: every polygon pane's shapes, one per colour member (and other discrete detail), in drawing order
+    const shapes = [];
+    for (const pane of polyPanes) {
+      const pfmt = createSheetFormatter(model, sheetName, [pane]);
+      const marks = marksOf(pane);
+      if (!marks || marks.length < 6) return no("a polygon layer's positions could not be computed");
+      const pathF = (pane.encodings.find(e => e.channel === "path") || {}).field;
+      const pi = pathF ? ctx.colFor(pathF.name, pathF.ds) : -1;
+      const enc = pfmt.colorEncoding();
+      const ci = enc ? ctx.colFor(enc.ref.name, enc.ref.ds) : -1;
+      const groupCols = pane.encodings.filter(e => /^(color|lod|detail)$/.test(e.channel) && e.field.type !== "qk")
+        .map(e => ctx.colFor(e.field.name, e.field.ds)).filter(i => i >= 0 && i !== pi);
+      const groups = new Map();
+      marks.forEach(m => {
+        const key = groupCols.map(i => tfDvText(m.row[i])).join("\u0001");
+        if (!groups.has(key)) groups.set(key, { key, marks: [], first: m.ri });
+        groups.get(key).marks.push(m);
+      });
+      const vals = [...groups.values()].map(g => ci >= 0 ? (enc.continuous ? tfDvNum(g.marks[0].row[ci]) : tfDvText(g.marks[0].row[ci])) : null);
+      const scale = ci >= 0 ? tfBuildColorScale(pfmt, enc, vals) : null;
+      [...groups.values()].forEach((g, k) => {
+        if (pi >= 0) g.marks.sort((a, b) => (tfDvNum(a.row[pi]) || 0) - (tfDvNum(b.row[pi]) || 0));
+        const argb = scale ? scale(vals[k]) : null;
+        shapes.push({ pts: g.marks.map(m => m.xy), color: (argb ? argb.slice(2) : pfmt.markColor()).toUpperCase(),
+                      name: ci >= 0 ? tfDvText(g.marks[0].row[ci]) : "", first: g.first });
+      });
+    }
+    shapes.sort((a, b) => a.first - b.first);                 // Tableau draws in summary order: later on top
+    const all = shapes.flatMap(s => s.pts);
+    const c = tfFitDialCentre(all, shapes.map(sh => sh.pts));
+    if (!c) return no("no circle fits the polygons");
+    const radii = all.map(([x, y]) => Math.hypot(x - c.cx, y - c.cy));
+    const R = Math.max(...radii);
+    if (!(R > 0)) return no("zero radius");
+    const inner = radii.filter(r => r > 0.03 * R);
+    const r0 = inner.length ? Math.min(...inner) : 0;
+    // a dial: (almost) every outline point lies on the outer or the inner circle, or at the centre
+    const onCircle = radii.filter(r => Math.abs(r - R) < 0.04 * R || (r0 > 0 && Math.abs(r - r0) < 0.04 * R) || r < 0.03 * R).length;
+    if (onCircle < 0.85 * radii.length) return no("the polygons are not arcs of one circle");
+    const ranges = shapes.map(s => ({ ...s, range: tfAngularRange(s.pts, c) })).filter(s => s.range && s.range.to - s.range.from > 0.5);
+    if (!ranges.length) return no("no arc has an angular range");
+    // one angle frame for all arcs: the first arc's, the others shifted by whole turns to overlap it
+    const ref = (ranges[0].range.from + ranges[0].range.to) / 2;
+    ranges.forEach(s => {
+      const mid = (s.range.from + s.range.to) / 2;
+      const k = Math.round((ref - mid) / 360);
+      s.range = { from: s.range.from + 360 * k, to: s.range.to + 360 * k };
+    });
+    const start = Math.min(...ranges.map(s => s.range.from)), end = Math.max(...ranges.map(s => s.range.to));
+    const span = Math.min(360, end - start);
+    if (span < 30) return no("the arcs span under 30°");
+    // the visible bands: at each angle, the arc drawn last that covers it (overlapping arcs = layered bands)
+    const bands = [];
+    const STEP = 0.25;
+    for (let a = start + STEP / 2; a < start + span; a += STEP) {
+      let top = null;
+      for (const s of ranges) if (a >= s.range.from - 1e-6 && a <= s.range.to + 1e-6) top = s;
+      const color = top ? top.color : null, name = top ? top.name : "";
+      const last = bands[bands.length - 1];
+      if (last && last.color === color && last.name === name) last.to = a + STEP / 2;
+      else bands.push({ from: a - STEP / 2, to: a + STEP / 2, color, name });
+    }
+    // snap band edges to the arcs' own end angles (the sampling is only 0.25° fine)
+    const edges = ranges.flatMap(s => [s.range.from, s.range.to]);
+    bands.forEach(b => {
+      const snap = v => { const e = edges.find(x => Math.abs(x - v) <= STEP); return e === undefined ? v : e; };
+      b.from = snap(b.from); b.to = snap(b.to);
+    });
+
+    // the other layers: a needle (a line from the centre outwards) and text
+    const toUnit = ([x, y]) => [(x - c.cx) / R, (y - c.cy) / R];
+    let needle = null;
+    const texts = [];
+    const extentPts = all.map(toUnit);
+    for (const pane of panes) {
+      if (polyPanes.includes(pane)) continue;
+      const mark = String(pane.markClass || "").toLowerCase();
+      const marks = marksOf(pane);
+      if (!marks || !marks.length) continue;
+      const pfmt = createSheetFormatter(model, sheetName, [pane]);
+      marks.forEach(m => extentPts.push(toUnit(m.xy)));
+      if (mark === "line" && marks.length >= 2) {
+        const d = marks.map(m => Math.hypot(m.xy[0] - c.cx, m.xy[1] - c.cy) / R);
+        const near = Math.min(...d), far = Math.max(...d);
+        if (near < 0.2 && far > 0.4 && (!needle || far > needle.length)) {
+          const tip = marks[d.indexOf(far)];
+          let angle = tfGaugeAngle(tip.xy[0], tip.xy[1], c);
+          while (angle < start - 180) angle += 360;
+          while (angle > start + 180) angle -= 360;
+          needle = { angle, length: far, color: pfmt.markColor().toUpperCase() };
+        }
+        continue;
+      }
+      if (mark === "text" || pfmt.markLabelsShown()) {
+        if (mark !== "text") continue;                         // labels of other marks are not reproduced
+        const tpl = pfmt.labelRunsTemplate();
+        if (!tpl.length) continue;
+        marks.forEach(m => {
+          const valueOf = ref => {
+            const fmtOf = v => {
+              const nf = pfmt.numFmtFor(ref) || (/^parameters$/i.test(ref.ds || "") ? (ctx.paramInfo(ref.name) || {}).defaultFormat : null);
+              return typeof v === "number" ? formatNum(v, nf) || tfAutoNumber(v) : String(v);
+            };
+            try {
+              if (/^parameters$/i.test(ref.ds || "")) { const v = ctx.forRow(null).field(["Parameters", ref.name]); return v === null ? "" : fmtOf(v); }
+              const ci = ctx.colFor(ref.name, ref.ds);
+              // the row's own value as Tableau formatted it
+              if (ci >= 0 && !tfIsNull(m.row[ci])) return formatNum(tfDvNum(m.row[ci]), pfmt.numFmtFor(ref)) || tfDvText(m.row[ci]);
+              // a value another row carries (the KPI on the needle layer): Tableau's formatting of that row
+              if (ci >= 0) { const r2 = (summary.data || []).find(r => !tfIsNull(r[ci])); if (r2) return formatNum(tfDvNum(r2[ci]), pfmt.numFmtFor(ref)) || tfDvText(r2[ci]); }
+              const v = ctx.forRow(m.row, ref.ds).field([ref.name]);
+              return v === null || v === undefined || typeof v === "object" ? "" : fmtOf(v);
+            } catch (e) { return ""; }
+          };
+          const lines = renderTemplate(tpl, valueOf).map(line => line.map(x => ({ text: x.text, font: pieFont(pfmt.labelFont(x.props)) })));
+          if (lines.length && lines.some(l => l.some(x => x.text.trim()))) {
+            const [ux, uy] = toUnit(m.xy);
+            texts.push({ x: ux, y: uy, lines });
+          }
+        });
+      }
+    }
+    const xs = extentPts.map(p => p[0]), ys = extentPts.map(p => p[1]);
+    const strokeRule = (polyPanes[0].style && polyPanes[0].style.rules && polyPanes[0].style.rules.mark || [])
+      .find(r => r.attr === "stroke-color");
+    tfLog(`Gauge (map): ${ranges.length} arcs → ${bands.length} bands over ${span.toFixed(1)}° from ${start.toFixed(1)}°, ` +
+          `hole ${(r0 / R).toFixed(2)}, needle ${needle ? needle.angle.toFixed(1) + "°" : "none"}, ${texts.length} texts`);
+    return {
+      kind: "map", start, span, bands, holeRatio: r0 / R, needle, texts,
+      extent: { x0: Math.min(...xs), x1: Math.max(...xs), y0: Math.min(...ys), y1: Math.max(...ys) },
+      stroke: strokeRule ? (tfArgb(strokeRule.value) || "").slice(2) || null : null,
+      font: pieFont(fmt.labelFont({}))
+    };
+  } catch (e) {
+    tfLog(`Gauge (map): not rebuilt – ${e.message}`);
+    return null;
+  }
+}
+
+/* ── output ─────────────────────────────────────────────────────────────── */
+/**
+ * The gauge on the chart data sheet: one row per dial band and the needle's three wedges, in degrees, so the
+ * chart's series are linked to cells. @returns {{ dial: any, needle: any, nextRow: number }}
+ */
+function writeGaugeData(ds, startRow, gauge, name) {
+  ds.getCell(startRow, 1).value = name;
+  ds.getCell(startRow, 1).font = { bold: true };
+  ["Dial band", "Degrees", "From (°)", "To (°)", "Colour"].forEach((h, k) => { ds.getCell(startRow + 1, k + 1).value = h; });
+  ds.getRow(startRow + 1).font = { bold: true };
+  let row = startRow + 2;
+  const dial = gaugeDialSlices(gauge);
+  const first = row;
+  dial.forEach(s => {
+    [s.name, s.value, s.from, s.to, s.color ? "#" + s.color : "(see-through)"].forEach((v, k) => { ds.getCell(row, k + 1).value = v; });
+    row++;
+  });
+  const dialRef = { sheet: ds.name, cat: `$A$${first}:$A$${row - 1}`, val: `$B$${first}:$B$${row - 1}` };
+  let needleRef = null;
+  const nd = gaugeNeedleSlices(gauge);
+  if (nd) {
+    row++;
+    ds.getCell(row, 1).value = "Needle"; ds.getCell(row, 1).font = { bold: true };
+    const f = ++row;
+    nd.forEach(s => { ds.getCell(row, 1).value = s.name; ds.getCell(row, 2).value = s.value; row++; });
+    needleRef = { sheet: ds.name, cat: `$A$${f}:$A$${row - 1}`, val: `$B$${f}:$B$${row - 1}` };
+  }
+  return { panes: { dial: dialRef, needle: needleRef }, nextRow: row + 1 };
+}
+
+/** the dial's wedges from its start angle: the bands, then the see-through rest of the circle */
+function gaugeDialSlices(gauge) {
+  const out = gauge.bands.map(b => ({ name: b.name || "Band", value: +(b.to - b.from).toFixed(4),
+    from: +(b.from - gauge.start).toFixed(2), to: +(b.to - gauge.start).toFixed(2), color: b.color }));
+  const rest = 360 - gauge.span;
+  if (rest > 0.01) out.push({ name: "(hidden)", value: +rest.toFixed(4), from: +gauge.span.toFixed(2), to: 360, color: null });
+  return out;
+}
+
+/** the needle as three pie wedges from the dial's start: see-through, the needle, see-through */
+function gaugeNeedleSlices(gauge) {
+  if (!gauge.needle) return null;
+  const w = 1.6;                                               // degrees: a thin but visible needle
+  const at = Math.max(0, Math.min(gauge.span, gauge.needle.angle - gauge.start));
+  const before = Math.max(0, at - w / 2);
+  return [{ name: "Before the needle", value: +before.toFixed(4) },
+          { name: "Needle", value: w },
+          { name: "After the needle", value: +(360 - before - w).toFixed(4) }];
+}
+
+/**
+ * Excel's gauge: a doughnut dial and a pie needle in one plot area, both turned to the dial's start
+ * (firstSliceAng, whole degrees clockwise from 12 o'clock). spec: { dial, needle, firstSliceAng, holeSize, plot,
+ * bg, font, needleColor, stroke, hasShapes, ref: { dial, needle } }
+ */
+function gaugeChartXml(spec) {
+  const pt = (i, color, line) => `<c:dPt><c:idx val="${i}"/><c:bubble3D val="0"/><c:spPr>${fillXml(color)}` +
+    (line && color ? `<a:ln w="9525"><a:solidFill><a:srgbClr val="${line}"/></a:solidFill></a:ln>` : NO_LINE) + `</c:spPr></c:dPt>`;
+  const ser = (idx, name, slices, ref, line) => `<c:ser><c:idx val="${idx}"/><c:order val="${idx}"/><c:tx><c:v>${esc(name)}</c:v></c:tx>` +
+    slices.map((s, i) => pt(i, s.color, line)).join("") +
+    `${pieCatXml(slices.map(s => s.name), ref)}${pieValXml(slices.map(s => s.value), ref)}</c:ser>`;
+  const ang = `<c:firstSliceAng val="${spec.firstSliceAng}"/>`;
+  const dial = spec.holeSize
+    ? `<c:doughnutChart><c:varyColors val="1"/>${ser(0, "Dial", spec.dial, spec.ref.dial, spec.stroke)}${ang}` +
+      `<c:holeSize val="${Math.max(10, Math.min(90, Math.round(spec.holeSize)))}"/></c:doughnutChart>`
+    : `<c:pieChart><c:varyColors val="1"/>${ser(0, "Dial", spec.dial, spec.ref.dial, spec.stroke)}${ang}</c:pieChart>`;
+  const needle = spec.needle
+    ? `<c:pieChart><c:varyColors val="1"/>${ser(1, "Needle", spec.needle.map((s, i) => ({ ...s, color: i === 1 ? spec.needleColor : null })), spec.ref.needle, null)}${ang}</c:pieChart>`
+    : "";
+  return XML_DECL +
+    `<c:chartSpace xmlns:c="${NS.c}" xmlns:a="${NS.a}" xmlns:r="${NS.r}">` +
+    `<c:roundedCorners val="0"/><c:chart><c:autoTitleDeleted val="1"/>` +
+    `<c:plotArea>${layoutXml(spec.plot)}${dial}${needle}<c:spPr><a:noFill/>${NO_LINE}</c:spPr></c:plotArea>` +
+    `<c:plotVisOnly val="1"/><c:dispBlanksAs val="gap"/></c:chart>` +
+    `<c:spPr>${fillXml(spec.bg)}${NO_LINE}</c:spPr>${txPrXml(spec.font)}` +
+    (spec.hasShapes ? `<c:userShapes r:id="rId1"/>` : "") + `</c:chartSpace>`;
+}
+
+/**
+ * The chart job for a map / polygon gauge in a block of w × h px: the dial sized and placed the way Tableau's map
+ * fits all marks into the zone (but never taller than the block: Excel cannot draw a plot area outside its
+ * chart), Tableau's text marks as text boxes at their own positions, a hub over the needle's pivot.
+ * @param {any} gauge buildMapGaugeModel @param {{ w: number, h: number }} block @param {any} refs writeGaugeData
+ * @param {{ name: string, bg: string }} o @returns {any[]}
+ */
+function buildGaugeCharts(gauge, block, refs, o) {
+  const M = ZONE_MARGIN;
+  const w = Math.max(40, block.w - 2 * M), h = Math.max(40, block.h - M);
+  // px per gauge unit (centre 0,0, radius 1): every mark fits – Tableau's map zooms to its marks – and the whole
+  // circle stays inside the chart (Excel cannot draw a plot area outside it), so the hidden half needs room too
+  const ex = gauge.extent, padX = 0.08 * (ex.x1 - ex.x0 || 2), padY = 0.08 * (ex.y1 - ex.y0 || 2);
+  const x0 = Math.min(ex.x0 - padX, -1), x1 = Math.max(ex.x1 + padX, 1), y0 = ex.y0 - padY, y1 = ex.y1 + padY;
+  let k = Math.min(w / (x1 - x0), w / 2, h / 2, h / (y1 - y0));
+  let cyMin = 0, cyMax = 0;
+  for (let guard = 0; guard < 60; guard++, k *= 0.96) {
+    cyMin = Math.max(k, y1 * k);                               // the circle's top and the highest mark inside
+    cyMax = Math.min(h - k, h + y0 * k);                       // its bottom and the lowest mark inside
+    if (cyMin <= cyMax) break;
+  }
+  k = Math.max(4, k);
+  const D = 2 * k;
+  const cx = Math.max(-x0 * k, Math.min(w - x1 * k, w / 2 - (ex.x0 + ex.x1) / 2 * k));
+  const cy = Math.max(cyMin, Math.min(cyMax, h / 2 + (ex.y0 + ex.y1) / 2 * k));
+  const texts = [];
+  const textScale = FORMAT_CONFIG.tableauTextScale || (typeof window !== "undefined" && window.devicePixelRatio) || 1;
+  gauge.texts.forEach(t => {
+    const lines = t.lines;
+    const sizes = lines.flatMap(l => l.map(x => x.font.size || 9));
+    const pt = Math.max(...sizes, 9);
+    const px = pt * 96 / 72 * textScale;
+    const tw = Math.max(...lines.map(l => l.reduce((s, x) => s + textWidthPx(x.text, x.font, (x.font.size || 9) * 96 / 72 * textScale), 0))) + 6;
+    const th = lines.length * px * LABEL_LINE_EM;
+    const x = cx + t.x * k, y = cy - t.y * k;
+    texts.push({ x: Math.max(0, Math.min(w - tw, x - tw / 2)), y: Math.max(0, Math.min(h - th, y - th / 2)), w: tw, h: th,
+                 lines, anchor: "ctr", align: "ctr" });
+  });
+  if (gauge.needle) {                                          // the pivot: a small disc in the needle's colour
+    const hub = Math.max(6, D * 0.05);
+    texts.push({ x: cx - hub / 2, y: cy - hub / 2, w: hub, h: hub, shape: "ellipse", fill: gauge.needle.color, lines: [] });
+  }
+  const startInt = Math.round(((gauge.start % 360) + 360) % 360) % 360;
+  const spec = {
+    dial: gaugeDialSlices(gauge), needle: gaugeNeedleSlices(gauge), firstSliceAng: startInt,
+    holeSize: gauge.holeRatio > 0.05 ? 100 * gauge.holeRatio : null,
+    plot: { x: (cx - D / 2) / w, y: (cy - D / 2) / h, w: D / w, h: D / h },
+    bg: o.bg, font: gauge.font, needleColor: gauge.needle ? gauge.needle.color : null,
+    stroke: gauge.stroke, hasShapes: texts.length > 0, ref: refs
+  };
+  return [{ x: M, y: 0, w, h, name: o.name, xml: gaugeChartXml(spec),
+            shapes: texts.length ? userShapesXml(texts, { w, h }) : null, tips: [] }];
+}
+
+/** a pie / donut gauge: one slice painted the background colour (Tableau's trick to hide the bottom half) */
+function pieIsGauge(pie, bg) {
+  const total = pie.points.reduce((s, p) => s + Math.abs(p.value || 0), 0);
+  const bgU = String(bg || "FFFFFF").toUpperCase();
+  return total > 0 && pie.points.some(p => p.color && String(p.color).toUpperCase() === bgU &&
+                                         Math.abs(p.value) / total >= 0.2 && Math.abs(p.value) / total <= 0.6);
 }
 
 
@@ -8549,6 +9331,7 @@ function describeVisual(visualModel, model) {
   const name = () => {
     switch (type) {
       case VISUAL_TYPES.MAP: case VISUAL_TYPES.MAP_FILLED: {
+        if (visualModel.gauge) { evidence.push("polygon arcs + needle rebuilt from the workbook's calculations"); return "Gauge"; }
         const geoDims = [...detail, ...shelfDims, ...color, ...text].filter(r => !isMeasure(r) && !GEO_GENERATED.test(r.name) &&
                                                                              !!(describeField(model, r).info || {}).geoRole);
         flags.geographic = true;
@@ -8563,6 +9346,7 @@ function describeVisual(visualModel, model) {
         return "Symbol Map";
       }
       case VISUAL_TYPES.PIE:
+        if (visualModel.pie && visualModel.pie.gauge) { evidence.push("a slice in the background colour hides part of the dial"); return "Gauge"; }
         if (visualModel.pie && (visualModel.pie.inner || (visualModel.pie.layers || 0) > 1)) return "Nested Donut";
         if ((visualModel.pie && visualModel.pie.hole) || (vm.fmt.pieLayers && (vm.fmt.pieLayers() || {}).hole)) return "Donut Chart";
         return shelfDims.length ? "Multiple Pies" : "Pie Chart";
@@ -8700,6 +9484,13 @@ function conversionOf(visualModel, semantics) {
   const renderer = visualModel.renderer;
   const why = String(visualModel.statusReason || "");
   if (visualModel.status === "warning" && /injection failed/i.test(why)) return make(STRATEGY.FAILED, "Nothing", why);
+  if (visualModel.gauge) return make(STRATEGY.CONSTRUCTED, "Gauge: doughnut dial + pie needle",
+    "Excel has no gauge chart: built Excel's standard way – the dial's bands as a doughnut (the rest of the circle see-through), " +
+    "the needle as a thin pie slice, both turned to the dial's start; positions recomputed from the workbook's calculations, " +
+    "Tableau's text marks as text boxes");
+  if (visualModel.pie && visualModel.pie.gauge) return make(STRATEGY.NATIVE, `${visualModel.pie.hole ? "Doughnut" : "Pie"} chart (gauge)`,
+    "Direct Excel equivalent: Tableau's slices, colours and pointer slice; the slice Tableau paints in the background colour " +
+    "is see-through" + (visualModel.pie.hole ? "; the hole with its text" : ""));
   if (visualModel.pie) {
     const pie = visualModel.pie;
     const donut = pie.hole || pie.inner;
@@ -11174,7 +11965,13 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
             pieLegendItems.push(...pieLegends(pie, sheet.name, visualModel.viewModel));
           }
         }
-        if (renderDecision.renderer === "excel-chart" && !visualModel.pie) {
+        // a gauge drawn with map layers / polygons: rebuilt from its calculations as Excel's doughnut + needle gauge
+        if (!asTable && fmtModel && FORMAT_CONFIG.nativeCharts && !visualModel.pie &&
+            ((fmtModel.sheets[sheet.name] || {}).panes || []).some(p => /^polygon$/i.test(p.markClass || ""))) {
+          const gauge = buildMapGaugeModel(fmtModel, sheet.name, summaryData);
+          if (gauge) { visualModel.gauge = gauge; renderDecision = VISUAL_RENDERERS.chart; }
+        }
+        if (renderDecision.renderer === "excel-chart" && !visualModel.pie && !visualModel.gauge) {
           try {
             visualModel.chartSpecs = buildExcelChartSpecs(visualModel, fmtModel);
             // Tableau draws legends as separate dashboard cards, never inside the view: the chart keeps a
@@ -11544,6 +12341,19 @@ setTableVisibleRows(placedItems);
     for (let i = 0; i < adjustedItems.length; i++) {
       const item = adjustedItems[i];
 
+      if (item.visualModel && item.visualModel.gauge) {
+        const status = visualStatuses.find(entry => entry.worksheet === item.name);
+        const titleRows = writeGraphicTitle(item);
+        const data = writeGaugeData(chartDataSheetOf(), chartData.row + 1, item.visualModel.gauge, item.name);
+        chartData.row = data.nextRow - 1;
+        pieJobs.push({ item, top: item.gridRow + titleRows, panes: data.panes, gauge: true });
+        reserveGraphicBlock(item);
+        item.visualModel.status = "success";
+        item.visualModel.statusReason = "Excel gauge (doughnut dial + pie needle) rebuilt from the workbook's calculations";
+        if (status) { status.status = "success"; status.reason = item.visualModel.statusReason; }
+        continue;
+      }
+
       if (item.visualModel && item.visualModel.pie) {
         const status = visualStatuses.find(entry => entry.worksheet === item.name);
         const titleRows = writeGraphicTitle(item);
@@ -11894,13 +12704,14 @@ setTableVisibleRows(placedItems);
     const finalizeCharts = () => {
       /** @type {ChartJob[]} */
       const pieChartJobs = [];
-      pieJobs.forEach(({ item, top, panes }) => {
+      pieJobs.forEach(({ item, top, panes, gauge }) => {
         let w = 0, h = 0;
         for (let c = item.gridCol; c < item.gridCol + item.gridW; c++) w += colPx(c);
         for (let r = top; r < item.gridRow + item.allocatedRows; r++) h += rowPx(r);
         const bg = (item.vm.fmt.tableBackground() || "FFFFFFFF").slice(2);
         const link = `#'${worksheet.name.replace(/'/g, "''")}'!${worksheet.getCell(top + 1, item.gridCol + 1).address}`;
-        buildPieCharts(item.visualModel.pie, { w, h }, panes, { name: item.visualName || item.name, bg, link }).forEach(c => {
+        (gauge ? buildGaugeCharts(item.visualModel.gauge, { w, h }, panes, { name: item.visualName || item.name, bg })
+               : buildPieCharts(item.visualModel.pie, { w, h }, panes, { name: item.visualName || item.name, bg, link })).forEach(c => {
           const at = nativeAnchor(item.gridCol, top, c.x, c.y, colPx, rowPx);
           pieChartJobs.push({ spec: /** @type {any} */ ({ kind: "pie" }), refs: /** @type {any} */ (null), item, name: c.name,
             col: at.nativeCol, row: at.nativeRow, colOffPx: at.nativeColOff / 9525, rowOffPx: at.nativeRowOff / 9525,
