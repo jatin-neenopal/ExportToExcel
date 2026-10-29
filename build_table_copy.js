@@ -240,6 +240,9 @@ const FORMAT_CONFIG = {
   conversionReport: true,         // a "Conversion Report" sheet: every visual, how it was converted (NATIVE … TABLE_FALLBACK) and why
   fallbackNotes: true,            // a note on each visual exported as its data table, naming the Tableau visual and the reason
   filterCards: true,              // dashboard filter controls → a card with their title and current selection ("(All)", "East, West" …)
+  slicers: true,                  // a filter card of a field's values → an Excel slicer that filters every chart, table and KPI value
+                                  // built from the same data source (their numbers become formulas over its rows, a hidden sheet)
+  slicerMaxRows: 200000,          // a data source with more rows keeps its filter cards as text (the file would get too big and slow)
   showTiming: false,              // true: also show the "⏱ dashboards … · sheets … · file …" line in the panel (always in the console)
   debug: false                    // true: dump the parsed workbook model, [Format] traces and full visual specs to the console
 };
@@ -428,6 +431,36 @@ function applyLabels(spec, fmt, measures) {
 }
 
 /**
+ * Label → Marks to Label: Tableau labels only some marks of each line / pane – Min/Max of a field (the earliest and
+ * latest dates when the field is the category axis, else the lowest and highest values), Line Ends or Most Recent:
+ * the points that keep their label (s.labelOnly).
+ * @param {ChartSpec} spec @param {SheetFormatter} fmt @param {{ ref?: FieldRef | null } | undefined} catDim the innermost category field
+ */
+function applyLabelMarks(spec, fmt, catDim) {
+  const m = fmt.markLabelsMarks();
+  if (!m || !/^(range|line-ends|most-recent)$/.test(m.mode || "")) return;
+  const onCategory = !m.field || !!(catDim && catDim.ref && tfSameField(tfParseFieldRef(m.field), catDim.ref));
+  spec.series.forEach(s => {
+    if (!s.labels || s.refLine || !s.values) return;
+    const at = s.values.map((v, i) => num(v) === null ? -1 : i).filter(i => i >= 0);
+    if (!at.length) return;
+    const first = at[0], last = at[at.length - 1], keep = new Set();
+    if (m.mode === "range" && !onCategory) {
+      const byValue = [...at].sort((a, b) => /** @type {number} */ (s.values[a]) - /** @type {number} */ (s.values[b]));
+      if (m.min) keep.add(byValue[0]);
+      if (m.max) keep.add(byValue[byValue.length - 1]);
+    } else if (m.mode === "range") {
+      if (m.min) keep.add(first);
+      if (m.max) keep.add(last);
+    } else if (m.mode === "line-ends") {
+      if (m.first) keep.add(first);
+      if (m.last) keep.add(last);
+    } else keep.add(last);
+    s.labelOnly = [...keep];
+  });
+}
+
+/**
  * Tableau hides axes ("Show Header" off), renames or removes axis titles (Edit Axis), and turns grid
  * lines and axis rulers off per worksheet; the Excel chart follows the same settings.
  * @param {ChartSpec} spec @param {ChartContext} ctx
@@ -487,6 +520,7 @@ function tvApplyWorkbookAxes(spec, ctx) {
   spec.valueAxisNumFmt = axisNumFmt(fmt, refs[0]);
   if (refs[1]) spec.secondaryAxisNumFmt = axisNumFmt(fmt, refs[1]);
   applyLabels(spec, fmt, refs);
+  applyLabelMarks(spec, fmt, roles[catShelf].dims.slice(-1)[0]);
   // categories: a continuous pill draws an axis, discrete pills draw headers – hidden only if all are
   const dims = [...roles[valueShelf].dims.map(d => ({ d, shelf: valueShelf })), ...roles[catShelf].dims.map(d => ({ d, shelf: catShelf }))];
   const hidden = ({ d, shelf }) => !!d.ref && (d.continuous ? fmt.axisInfo(d.ref, shelf, "0").hidden === true : fmt.isLabelHidden(d.ref));
@@ -1406,6 +1440,15 @@ function createSheetFormatter(model, sheetName, onlyPanes) {
     },
     /** Label → "Allow labels to overlap other marks" off (Tableau's default) → overlapping labels hidden */
     markLabelsCulled() { return panes.some(p => markRule(p, "mark-labels-cull") !== "false"); },
+    /** Label → Marks to Label: "range" (Min/Max of a field), "line-ends", "most-recent" …; null = all marks */
+    markLabelsMarks() {
+      const p = panes.find(x => markRule(x, "mark-labels-mode") !== undefined);
+      if (!p) return null;
+      const r = a => markRule(p, a);
+      return { mode: r("mark-labels-mode"), field: r("mark-labels-range-field"),
+               min: r("mark-labels-range-min") !== "false", max: r("mark-labels-range-max") !== "false",
+               first: r("mark-labels-line-first") !== "false", last: r("mark-labels-line-last") !== "false" };
+    },
     /** Label → "Show mark labels"; unset = on when something is on Label */
     markLabelsShown() {
       return panes.some(p => {
@@ -1765,7 +1808,7 @@ function tfCalcInfo(calc) {
 
 /* Raise when the parser reads something new: a workbook model remembered by an older version is then
    parsed again from its stored XML (ui/workbook-store.js), so an update reaches workbooks loaded before it. */
-const FORMAT_MODEL_VERSION = 7;
+const FORMAT_MODEL_VERSION = 8;
 
 /** @param {string} xmlString the .twb XML @returns {FormatModel} */
 function parseTableauFormatting(xmlString) {
@@ -1855,6 +1898,8 @@ function parseTableauFormatting(xmlString) {
     ].filter(x => x.field && x.measure) : [];
     // members kept by the Measure Names filter, in filter order
     sheet.measureFilter = [];
+    // the fields the sheet filters by (a calculated filter's own datasource: two calculations can share a caption)
+    sheet.filterRefs = view ? tfKids(view, "filter").map(f => tfParseFieldRef(f.getAttribute("column") || "")).filter(Boolean) : [];
     if (view) tfKids(view, "filter").forEach(f => {
       if (!/\[:Measure Names\]$/.test(f.getAttribute("column") || "")) return;
       Array.from(f.getElementsByTagName("groupfilter")).forEach(g => {
@@ -1951,6 +1996,7 @@ function parseTableauFormatting(xmlString) {
         w: tfNum(c.getAttribute("w")), h: tfNum(c.getAttribute("h")),
         runs: tfKid(c, "formatted-text") ? tfParseRuns(tfKid(c, "formatted-text")) : undefined,
         param: c.getAttribute("param") || undefined,             // image zones: the file inside the .twbx; legends: their field
+        mode: c.getAttribute("mode") || undefined,               // filter cards: dropdown, checkdropdown, checklist, radiolist, slider …
         scaled: c.getAttribute("is-scaled") === "1" || undefined,
         // Center Image is on unless switched off (is-centered='0')
         centered: c.getAttribute("is-centered") ? c.getAttribute("is-centered") === "1" : undefined,
@@ -2248,10 +2294,12 @@ function tvDateAxis(cats) {
  * @param {{ count: number, indexOf: (row: DataValue[]) => number | undefined }} cats
  * @param {number} valueCi
  * @param {(row: DataValue[]) => boolean} [filter]
- * @returns {(number | null)[]} one total per category, null = no value
+ * @returns {(number | null)[]} one total per category, null = no value; .src: the measure column and each total's marks
+ *   (a slicer turns the total into a formula over them – an array made from these values no longer has it)
  */
 function tvSum(vm, cats, valueCi, filter) {
   const out = new Array(cats.count).fill(null);
+  const marks = out.map(() => []);
   vm.rows.forEach(row => {
     if (filter && !filter(row)) return;
     const n = tfDvNum(row[valueCi]);
@@ -2259,7 +2307,25 @@ function tvSum(vm, cats, valueCi, filter) {
     const i = cats.indexOf(row);
     if (i === undefined) return;
     out[i] = (out[i] || 0) + n;
+    marks[i].push(row);
   });
+  Object.defineProperty(out, "src", { value: { ci: valueCi, rows: marks } });
+  return out;
+}
+
+/** tvSum's totals picked / reordered by index (-1: no value), keeping their marks (.src)
+ * @param {(number | null)[]} from @param {number[]} at the index in `from` of each value */
+function tvPickSum(from, at) {
+  const out = at.map(i => (i < 0 ? null : from[i]));
+  const src = /** @type {any} */ (from).src;
+  if (src) Object.defineProperty(out, "src", { value: { ci: src.ci, rows: at.map(i => (i < 0 ? [] : src.rows[i])) } });
+  return out;
+}
+
+/** one value per mark (a scatter's x / y): measure ci of each row, with its mark (.src) @param {DataValue[][]} rows @param {number} ci */
+function tvMarkValues(rows, ci) {
+  const out = rows.map(r => tfDvNum(r[ci]));
+  Object.defineProperty(out, "src", { value: { ci, rows: rows.map(r => [r]) } });
   return out;
 }
 
@@ -2671,7 +2737,8 @@ function tvCartesianSpecs(ctx) {
   const color = roles.color;
   const colorCi = color && !color.measureNames && !color.continuous ? color.ci : -1;
   const colorLevel = colorCi >= 0 ? catDims.findIndex(d => d.ci === colorCi) : -1;
-  const scale = tvColorScale(vm, roles, ctx.markToken);
+  // a pane of small multiples gets the whole view's colours (its own rows hold one member of each)
+  const scale = ctx.colorScale !== undefined ? ctx.colorScale : tvColorScale(vm, roles, ctx.markToken);
   const fieldLabels = vm.fmt.hasModel ? vm.fmt.fieldLabelsShown(catShelf) : true;
   // rounded bars are lines in Tableau (thick, round caps): Excel's bars
   const asBars = t => ctx.roundedBar && t === "line" ? "bar" : t;
@@ -2765,7 +2832,7 @@ function tvCartesianSpecs(ctx) {
     if (ranges.length < 2 || ranges.length * series.length > TV_MAX_SERIES) return series;
     return series.flatMap(s => !broken(s) ? [s]
       : ranges.map((r, k) => ({ ...s, name: k ? `${s.name} ` + "\u200b".repeat(k) : s.name,
-                                values: s.values.map((v, i) => i >= r.from && i <= r.to ? v : null),
+                                values: tvPickSum(s.values, s.values.map((v, i) => i >= r.from && i <= r.to ? i : -1)),
                                 pointColors: s.pointColors ? s.pointColors.map((c, i) => i >= r.from && i <= r.to ? c : null) : undefined })));
   };
 
@@ -3196,6 +3263,102 @@ function tvHistogramSpecs(ctx) {
                   note: "Tableau's own bins and counts as touching columns – the same bins Tableau draws, not Excel's automatic ones" } }));
 }
 
+/* ── small multiples: discrete dimensions beside the axes split Tableau's view into a grid of panes, each a little
+ *    chart of its own. Excel draws no panes inside a chart: one chart per pane, laid out as Tableau's grid ──────── */
+const TV_MAX_PANES = 48;
+
+/** a chart's values as its value axis has to reach them (stacked marks add up) @param {ChartSpec} spec @returns {number[]} */
+function tvAxisExtent(spec) {
+  const out = [], stacks = new Map();
+  spec.series.forEach(s => (s.values || []).forEach((v, i) => {
+    const x = num(v);
+    if (x === null) return;
+    if (!spec.stacked) { out.push(x); return; }
+    const t = stacks.get(i) || { pos: 0, neg: 0 };
+    if (x >= 0) t.pos += x; else t.neg += x;
+    stacks.set(i, t);
+  }));
+  stacks.forEach(t => out.push(t.pos, t.neg));
+  return out;
+}
+
+/** where Tableau ends an axis reaching v: the next tick of a round step (1, 2, 2.5, 5 × 10ⁿ) giving about four ticks */
+function tvNiceEnd(v) {
+  if (!v) return 0;
+  const a = Math.abs(v), raw = a / 4, mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = ([1, 2, 2.5, 5, 10].find(k => k * mag >= raw - 1e-12) || 10) * mag;
+  return Math.sign(v) * +(Math.ceil(a / step - 1e-9) * step).toPrecision(12);
+}
+
+/**
+ * Tableau's grid of panes – rows: the discrete dimensions on Rows beside the measure, columns: the discrete dimensions
+ * on Columns outside the innermost field – as one chart spec per pane, its place and header texts on spec.grid. Every
+ * pane spans the same dates and the same value range (Tableau's uniform axis), unless the axis is independent.
+ * Null when the view is no such grid (the panes then stay one chart).
+ * @param {ChartContext} ctx @returns {ChartSpec[] | null}
+ */
+function tvSmallMultipleSpecs(ctx) {
+  const { vm, roles } = ctx;
+  if (!roles.rows.values.length || roles.cols.values.length) return null;          // panes of columns: measures on Rows
+  const rowDims = roles.rows.dims, colDims = roles.cols.dims, outer = colDims.slice(0, -1);
+  if (!rowDims.length || !colDims.length || [...rowDims, ...outer].some(d => d.continuous || d.ci < 0)) return null;
+  const keyOf = (r, dims) => dims.map(d => tvText(r[d.ci])).join("\u0001");
+  /** the members of the dimensions in Tableau's order (natural sort), with their header text */
+  const members = dims => {
+    const seen = new Map();
+    vm.rows.forEach(r => { const k = keyOf(r, dims); if (!seen.has(k)) seen.set(k, dims.map(d => r[d.ci])); });
+    return [...seen.entries()].sort(([, a], [, b]) => {
+      for (let l = 0; l < dims.length; l++) { const d = tfNaturalCompare(a[l], b[l]); if (d) return d; }
+      return 0;
+    }).map(([key, dvs]) => ({ key, label: dvs.map(dv => tfDvText(dv)).join(" / ") }));
+  };
+  const rowM = members(rowDims), colM = outer.length ? members(outer) : [{ key: "", label: "" }];
+  const n = rowM.length * colM.length;
+  if (n < 2 || n > TV_MAX_PANES) return null;
+  const paneRoles = { ...roles, rows: { ...roles.rows, dims: [] }, cols: { ...roles.cols, dims: colDims.slice(-1) } };
+  const rowRot = vm.fmt.hasModel ? vm.fmt.headerOrientation(rowDims[rowDims.length - 1].ref) : null;
+  const rowHead = { rowVertical: rowRot === -90 || rowRot === 90, rowLen: Math.max(...rowM.map(m => m.label.length)) };
+  const colorScale = tvColorScale(vm, roles, ctx.markToken);
+  /** @type {ChartSpec[]} */
+  const specs = [];
+  for (let r = 0; r < rowM.length; r++) {
+    for (let c = 0; c < colM.length; c++) {
+      const rows = vm.rows.filter(x => keyOf(x, rowDims) === rowM[r].key && (!outer.length || keyOf(x, outer) === colM[c].key));
+      if (!rows.length) continue;                                      // Tableau leaves an empty pane blank
+      const pane = tvCartesianSpecs({ ...ctx, vm: { ...vm, rows }, roles: paneRoles, colorScale });
+      if (pane.length !== 1) return null;                              // panes of panes: kept as one chart
+      specs.push({ ...pane[0], legend: false,
+                   grid: { row: r, col: c, rows: rowM.length, cols: colM.length, rowLabel: rowM[r].label, colLabel: colM[c].label, ...rowHead } });
+    }
+  }
+  if (specs.length < 2) return null;
+  // one time axis for all: the earliest and latest date of any pane; other categories have to be the same in each
+  const dated = specs.filter(s => s.dateAxis);
+  if (dated.length === specs.length) {
+    const min = Math.min(...dated.map(s => s.dateAxis.serials[0])), max = Math.max(...dated.map(s => s.dateAxis.serials[s.dateAxis.serials.length - 1]));
+    specs.forEach(s => { s.dateAxis = { ...s.dateAxis, min, max }; });
+  } else if (dated.length || specs.some(s => JSON.stringify(s.categories.levels) !== JSON.stringify(specs[0].categories.levels))) {
+    return null;
+  }
+  // Tableau's uniform axis: every pane on the whole view's range (an independent axis gives each pane its own)
+  const ref = roles.rows.values[0].ref;
+  const independent = ref && /independent/.test(vm.fmt.axisSpace(ref, "rows", "0").rangeType || "");
+  if (!independent && !specs.some(s => s.percent)) {
+    const all = specs.flatMap(tvAxisExtent);
+    const lo = Math.min(0, ...all), hi = Math.max(0, ...all);
+    specs.forEach(s => {
+      // the range of the exported values, not of the workbook: dropped again when the values follow slicers
+      s.dataRange = { min: s.valueMin === undefined, max: s.valueMax === undefined };
+      if (s.valueMin === undefined) s.valueMin = tvNiceEnd(lo);
+      if (s.valueMax === undefined) s.valueMax = tvNiceEnd(hi);
+    });
+  }
+  const conversion = { strategy: "CONSTRUCTED", output: `Small multiples: ${specs.length} charts in Tableau's ${rowM.length} × ${colM.length} grid`,
+                       note: "Excel draws no panes inside one chart: each pane is its own chart, on the same axes" };
+  specs.forEach(s => { s.conversion = s.conversion ? { ...s.conversion, note: `${s.conversion.note}; ${conversion.note}` } : conversion; });
+  return specs;
+}
+
 
 /* ═══ charts/model/roles.js ═══════════════════════════════════════════════════════════════════════ */
 /* Which summary column sits on which shelf / encoding (TWB or live spec). */
@@ -3537,9 +3700,25 @@ function layoutXml(plot) {
     `<c:x val="${v(plot.x)}"/><c:y val="${v(plot.y)}"/><c:w val="${v(plot.w)}"/><c:h val="${v(plot.h)}"/></c:manualLayout></c:layout>`;
 }
 
+const NS_C15 = "http://schemas.microsoft.com/office/drawing/2012/chart";
+
+/** slice labels Excel takes from a range of cells ("Value From Cells", Excel 2013+): they move with the slices
+ * @param {{ range: string, texts: string[], font: any }} l @param {boolean} doughnut */
+function cellLabelsXml(l, doughnut) {
+  const dLbls = `<c:dLbls><c:spPr><a:noFill/>${NO_LINE}</c:spPr>${txPrXml(l.font)}` +
+    (doughnut ? "" : `<c:dLblPos val="outEnd"/>`) +
+    `<c:showLegendKey val="0"/><c:showVal val="0"/><c:showCatName val="0"/><c:showSerName val="0"/><c:showPercent val="0"/>` +
+    `<c:showBubbleSize val="0"/>${doughnut ? "" : `<c:showLeaderLines val="1"/>`}` +
+    `<c:extLst><c:ext uri="{CE6537A1-D6FC-4f65-9D91-7224C49458BB}" xmlns:c15="${NS_C15}"><c15:showDataLabelsRange val="1"/></c:ext></c:extLst></c:dLbls>`;
+  const range = `<c:extLst><c:ext uri="{02D57815-91ED-43cb-92C2-25804820EDAC}" xmlns:c15="${NS_C15}"><c15:datalabelsRange>` +
+    `<c15:f>${esc(l.range)}</c15:f><c15:dlblRangeCache>${strPts(l.texts)}</c15:dlblRangeCache></c15:datalabelsRange></c:ext></c:extLst>`;
+  return { dLbls, range };
+}
+
 /**
  * spec: { seriesName, categories[], values[], ref? {sheet, cat, val}, title?, titleFont?, font?, bg? (RRGGBB, null =
- *   see-through), plot?, holeSize? (% of the diameter → doughnut), hasShapes?, points: [{ color, selected }] }
+ *   see-through), plot?, holeSize? (% of the diameter → doughnut), hasShapes?, points: [{ color, selected }],
+ *   cellLabels? { range, texts[], font } (labels from cells) }
  * @param {any} spec @returns {string}
  */
 function pieChartXml(spec) {
@@ -3548,8 +3727,9 @@ function pieChartXml(spec) {
     (p.selected ? `<a:ln w="19050"><a:solidFill><a:srgbClr val="000000"/></a:solidFill></a:ln>`
                 : !p.color ? NO_LINE : `<a:ln w="9525"><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill></a:ln>`) +
     `</c:spPr></c:dPt>`).join("");
+  const lbl = spec.cellLabels ? cellLabelsXml(spec.cellLabels, !!spec.holeSize) : { dLbls: "", range: "" };
   const ser = `<c:ser><c:idx val="0"/><c:order val="0"/><c:tx><c:v>${esc(spec.seriesName || "")}</c:v></c:tx>` +
-    `${dPts}${pieCatXml(spec.categories, spec.ref)}${pieValXml(spec.values, spec.ref)}</c:ser>`;
+    `${dPts}${lbl.dLbls}${pieCatXml(spec.categories, spec.ref)}${pieValXml(spec.values, spec.ref)}${lbl.range}</c:ser>`;
   const plot = spec.holeSize
     ? `<c:doughnutChart><c:varyColors val="1"/>${ser}<c:firstSliceAng val="0"/>` +
       `<c:holeSize val="${Math.max(10, Math.min(90, Math.round(spec.holeSize)))}"/></c:doughnutChart>`    // Excel allows 10–90
@@ -3567,20 +3747,29 @@ function pieChartXml(spec) {
  * Text boxes / shapes drawn on top of a chart (its chartDrawing part), anchored relative to the chart so they
  * move and scale with it; later items draw on top.
  * texts: [{ x, y, w, h (px inside the chart), lines: [[{text, font}]], align: "l"|"ctr"|"r", anchor: "t"|"ctr"|"b",
- *           shape?: preset geometry ("ellipse" …; default a borderless text box), fill?: RRGGBB }]
+ *           shape?: preset geometry ("ellipse" …; default a borderless text box), fill?: RRGGBB,
+ *           link?: the cell whose text the box shows ('Sheet'!$A$1) }]
  * @param {any[]} texts @param {{ w: number, h: number }} size chart size px @returns {string}
  */
 function userShapesXml(texts, size) {
   const fx = (v, d) => Math.max(0, Math.min(1, v / d)).toFixed(5);
-  const paras = t => t.lines && t.lines.length ? parasXml(t.lines, t.align || "ctr") : `<a:p><a:endParaRPr lang="en-US"/></a:p>`;
+  // a box linked to a cell: its text is Excel's TxLink field (a plain run would never refresh), in the line's largest font
+  const linked = (t, i) => {
+    const runs = t.lines[0] || [], f = runs.reduce((a, r) => ((r.font && r.font.size) || 0) > ((a && a.size) || 0) ? r.font : a, null);
+    const id = `{6A1D0C2E-0000-4000-8000-${String(i + 1).padStart(12, "0")}}`;
+    return `<a:p><a:pPr algn="${t.align || "ctr"}"/><a:fld id="${id}" type="TxLink"><a:rPr${fontAttrs(f)}>${fontKids(f)}</a:rPr>` +
+           `<a:t>${esc(runs.map(r => r.text).join(""))}</a:t></a:fld></a:p>`;
+  };
+  const paras = (t, i) => t.link ? linked(t, i)
+    : t.lines && t.lines.length ? parasXml(t.lines, t.align || "ctr") : `<a:p><a:endParaRPr lang="en-US"/></a:p>`;
   return XML_DECL + `<c:userShapes xmlns:c="${NS.c}" xmlns:a="${NS.a}" xmlns:cdr="${NS_CDR}">` + texts.map((t, i) =>
     `<cdr:relSizeAnchor><cdr:from><cdr:x>${fx(t.x, size.w)}</cdr:x><cdr:y>${fx(t.y, size.h)}</cdr:y></cdr:from>` +
     `<cdr:to><cdr:x>${fx(t.x + t.w, size.w)}</cdr:x><cdr:y>${fx(t.y + t.h, size.h)}</cdr:y></cdr:to>` +
-    `<cdr:sp macro="" textlink=""><cdr:nvSpPr><cdr:cNvPr id="${i + 2}" name="${t.shape ? "Shape" : "Label"} ${i + 1}"/>` +
+    `<cdr:sp macro="" textlink="${t.link ? esc(t.link) : ""}"><cdr:nvSpPr><cdr:cNvPr id="${i + 2}" name="${t.shape ? "Shape" : "Label"} ${i + 1}"/>` +
     `<cdr:cNvSpPr${t.shape ? "" : ' txBox="1"'}/></cdr:nvSpPr>` +
     `<cdr:spPr><a:prstGeom prst="${t.shape || "rect"}"><a:avLst/></a:prstGeom>${fillXml(t.fill)}${NO_LINE}</cdr:spPr>` +
     `<cdr:txBody><a:bodyPr wrap="none" lIns="0" tIns="0" rIns="0" bIns="0" anchor="${t.anchor || "t"}"/><a:lstStyle/>` +
-    `${paras(t)}</cdr:txBody></cdr:sp></cdr:relSizeAnchor>`).join("") + `</c:userShapes>`;
+    `${paras(t, i)}</cdr:txBody></cdr:sp></cdr:relSizeAnchor>`).join("") + `</c:userShapes>`;
 }
 
 const xfrmXml = (x, y, w, h) => `<a:off x="${Math.round(x * PIE_EMU_PER_PX)}" y="${Math.round(y * PIE_EMU_PER_PX)}"/>` +
@@ -3867,6 +4056,16 @@ function buildPieSpec(fmt, summary, opts = {}) {
   const showLabels = fmt.markLabelsShown();
   const labelTpl = fmt.labelRunsTemplate(), tipTpl = fmt.tooltipTemplate();
   const selected = selectedRows(cols, summary.data || [], opts.selectedTables);
+  // the label with each field's value as a part of its own (a slicer formula rebuilds those parts)
+  const labelParts = r => {
+    const parts = [];
+    const lines = renderTemplate(labelTpl, ref => {
+      const k = colFor(ref);
+      parts.push({ ref, col: k, text: valueOf(r)(ref), nf: fmt.numFmtFor(ref) });
+      return `\u0002${parts.length - 1}\u0003`;
+    });
+    return { lines: lines.map(line => line.map(x => ({ text: x.text, font: pieFont(fmt.labelFont(x.props)) }))), parts };
+  };
   const points = marks.map(({ r, i }) => ({
     row: i,
     rowKey: keyOf(r, rowHdr), colKey: keyOf(r, colHdr),
@@ -3876,6 +4075,7 @@ function buildPieSpec(fmt, summary, opts = {}) {
     selected: selected.has(i),
     label: showLabels ? renderTemplate(labelTpl, valueOf(r))
       .map(line => line.map(x => ({ text: x.text, font: pieFont(fmt.labelFont(x.props)) }))) : null,
+    labelParts: showLabels ? labelParts(r) : null,
     tooltip: plainText(renderTemplate(tipTpl, valueOf(r)))
   }));
   const markSize = fmt.markSize();
@@ -3883,7 +4083,7 @@ function buildPieSpec(fmt, summary, opts = {}) {
         `labels=${showLabels}, selected=${selected.size}, size slider=${markSize === null ? "default" : markSize}`);
   const axis = shelf => ((fmt.sheetModel || {})[shelf] || []).some(r => r.type === "qk");
   return {
-    columns: cols, data: summary.data || [], valueCaption, points, legend, markSize,
+    columns: cols, data: summary.data || [], valueCaption, points, legend, markSize, valueCol: vi,
     cullLabels: fmt.markLabelsCulled(),
     rowKeys: [...new Set(points.map(p => p.rowKey))], colKeys: [...new Set(points.map(p => p.colKey))],
     stretch: { w: axis("cols"), h: axis("rows") },             // a continuous axis (a donut's MIN(0)) → the pane fills the zone
@@ -3938,7 +4138,17 @@ function buildHoleSpec(fmt, pie) {
     tipFor,
     color: fmt.markColor(),                                    // usually white = the background
     labelFor: pts => shown ? renderTemplate(tpl, valueOf(pts))
-      .map(line => line.map(x => ({ text: x.text, font: pieFont(fmt.labelFont(x.props)) }))) : null
+      .map(line => line.map(x => ({ text: x.text, font: pieFont(fmt.labelFont(x.props)) }))) : null,
+    /** the label with each field's value as a part of its own (see buildPieSpec) */
+    labelPartsFor: pts => {
+      if (!shown) return null;
+      const parts = [];
+      const lines = renderTemplate(tpl, ref => {
+        parts.push({ ref, col: pie.columns.findIndex(c => c.ref && tfSameField(c.ref, ref)), text: valueOf(pts)(ref), nf: fmt.numFmtFor(ref) });
+        return `\u0002${parts.length - 1}\u0003`;
+      });
+      return { lines: lines.map(line => line.map(x => ({ text: x.text, font: pieFont(fmt.labelFont(x.props)) }))), parts };
+    }
   };
 }
 
@@ -4005,38 +4215,123 @@ function buildPieModel(model, sheetName, summary, opts) {
 }
 
 /* ── output ───────────────────────────────────────────────────────────── */
+/** a number format showing numbers the way Tableau showed this one ("$1.2M" → "$"#,##0.0,,"M"); null: not a number */
+function excelFormatLike(text) {
+  const m = String(text || "").match(/^(\D*?)(\d[\d,]*)(?:\.(\d+))?(\D*)$/);
+  if (!m) return null;
+  const q = s => (s ? `"${s.replace(/"/g, "")}"` : "");
+  const unit = m[4].match(/^\s*([KMB%])/i);
+  const scale = !unit ? "" : unit[1] === "%" ? "%" : ",".repeat({ k: 1, m: 2, b: 3 }[unit[1].toLowerCase()]);
+  const suffix = unit && unit[1] === "%" ? m[4].replace("%", "") : m[4];
+  const grouped = m[2].includes(",") || parseFloat(m[2]) < 1000;
+  return `${q(m[1].replace(/-$/, ""))}${grouped ? "#,##0" : "0"}${m[3] ? "." + "0".repeat(m[3].length) : ""}${scale}${q(suffix)}`;
+}
+
+/**
+ * A label's lines as formulas: each field part a TEXT() of its formula, in Tableau's number format (else one like
+ * the value Tableau showed), the rest literal text. partFormula(part) → formula, or null (the part keeps its text).
+ * @param {{ lines: any[][], parts: any[] }} lp @returns {{ expr: string, dynamic: boolean, text: string }[]}
+ */
+function labelLineFormulas(lp, partFormula) {
+  const lit = s => `"${String(s).replace(/"/g, '""')}"`;
+  return lp.lines.map(line => {
+    let dynamic = false, text = "";
+    const expr = line.map(x => x.text).join("").split(/(\u0002\d+\u0003)/).filter(Boolean).map(s => {
+      const m = s.match(/^\u0002(\d+)\u0003$/);
+      if (!m) { text += s; return lit(s); }
+      const part = lp.parts[+m[1]];
+      text += part.text;
+      const v = partFormula(part);
+      const nf = v && (part.nf || excelFormatLike(part.text));
+      if (!nf) return lit(part.text);
+      dynamic = true;
+      return `TEXT(${v},${lit(nf)})`;
+    }).join("&") || '""';
+    return { expr, dynamic, text };
+  });
+}
+
 /**
  * The slices on the chart data sheet – every summary column, the category / value Excel plots and Tableau's
  * label and tooltip text – so each chart is linked to real cells. Returns per pane the ranges its series uses.
+ * A pie bound to the slicers (pie.slicerBinding) gets formulas: each slice's value, its label (Excel draws it from
+ * the cell) and the donut's centre lines that show the slices' total (cells its text boxes link to).
  * @param {import("exceljs").Worksheet} ds @param {number} startRow 1-based @param {any} pie @param {string} name
- * @returns {{ panes: Map<string, { ref: any, innerRef: any }>, nextRow: number }}
+ * @returns {{ panes: Map<string, { ref: any, innerRef: any, centre: (string | null)[] | null }>, nextRow: number }}
  */
 function writePieData(ds, startRow, pie, name) {
   const nCols = pie.columns.length;
+  const bound = pie.slicerBinding || null;
   ds.getCell(startRow, 1).value = name;
   ds.getCell(startRow, 1).font = { bold: true };
   // cell by cell: Row.values only takes an Array of ExcelJS's own realm
   const putRow = (r, values) => values.forEach((v, k) => { ds.getCell(r, k + 1).value = v; });
   putRow(startRow + 1, [...pie.columns.map(c => c.name), "Excel category", "Excel value", "Tableau label", "Tableau tooltip"]);
   ds.getRow(startRow + 1).font = { bold: true };
-  const catCol = ds.getColumn(nCols + 1).letter, valCol = ds.getColumn(nCols + 2).letter;
+  const catCol = ds.getColumn(nCols + 1).letter, valCol = ds.getColumn(nCols + 2).letter, lblCol = ds.getColumn(nCols + 3).letter;
+  const base = pie.valueCol >= 0 ? pie.columns[pie.valueCol] : null;
+  /** a label part's formula: the slice's value or its share of the total, another measure of the slice; null = text */
+  const fieldFormula = (part, at, total, p) => {
+    const d = String(part.ref.deriv || "").toLowerCase();
+    if (/^pcto/.test(d)) {
+      if (base && base.ref && tfNorm(part.ref.name.split(":").pop()) === tfNorm(base.ref.name)) return `${at}/${total}`;
+    } else if (part.col === pie.valueCol) return at;
+    else if (part.col >= 0 && pie.columns[part.col].numeric && p) {
+      const f = bound.formulaFor([pie.data[p.row]], part.col, "cell");
+      if (f) return f;
+    }
+    if (part.col >= 0 && pie.columns[part.col].numeric) bound.fixed++;
+    return null;
+  };
   let row = startRow + 2;
-  const writeRows = pts => {
-    const first = row;
+  const writeRows = (pts, layer) => {
+    const first = row, last = row + pts.length - 1;
+    const total = `SUMIF($${valCol}$${first}:$${valCol}$${last},">0")`;     // #N/A (a slice the slicers empty) left out
     pts.forEach(p => {
-      putRow(row++, [
+      const r = row++;
+      putRow(r, [
         ...pie.data[p.row].map((dv, k) => pie.columns[k].numeric ? tfDvNum(dv) : tfDvText(dv)),
         p.category, p.value, p.label ? plainText(p.label) : "", p.tooltip]);
+      if (!bound || layer !== pie) return;
+      const at = `${valCol}${r}`;
+      ds.getCell(at).value = { formula: bound.formulaFor([pie.data[p.row]], pie.valueCol, "chart"), result: p.value };
+      bound.written++;
+      const lines = p.labelParts ? labelLineFormulas(p.labelParts, part => fieldFormula(part, at, total, p)) : [];
+      if (lines.some(l => l.dynamic))
+        ds.getCell(`${lblCol}${r}`).value = { formula: `IF(ISNUMBER(${at}),${lines.map(l => l.expr).join("&CHAR(10)&")},"")`, result: plainText(p.label) };
     });
-    return { sheet: ds.name, cat: `$${catCol}$${first}:$${catCol}$${row - 1}`, val: `$${valCol}$${first}:$${valCol}$${row - 1}` };
+    return { sheet: ds.name, cat: `$${catCol}$${first}:$${catCol}$${last}`, val: `$${valCol}$${first}:$${valCol}$${last}`,
+             lbl: `$${lblCol}$${first}:$${lblCol}$${last}`, total };
   };
+  const single = pie.rowKeys.length * pie.colKeys.length === 1;
   const panes = new Map();
   pie.rowKeys.forEach(rk => pie.colKeys.forEach(ck => {
     const pts = pie.points.filter(p => p.rowKey === rk && p.colKey === ck);
     if (!pts.length) return;
-    const ref = writeRows(pts);
+    const ref = writeRows(pts, pie);
     const innerPts = pie.inner ? pie.inner.points.filter(p => p.rowKey === rk && p.colKey === ck) : [];
-    panes.set(rk + "\u0001" + ck, { ref, innerRef: innerPts.length ? writeRows(innerPts) : null });
+    const innerRef = innerPts.length ? writeRows(innerPts, pie.inner) : null;
+    // the hole's label: a line showing the total of the slices' measure follows them; the rest keeps its text
+    let centre = null;
+    const lp = bound && pie.hole && !(single && pie.centerText) ? pie.hole.labelPartsFor(pts) : null;
+    if (lp) {
+      const lines = labelLineFormulas(lp, part => {
+        if (part.col === pie.valueCol && /^(sum|cnt)$/.test(String(part.ref.deriv || "").toLowerCase())) return ref.total;
+        if (part.col >= 0 && pie.columns[part.col].numeric) bound.fixed++;
+        return null;
+      });
+      if (lines.some(l => l.dynamic)) {
+        putRow(row, ["Centre text"]);
+        centre = lines.map((l, i) => {
+          if (!l.dynamic) return null;
+          const cell = ds.getCell(row, i + 2);
+          cell.value = { formula: l.expr, result: l.text };
+          return sheetRef(ds.name, `$${cell.address.replace(/\d+$/, "")}$${row}`);
+        });
+        row++;
+      }
+    }
+    panes.set(rk + "\u0001" + ck, { ref, innerRef, centre });
   }));
   return { panes, nextRow: row + 1 };
 }
@@ -4082,6 +4377,15 @@ function buildPieCharts(pie, block, paneRefs, o) {
                adj: hole ? [ang(st), ang(a), 50000 * (1 - hole / d)] : [ang(st), ang(a)], text: p.tooltip, link: o.link };
     }).filter(Boolean);
   };
+  // bound to the slicers: the slices change size, so Excel draws the labels from their cells, the centre lines
+  // showing the total link to theirs, and the tooltip wedges (cut at Tableau's angles) are left out
+  const bound = !!pie.slicerBinding;
+  /** centre lines stacked around the middle, one text box each; a line with a cell shows that cell's text */
+  const centreBoxes = (lines, links) => {
+    const lh = lines.map(l => Math.max(...l.map(x => (x.font && x.font.size) || 9), 1) * 1.25 * 96 / 72);
+    let y = ph / 2 - lh.reduce((a, b) => a + b, 0) / 2;
+    return lines.map((l, i) => { const b = { x: 0, y, w: pw, h: lh[i], lines: [l], anchor: "ctr", link: links[i] || null }; y += lh[i]; return b; });
+  };
   const out = [];
   pie.rowKeys.forEach((rk, ri) => pie.colKeys.forEach((ck, cj) => {
     const pts = pie.points.filter(p => p.rowKey === rk && p.colKey === ck);
@@ -4093,27 +4397,34 @@ function buildPieCharts(pie, block, paneRefs, o) {
     // and tooltip stay as Tableau shows them
     const bgU = String(o.bg || "").toUpperCase();
     const shown = pts.map(p => pie.gauge && p.color && String(p.color).toUpperCase() === bgU ? { ...p, hidden: true } : p);
-    const texts = [...labelsOf(shown, D / 2, pie.cullLabels), ...(innerPts.length ? labelsOf(innerPts, innerD / 2, pie.inner.cullLabels) : [])];
+    const texts = bound ? [] : [...labelsOf(shown, D / 2, pie.cullLabels), ...(innerPts.length ? labelsOf(innerPts, innerD / 2, pie.inner.cullLabels) : [])];
     // Excel's hole is see-through (it shows the chart background): a hole in another colour is a filled circle
-    // under the labels
-    if (holeD && pie.hole.color.toUpperCase() !== o.bg.toUpperCase())
+    // under the labels. Bound to the slicers, a donut is a pie under such a circle: Excel puts a pie's labels outside
+    // it, as Tableau does, but a doughnut's on the ring
+    const holeAsCircle = bound && holeD && !innerPts.length;
+    if (holeD && (holeAsCircle || pie.hole.color.toUpperCase() !== o.bg.toUpperCase()))
       texts.unshift({ x: (pw - holeD) / 2, y: (ph - holeD) / 2, w: holeD, h: holeD, shape: "ellipse", fill: pie.hole.color, lines: [] });
     // centre: a floating text box / sheet over the hole wins over the hole's own label (Tableau draws it on top)
     const centre = (single && pie.centerText && pie.centerText.lines) || (pie.hole && pie.hole.labelFor(pts));
-    if (centre && centre.length && !innerPts.length) texts.push({ x: 0, y: 0, w: pw, h: ph, lines: centre, anchor: "ctr" });
+    if (centre && centre.length && !innerPts.length) {
+      if (refs.centre) texts.push(...centreBoxes(centre, refs.centre));
+      else texts.push({ x: 0, y: 0, w: pw, h: ph, lines: centre, anchor: "ctr" });
+    }
+    const labelFont = (pts.find(p => p.label && p.label.length && p.label[0].length) || { label: [[{ font: pie.font }]] }).label[0][0].font;
+    const cellLabels = bound && pts.some(p => p.label) ? { range: sheetRef(refs.ref.sheet, refs.ref.lbl), texts: pts.map(p => p.label ? plainText(p.label) : ""), font: labelFont } : null;
     const x = M + cj * pw, y = ri * ph;
     const spec = {
       seriesName: pie.valueCaption, categories: pts.map(p => p.category), values: pts.map(p => p.value), ref: refs.ref,
       title: [rk, ck].filter(Boolean).join(" | ") || null, titleFont: pie.font, font: pie.font, bg: o.bg,
       plot: { x: (1 - D / pw) / 2, y: (1 - D / ph) / 2, w: D / pw, h: D / ph },
-      holeSize: holeD ? 100 * holeD / D : innerPts.length ? 100 * innerD / D : null,
-      points: shown.map(p => ({ color: p.hidden ? null : p.color, selected: p.selected })), hasShapes: texts.length > 0
+      holeSize: holeAsCircle ? null : holeD ? 100 * holeD / D : innerPts.length ? 100 * innerD / D : null,
+      points: shown.map(p => ({ color: p.hidden ? null : p.color, selected: p.selected })), hasShapes: texts.length > 0, cellLabels
     };
     const holeTip = holeD && pie.hole.tipFor(pts);
     out.push({ x, y, w: pw, h: ph, name: o.name, xml: pieChartXml(spec),
                shapes: texts.length ? userShapesXml(texts, { w: pw, h: ph }) : null,
                // a gauge stays a plain, editable Excel chart: no tooltip wedges grouped over it
-               tips: pie.gauge ? [] : [...tipsOf(shown, D, holeD || (innerPts.length ? innerD : 0), { w: pw, h: ph }),
+               tips: pie.gauge || bound ? [] : [...tipsOf(shown, D, holeD || (innerPts.length ? innerD : 0), { w: pw, h: ph }),
                       ...(holeTip ? [{ x: (pw - holeD) / 2, y: (ph - holeD) / 2, w: holeD, h: holeD, prst: "ellipse", text: holeTip, link: o.link }] : [])] });
     if (!innerPts.length) return;
     // nested donut: the inner pie is its own see-through chart exactly over the ring's hole (drawn after = on top);
@@ -5057,21 +5368,22 @@ function tvScatterSpec(ctx, opts = {}) {
   // a Size measure is part of the meaning (Tableau's circles sized by it): Excel's bubble chart, area = size
   const sizeCi = !opts.lines && roles.size >= 0 && !vm.cols[roles.size].isHeader ? roles.size : -1;
   const sizeOf = r => { const n = tfDvNum(r[sizeCi]); return n === null ? null : Math.abs(n); };
+  // a size that is never negative is the measure itself (each value knows its mark); a bubble's area is its magnitude
+  const sizes = own => own.every(r => (tfDvNum(r[sizeCi]) ?? 0) >= 0) ? tvMarkValues(own, sizeCi) : own.map(sizeOf);
   if (colorCi >= 0 && !roles.color.continuous) {
     const values = tvColorValues(vm, roles);
     if (values.length > TV_MAX_SERIES) throw new Error("too many colour values for an Excel chart");
     spec.series = values.map((v, i) => {
-      const own = rows.filter(r => tvText(r[colorCi]) === v), pts = own.map(point);
+      const own = rows.filter(r => tvText(r[colorCi]) === v);
       return { name: v, color: (scale && scale(v)) || tvHex(TABLEAU_10[i % TABLEAU_10.length]),
-               x: pts.map(p => p.x), y: pts.map(p => p.y), labels, ...(opts.lines ? { line: true } : {}),
-               ...(sizeCi >= 0 ? { size: own.map(sizeOf) } : {}),
+               x: tvMarkValues(own, xm.ci), y: tvMarkValues(own, ym.ci), labels, ...(opts.lines ? { line: true } : {}),
+               ...(sizeCi >= 0 ? { size: sizes(own) } : {}),
                labelTexts: textLabels ? own.map(labelOf) : undefined };
     });
   } else {
-    const pts = rows.map(point);
     spec.series = [{
-      name: tvMeasureLabel(vm, ym.ci), color: tvMarkColor(roles), x: pts.map(p => p.x), y: pts.map(p => p.y), labels,
-      ...(opts.lines ? { line: true } : {}), ...(sizeCi >= 0 ? { size: rows.map(sizeOf) } : {}),
+      name: tvMeasureLabel(vm, ym.ci), color: tvMarkColor(roles), x: tvMarkValues(rows, xm.ci), y: tvMarkValues(rows, ym.ci), labels,
+      ...(opts.lines ? { line: true } : {}), ...(sizeCi >= 0 ? { size: sizes(rows) } : {}),
       labelTexts: textLabels ? rows.map(labelOf) : undefined,
       pointColors: colorCi >= 0 && scale ? rows.map(r => scale(tfDvNum(r[colorCi]))) : undefined
     }];
@@ -5327,7 +5639,7 @@ function tvTreemapSpec(ctx) {
     ...tvBaseSpec(vm), kind: "treemap", legend: false,
     categories: { names: levelCis.map(ci => tvMeasureLabel(vm, ci)), levels: cats.levels.map(lv => keep.map(i => lv[i])) },
     numFmt: tvNumFmt(vm, roles.size),
-    series: [{ name: tvMeasureLabel(vm, roles.size), values: keep.map(i => sizes[i]), color: tvMarkColor(roles),
+    series: [{ name: tvMeasureLabel(vm, roles.size), values: tvPickSum(sizes, keep), color: tvMarkColor(roles),
                pointColors: pointColors ? keep.map(i => pointColors[i]) : undefined, labels: true,
                // Size measure also on Label → "Quality Issue 20K", like Tableau
                labelParts: { category: true, value: roles.labelRefs.some(r => tfSameField(r, vm.cols[roles.size].ref || {})) } }]
@@ -5446,7 +5758,7 @@ function buildExcelChartSpecs(visualModel, model) {
              ![...roles.rows.values, ...roles.cols.values].some(v => v.mv)) {
     specs = tvScatterSpec(ctx, { lines: true });         // a line of one measure against another (a Pareto curve)
   } else {
-    specs = tvCartesianSpecs(ctx);
+    specs = tvSmallMultipleSpecs(ctx) || tvCartesianSpecs(ctx);
   }
   // reference lines last: a line Excel cannot draw adds its note to the conversion the approximations named
   specs.forEach(s => { s.name = visualModel.metadata.worksheetName; s.rolesSource = roles.source; tvApplyWorkbookAxes(s, ctx); tvNoteApproximations(s, ctx);
@@ -6493,6 +6805,7 @@ function writeKPICardStacked(worksheet, vm, originRow, originCol, rangeTracker) 
     if (color && plan.enc.applyTo === "fill") extra.fill = color;
     if (color && plan.enc.applyTo === "font" && !vp.explicitColor) extra.fontColor = color;
     tfWriteCell(worksheet.getCell(r + k + 1, C + 2), rows[0][ci], vp, extra);
+    if (vm.slicerBinding) vm.slicerBinding.bindCell(worksheet.getCell(r + k + 1, C + 2), [rows[0]], ci);
     rangeTracker.update(r + k, C); rangeTracker.update(r + k, C + 1);
   });
   return (vm.showTitle ? 1 : 0) + order.length;
@@ -6693,6 +7006,7 @@ function writeRegularTable(worksheet, vm, originRow, originCol, rangeTracker, al
       const pp = /\n/.test(text) ? { ...p, wrap: true } : p;    // wrap only on real line breaks
       const cell = worksheet.getCell(r + 1, colAt(k) + 1);
       tfWriteCell(cell, dv, pp, extra);
+      if (vm.slicerBinding && !cols[ci].isHeader) vm.slicerBinding.bindCell(cell, [row], ci);
       if (lastAt(k) > colAt(k)) {                                // a field over several columns: one merged cell
         for (let c = colAt(k) + 1; c <= lastAt(k); c++) worksheet.getCell(r + 1, c + 1).style = cell.style;
         worksheet.mergeCells(r + 1, colAt(k) + 1, r + 1, lastAt(k) + 1);
@@ -7141,6 +7455,7 @@ function writeKpiCard(worksheet, card, vm, originRow, originCol, gridW, rangeTra
       if (only && only.ci !== undefined) {                  // a single value: keep the number and its format
         const color = plan && plan.enc && plan.markIdx.has(only.ci) && plan.enc.applyTo === "font" && !only.props.explicitColor ? plan.colorAt(0) : null;
         tfWriteCell(cell, vm.rows[0][only.ci], only.props, { fill: card.background || undefined, fontColor: color || undefined });
+        if (vm.slicerBinding) vm.slicerBinding.bindCell(cell, [vm.rows[0]], only.ci);
       } else if (ln.segments.length) {
         cell.value = { richText: ln.segments.map(s => ({ text: textOf(s, vm), font: tfExcelFont(s.props) })) };
         if (card.background) cell.fill = tfExcelFill(card.background);
@@ -8675,8 +8990,10 @@ function pivotMatrix(vm, model) {
   const cols = [...rowCis.map(ci => vm.cols[ci]),
     ...keys.map(k => {
       const label = tuples.get(k).map(tfDvText).join(" / ");
-      return { name: label, label, ref: value.ref, dataType: value.dataType, pivoted: true, isHeader: false };
+      // matrixKey: the Columns members of this column (a mark is its row's members and these – slicer formulas)
+      return { name: label, label, ref: value.ref, dataType: value.dataType, pivoted: true, isHeader: false, matrixKey: tuples.get(k) };
     })];
+  const colFields = colCis.map(ci => vm.cols[ci].ref);
   /** @type {(string | null)[][]} */
   const fills = [];
   const rows = [...groups.values()].map(g => {
@@ -8689,7 +9006,7 @@ function pivotMatrix(vm, model) {
   vm.order = [...shownRow, ...keys.map((_, k) => rowCis.length + k)];
   vm.headerOrder = rowCis.map((_, i) => i);
   vm.showHeaderRow = true;
-  vm.matrix = { colDims: colCis, valueCi, colorCi };
+  vm.matrix = { colDims: colCis, valueCi, colorCi, colFields };
   vm.cellFill = (rowIdx, ci) => ci >= rowCis.length && fills[rowIdx] ? fills[rowIdx][ci - rowCis.length] : null;
   vm.notes.push(`matrix: ${groups.size} rows × ${keys.length} columns of ${value.name}`);
   return true;
@@ -9633,6 +9950,11 @@ function appendVisualData(workbook, title, vm) {
 
 const REPORT_SHEET = "Conversion Report";
 
+const SLICER_REPORT_NOTE = "Slicers: the visuals that follow them compute their numbers with formulas over the data source's rows " +
+  `(the hidden "Slicer Data" sheet), so a click in a slicer filters them all; the others keep Tableau's values. Charts and ` +
+  "tables keep the bars, points and rows Tableau drew: a value the filter left out at export adds to those, but a category, " +
+  "row or line only it has does not appear (export with every value selected to have them all).";
+
 const STRATEGY_FILL = { NATIVE: "FFE2F0D9", CONSTRUCTED: "FFDDEBF7", APPROXIMATE: "FFFFF2CC", TABLE_FALLBACK: "FFEDEDED",
                         IMAGE_FALLBACK: "FFE4DFEC", UNSUPPORTED: "FFF8CBAD", FAILED: "FFF4B183" };
 
@@ -9698,6 +10020,10 @@ function writeConversionReport(workbook, report) {
     section("Other dashboard objects");
     report.objects.forEach(o => { r++; put(r, 2, o.name); put(r, 3, o.kind); put(r, 5, o.output); });
   }
+  if (report.slicers && report.slicers.length) {
+    section("Slicers: the visuals they filter");
+    report.slicers.forEach(s => { r++; put(r, 2, s.worksheet); put(r, 3, s.follows ? "Follows the slicers" : "Fixed values"); put(r, 5, s.note); ws.mergeCells(r, 5, r, 7); });
+  }
   if (report.filters.length || report.parameters.length) {
     section("Filters and parameters (the exported data reflects their state at export time)");
     report.filters.forEach(f => { r++; put(r, 2, f.name); put(r, 3, "Filter"); put(r, 5, f.values.join(", ")); });
@@ -9709,6 +10035,7 @@ function writeConversionReport(workbook, report) {
   }
   section("Notes");
   [
+    ...(report.slicers && report.slicers.length ? [SLICER_REPORT_NOTE] : []),
     "Values are Tableau's own results for the view: calculated fields, LOD expressions and table calculations are exported as values, not translated into Excel formulas.",
     "Filters, parameters and sets apply as they were at export time; Excel has no live link back to Tableau.",
     "Tooltips: pies, donuts and packed bubbles show Tableau's tooltip text on hover; elsewhere the tooltip fields are in the exported data only.",
@@ -9777,6 +10104,10 @@ function writeConversionReports(workbook, reports) {
       section("Other dashboard objects");
       report.objects.forEach(o => { r++; put(r, 2, o.name); put(r, 3, o.kind); put(r, 5, o.output); });
     }
+    if (report.slicers && report.slicers.length) {
+      section("Slicers: the visuals they filter");
+      report.slicers.forEach(s => { r++; put(r, 2, s.worksheet); put(r, 3, s.follows ? "Follows the slicers" : "Fixed values"); put(r, 5, s.note); ws.mergeCells(r, 5, r, 7); });
+    }
     if (report.filters.length || report.parameters.length) {
       section("Filters and parameters (the exported data reflects their state at export time)");
       report.filters.forEach(f => { r++; put(r, 2, f.name); put(r, 3, "Filter"); put(r, 5, f.values.join(", ")); });
@@ -9789,6 +10120,7 @@ function writeConversionReports(workbook, reports) {
   });
   section("Notes");
   [
+    ...(reports.some(rep => rep.slicers && rep.slicers.length) ? [SLICER_REPORT_NOTE] : []),
     "Values are Tableau's own results for the view: calculated fields, LOD expressions and table calculations are exported as values, not translated into Excel formulas.",
     "Filters, parameters and sets apply as they were at export time; Excel has no live link back to Tableau.",
     "Tooltips: pies, donuts and packed bubbles show Tableau's tooltip text on hover; elsewhere the tooltip fields are in the exported data only.",
@@ -9815,6 +10147,11 @@ function writeChartData(ws, spec, startRow) {
     cell.value = v;
     if (fmt) cell.numFmt = fmt;
   };
+  // a value that follows the slicers: a formula over the slicer table's visible rows, Tableau's number as its result
+  const valueAt = (values, i) => {
+    const f = spec.valueFormula ? spec.valueFormula(values, i) : null;
+    return f ? { formula: f, result: values[i] } : values[i];
+  };
   ws.getCell(startRow + 1, 1).font = { bold: true };
 
   if (spec.kind === "scatter" || spec.kind === "bubble") {
@@ -9826,8 +10163,8 @@ function writeChartData(ws, spec, startRow) {
       put(startRow, cx, (spec.xTitle || "X") + (spec.series.length > 1 ? " – " + s.name : ""));
       put(startRow, cy, s.name);
       for (let i = 0; i < n; i++) {
-        if (num(s.x[i]) !== null) put(startRow + 1 + i, cx, s.x[i], spec.xNumFmt);
-        if (num(s.y[i]) !== null) put(startRow + 1 + i, cy, s.y[i], spec.numFmt);
+        if (num(s.x[i]) !== null) put(startRow + 1 + i, cx, valueAt(s.x, i), spec.xNumFmt);
+        if (num(s.y[i]) !== null) put(startRow + 1 + i, cy, valueAt(s.y, i), spec.numFmt);
       }
       maxLen = Math.max(maxLen, n);
       /** @type {ChartRefs["series"][number]} */
@@ -9837,7 +10174,7 @@ function writeChartData(ws, spec, startRow) {
       if (per === 3) {
         const cs = cx + 2;
         put(startRow, cs, (spec.sizeTitle || "Size") + (spec.series.length > 1 ? " – " + s.name : ""));
-        s.size.forEach((v, i) => { if (num(v) !== null) put(startRow + 1 + i, cs, v, spec.sizeNumFmt); });
+        s.size.forEach((v, i) => { if (num(v) !== null) put(startRow + 1 + i, cs, valueAt(s.size, i), spec.sizeNumFmt); });
         ref.size = cellRef(sheet, cs, startRow + 1, cs, startRow + Math.max(1, n));
       }
       return ref;
@@ -9867,8 +10204,7 @@ function writeChartData(ws, spec, startRow) {
     if (dates) put(startRow + 1 + i, 0, dates[i], dateFmt);
     else for (let l = 0; l < L; l++) if (l === L - 1 || starts[l][i]) put(startRow + 1 + i, l, levels[l][i]);
     spec.series.forEach((s, k) => {
-      const v = num(s.values[i]);
-      if (v !== null) put(startRow + 1 + i, L + k, v, s.secondary ? spec.secondaryNumFmt : spec.numFmt);
+      if (num(s.values[i]) !== null) put(startRow + 1 + i, L + k, valueAt(s.values, i), s.secondary ? spec.secondaryNumFmt : spec.numFmt);
     });
   }
   // label texts taken from cells (Excel's "Value From Cells"), after the series columns
@@ -9915,10 +10251,12 @@ function txPr(font, o = {}) {
     `<a:p><a:pPr>${def}</a:pPr><a:endParaRPr lang="en-US"/></a:p></c:txPr>`;
 }
 
-function title(text, font, vertical) {
+/** @param {string} text @param {any} font @param {boolean} vertical reads upwards @param {boolean} [flat] level even where
+ * Excel would turn it (a value axis title) */
+function title(text, font, vertical, flat = false) {
   if (!text) return "";
   const def = runProps(font, {}, "defRPr").replace(' lang="en-US"', "");
-  return `<c:title><c:tx><c:rich><a:bodyPr${vertical ? ' rot="-5400000" vert="horz"' : ""}/><a:lstStyle/>` +
+  return `<c:title><c:tx><c:rich><a:bodyPr${vertical ? ' rot="-5400000" vert="horz"' : flat ? ' rot="0" vert="horz"' : ""}/><a:lstStyle/>` +
     `<a:p><a:pPr>${def}</a:pPr><a:r>${runProps(font, {}, "rPr")}<a:t>${esc(text)}</a:t></a:r></a:p></c:rich></c:tx>` +
     `<c:overlay val="0"/></c:title>`;
 }
@@ -9937,15 +10275,12 @@ function serTx(ref, name) {
   return `<c:tx><c:strRef><c:f>${esc(ref)}</c:f><c:strCache>${strCache([name])}</c:strCache></c:strRef></c:tx>`;
 }
 
-/** @param {string} ref @param {any[][]} levels @param {string[] | null} [shown] labels shown instead (Tableau's
- * truncated headers): written into the chart, as Excel re-reads linked category cells when it opens the file
- * @param {{ serials: number[] } | null} [dates] a date axis: the dates as serials */
-function catXml(ref, levels, shown = null, dates = null) {
+/** @param {string} ref @param {any[][]} levels @param {{ serials: number[] } | null} [dates] a date axis: the dates as serials */
+function catXml(ref, levels, dates = null) {
   if (dates) {
     return `<c:cat><c:numRef><c:f>${esc(ref)}</c:f><c:numCache><c:formatCode>yyyy\\-mm\\-dd</c:formatCode><c:ptCount val="${dates.serials.length}"/>` +
       dates.serials.map((v, i) => `<c:pt idx="${i}"><c:v>${v}</c:v></c:pt>`).join("") + `</c:numCache></c:numRef></c:cat>`;
   }
-  if (shown && levels.length <= 1) return `<c:cat><c:strLit>${strCache(shown)}</c:strLit></c:cat>`;
   if (levels.length <= 1) {
     return `<c:cat><c:strRef><c:f>${esc(ref)}</c:f><c:strCache>${strCache(levels[0] || [])}</c:strCache></c:strRef></c:cat>`;
   }
@@ -9966,7 +10301,7 @@ function valXml(tag, ref, values) {
  * @param {ChartSpec} spec */
 function labelTxPr(spec) {
   const lf = spec.labelFont;
-  if (!lf) return txPr(spec.font, spec.labelPos ? { noWrap: true } : {});
+  if (!lf) return txPr(spec.font, spec.labelPos || spec.series.some(s => s.labelOnly) ? { noWrap: true } : {});
   return txPr({ name: lf.name || spec.font.name, size: lf.size || spec.font.size, color: lf.color || spec.font.color },
               { bold: lf.bold, noWrap: true });
 }
@@ -9974,6 +10309,8 @@ function labelTxPr(spec) {
 /** @param {ChartSpec} spec @param {ChartSeries} s @param {string | null} pos @param {number[]} [hidden] points without a label */
 function dLbls(spec, s, pos, hidden) {
   if (!s.labels) return "";
+  const only = s.labelOnly ? new Set(s.labelOnly) : null;
+  if (only) hidden = [...new Set([...(hidden || []), ...(s.values || []).map((_, i) => i).filter(i => !only.has(i))])].sort((a, b) => a - b);
   const drop = (hidden || []).map(i => `<c:dLbl><c:idx val="${i}"/><c:delete val="1"/></c:dLbl>`).join("");
   if (s.labelTexts) {
     // a doughnut takes no label position (Excel refuses the file)
@@ -9986,7 +10323,21 @@ function dLbls(spec, s, pos, hidden) {
   const fmt = s.labelNumFmt || (s.secondary ? spec.secondaryNumFmt : spec.numFmt);
   const showVal = s.labelParts ? (s.labelParts.value ? 1 : 0) : 1;
   const showCat = s.labelParts && s.labelParts.category ? 1 : 0;
-  return `<c:dLbls>${fmt ? `<c:numFmt formatCode="${esc(fmt)}" sourceLinked="0"/>` : ""}` +
+  const shows = `<c:showLegendKey val="0"/><c:showVal val="${showVal}"/><c:showCatName val="${showCat}"/><c:showSerName val="0"/>` +
+    `<c:showPercent val="${s.labelParts && s.labelParts.percent ? 1 : 0}"/><c:showBubbleSize val="0"/>`;
+  // a label Tableau keeps on a line's first / last mark stays inside the pane: beside the point, not centred over it
+  const marks = (s.values || []).map((v, i) => num(v) === null ? -1 : i).filter(i => i >= 0);
+  const side = i => only && pos === "t" && marks.length > 1 ? (i === marks[0] ? "r" : i === marks[marks.length - 1] ? "l" : null) : null;
+  const placed = only ? [...only].filter(i => side(i)) : [];
+  if (placed.length) {
+    const one = i => `<c:dLbl><c:idx val="${i}"/>${fmt ? `<c:numFmt formatCode="${esc(fmt)}" sourceLinked="0"/>` : ""}` +
+      `<c:spPr><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr>${labelTxPr(spec)}<c:dLblPos val="${side(i)}"/>${shows}</c:dLbl>`;
+    const del = i => `<c:dLbl><c:idx val="${i}"/><c:delete val="1"/></c:dLbl>`;
+    const items = [...(hidden || []).map(i => [i, del(i)]), ...placed.map(i => [i, one(i)])].sort((a, b) => +a[0] - +b[0]);
+    return `<c:dLbls>${items.map(x => x[1]).join("")}${fmt ? `<c:numFmt formatCode="${esc(fmt)}" sourceLinked="0"/>` : ""}` +
+      `<c:spPr><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr>${labelTxPr(spec)}<c:dLblPos val="${pos}"/>${shows}</c:dLbls>`;
+  }
+  return `<c:dLbls>${drop}${fmt ? `<c:numFmt formatCode="${esc(fmt)}" sourceLinked="0"/>` : ""}` +
     `<c:spPr><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr>${labelTxPr(spec)}` +
     `${pos ? `<c:dLblPos val="${pos}"/>` : ""}<c:showLegendKey val="0"/><c:showVal val="${showVal}"/>` +
     `<c:showCatName val="${showCat}"/><c:showSerName val="0"/><c:showPercent val="${s.labelParts && s.labelParts.percent ? 1 : 0}"/><c:showBubbleSize val="0"/>` +
@@ -10085,6 +10436,16 @@ function niceUnit(range, ticks) {
 function valueRange(spec, axisPlot) {
   if (spec.percent) return { fixed: { min: 0, max: 1 }, unit: spec.valueMajorUnit || 0.2 };    // 100 % stacked: 0 – 100 %
   const fixed = { min: spec.valueMin, max: spec.valueMax };
+  // values that follow slicers can grow past Tableau's: only the workbook's own range and spacing are kept, Excel
+  // scales the rest (from zero when every value is positive, as Tableau's axis starts). Dots, targets and reference
+  // lines over bars are drawn on an axis pinned to this range: such a chart keeps Tableau's
+  const follows = spec.valueFormula && spec.series.some(s => s.values && /** @type {any} */ (s.values).src) &&
+                  !spec.overlay && !spec.targets && !(spec.refLines && spec.refLines.length);
+  if (follows) {
+    const all = spec.series.flatMap(s => s.values || []).filter(v => num(v) !== null);
+    if (fixed.min === undefined && spec.includeZero !== false && all.length && all.every(v => v >= 0)) fixed.min = 0;
+    return { fixed, unit: spec.valueMajorUnit || null };
+  }
   const vals = [], stacks = new Map();
   spec.series.filter(s => (!s.secondary || spec.secondarySync) && s.values).forEach(s => {
     const type = s.type || spec.kind;
@@ -10159,12 +10520,12 @@ function seriesXml(spec, s, k, refs, type, hiddenLabels) {
       `<c:spPr>${solid(c, opacity)}<a:ln><a:noFill/></a:ln></c:spPr></c:dPt>` : "").join("");
     const pos = spec.labelPos || (spec.stacked ? null : "outEnd");
     return `<c:ser>${head}<c:spPr>${solid(s.color, opacity)}<a:ln><a:noFill/></a:ln></c:spPr><c:invertIfNegative val="0"/>` +
-      `${dpts}${dLbls(spec, s, pos)}${catXml(refs.cat, levels, spec.categoryShown, spec.dateAxis)}${valXml("val", r.val, s.values)}${labelRangeXml(s, r)}</c:ser>`;
+      `${dpts}${dLbls(spec, s, pos)}${catXml(refs.cat, levels, spec.dateAxis)}${valXml("val", r.val, s.values)}${labelRangeXml(s, r)}</c:ser>`;
   }
   if (type === "line" && s.refLine) {         // reference line: flat, no markers; label above the 2nd point, as Tableau's
     const at = Math.min(1, Math.max(0, (s.values || []).length - 1));
     return `<c:ser>${head}<c:spPr>${refLineLn(s.refLine)}</c:spPr><c:marker><c:symbol val="none"/></c:marker>` +
-      `${refLineLabel(spec, s.refLine, "t", "showVal", at)}${catXml(refs.cat, levels, spec.categoryShown, spec.dateAxis)}${valXml("val", r.val, s.values)}<c:smooth val="0"/></c:ser>`;
+      `${refLineLabel(spec, s.refLine, "t", "showVal", at)}${catXml(refs.cat, levels, spec.dateAxis)}${valXml("val", r.val, s.values)}<c:smooth val="0"/></c:ser>`;
   }
   if (type === "line") {
     const lineSp = s.line === false ? `<a:ln w="28575"><a:noFill/></a:ln>`
@@ -10173,17 +10534,17 @@ function seriesXml(spec, s, k, refs, type, hiddenLabels) {
     const size = s.markerSize || 7;
     const dpts = s.marker ? pc.map((c, i) => c ? `<c:dPt><c:idx val="${i}"/>${markerXml(symbol, c, size)}<c:bubble3D val="0"/></c:dPt>` : "").join("") : "";
     return `<c:ser>${head}<c:spPr>${lineSp}</c:spPr>${markerXml(symbol, s.color, size)}${dpts}` +
-      `${dLbls(spec, s, "t", hiddenLabels)}${catXml(refs.cat, levels, spec.categoryShown, spec.dateAxis)}${valXml("val", r.val, s.values)}<c:smooth val="0"/>${labelRangeXml(s, r)}</c:ser>`;
+      `${dLbls(spec, s, "t", hiddenLabels)}${catXml(refs.cat, levels, spec.dateAxis)}${valXml("val", r.val, s.values)}<c:smooth val="0"/>${labelRangeXml(s, r)}</c:ser>`;
   }
   if (type === "area") {
     return `<c:ser>${head}<c:spPr>${solid(s.color, opacity !== null || s.alpha !== undefined ? opacity : spec.stacked ? null : 75000)}<a:ln><a:noFill/></a:ln></c:spPr>` +
-      `${dLbls(spec, s, null)}${catXml(refs.cat, levels, spec.categoryShown, spec.dateAxis)}${valXml("val", r.val, s.values)}</c:ser>`;
+      `${dLbls(spec, s, null)}${catXml(refs.cat, levels, spec.dateAxis)}${valXml("val", r.val, s.values)}</c:ser>`;
   }
   if (type === "pie") {
     const dpts = pc.map((c, i) => `<c:dPt><c:idx val="${i}"/><c:bubble3D val="0"/>` +
       `<c:spPr>${solid(c || s.color)}${line("FFFFFF", 12700)}</c:spPr></c:dPt>`).join("");
     return `<c:ser>${head}${dpts}${dLbls(spec, s, spec.kind === "pie" ? "bestFit" : null)}` +
-      `${catXml(refs.cat, levels, spec.categoryShown, spec.dateAxis)}${valXml("val", r.val, s.values)}${labelRangeXml(s, r)}</c:ser>`;
+      `${catXml(refs.cat, levels, spec.dateAxis)}${valXml("val", r.val, s.values)}${labelRangeXml(s, r)}</c:ser>`;
   }
   if (type === "bubble") {
     // packed bubbles: opaque with a white outline like Tableau; map marks slightly see-through
@@ -10206,7 +10567,8 @@ function seriesXml(spec, s, k, refs, type, hiddenLabels) {
     labelRangeXml(s, r) + `</c:ser>`;
 }
 
-/** @param {ChartSpec} spec @param {number} id @param {number} cross @param {{ deleted?: boolean, rot?: number }} [o] rot: label rotation (60000ths of a degree) */
+/** @param {ChartSpec} spec @param {number} id @param {number} cross @param {{ deleted?: boolean, rot?: number, skip?: number }} [o]
+ *  rot: label rotation (60000ths of a degree), skip: every n-th label shown */
 function catAxis(spec, id, cross, o = {}) {
   if (spec.dateAxis) return dateAxisXml(spec, id, cross, o);
   const horizontal = spec.barDir === "bar";
@@ -10217,14 +10579,16 @@ function catAxis(spec, id, cross, o = {}) {
     `<c:numFmt formatCode="General" sourceLinked="1"/><c:majorTickMark val="none"/><c:minorTickMark val="none"/>` +
     `<c:tickLblPos val="${o.deleted ? "none" : spec.valueReversed ? "nextTo" : "low"}"/><c:spPr>${spec.axisLine === false ? "<a:ln><a:noFill/></a:ln>" : line("D4D4D4", 9525)}</c:spPr>${txPr(spec.font, { rot: o.rot })}` +
     `<c:crossAx val="${cross}"/><c:crosses val="${spec.valueReversed && !o.deleted ? "max" : "autoZero"}"/><c:auto val="1"/><c:lblAlgn val="ctr"/>` +
-    `<c:lblOffset val="100"/>${o.rot !== undefined || spec.categoryLabelSkip ? `<c:tickLblSkip val="${spec.categoryLabelSkip || 1}"/>` : ""}<c:noMultiLvlLbl val="${multi ? 0 : 1}"/></c:catAx>`;
+    `<c:lblOffset val="100"/>${o.rot !== undefined ? `<c:tickLblSkip val="${o.skip || 1}"/>` : ""}<c:noMultiLvlLbl val="${multi ? 0 : 1}"/></c:catAx>`;
 }
 
 /** a continuous date axis: Excel's date axis, its labels as far apart as dateTicks found room for
  * @param {ChartSpec} spec @param {number} id @param {number} cross @param {{ deleted?: boolean, rot?: number }} o */
 function dateAxisXml(spec, id, cross, o) {
   const t = spec.dateTicks || { majorUnit: 1, majorTimeUnit: "years", numFmt: "yyyy" };
-  return `<c:dateAx><c:axId val="${id}"/><c:scaling><c:orientation val="minMax"/></c:scaling>` +
+  const d = spec.dateAxis;                                // panes of small multiples share one span (max before min)
+  const span = (d.max !== undefined ? `<c:max val="${d.max}"/>` : "") + (d.min !== undefined ? `<c:min val="${d.min}"/>` : "");
+  return `<c:dateAx><c:axId val="${id}"/><c:scaling><c:orientation val="minMax"/>${span}</c:scaling>` +
     `<c:delete val="${o.deleted ? 1 : 0}"/><c:axPos val="b"/>${o.deleted ? "" : title(spec.categoryTitle, spec.font, false)}` +
     `<c:numFmt formatCode="${esc(t.numFmt)}" sourceLinked="0"/><c:majorTickMark val="none"/><c:minorTickMark val="none"/>` +
     `<c:tickLblPos val="${o.deleted ? "none" : spec.valueReversed ? "nextTo" : "low"}"/><c:spPr>${spec.axisLine === false ? "<a:ln><a:noFill/></a:ln>" : line("D4D4D4", 9525)}</c:spPr>${txPr(spec.font, { rot: o.rot })}` +
@@ -10241,7 +10605,7 @@ function dateAxisXml(spec, id, cross, o) {
 function dateTicks(spec, axisPlot) {
   const d = spec.dateAxis;
   if (!d) return null;
-  const s = d.serials, first = s[0], last = s[s.length - 1];
+  const s = d.serials, first = d.min !== undefined ? d.min : s[0], last = d.max !== undefined ? d.max : s[s.length - 1];
   const month = v => { const t = new Date((v - 25569) * 86400000); return t.getUTCFullYear() * 12 + t.getUTCMonth(); };
   const months = month(last) - month(first), days = last - first;
   const charPx = ((spec.font && spec.font.size) || 9) * 4 / 3 * 0.55;          // average character of the label font
@@ -10304,7 +10668,7 @@ function valAxis(spec, id, cross, o = {}) {
     ? (fixed.max !== undefined ? `<c:max val="${fixed.max}"/>` : "") + (fixed.min !== undefined ? `<c:min val="${fixed.min}"/>` : "")
     : spec.includeZero === false || !o.values ? "" : zeroScaling(o.values);
   return `<c:valAx><c:axId val="${id}"/><c:scaling><c:orientation val="${o.reversed ? "maxMin" : "minMax"}"/>${scale}</c:scaling><c:delete val="${o.deleted ? 1 : 0}"/>` +
-    `<c:axPos val="${pos}"/>${grid}${title(o.title, spec.font, pos === "l" || pos === "r")}` +
+    `<c:axPos val="${pos}"/>${grid}${title(o.title, spec.font, (pos === "l" || pos === "r") && !o.titleFlat, !!o.titleFlat)}` +
     `<c:numFmt formatCode="${esc(o.tickFmt || axisFmt(o.numFmt || "General", o.values))}" sourceLinked="0"/><c:majorTickMark val="none"/>` +
     `<c:minorTickMark val="none"/><c:tickLblPos val="${o.hidden ? "none" : o.lowLabels ? "low" : "nextTo"}"/><c:spPr><a:ln><a:noFill/></a:ln></c:spPr>` +
     `${txPr(spec.font)}<c:crossAx val="${cross}"/><c:crosses val="${crosses}"/>` +
@@ -10362,42 +10726,35 @@ function xyFit(spec, plot) {
 }
 
 /**
- * Tableau's column headers stay horizontal and a name too long for its slot is cut short with "..": the
- * labels shown on a vertical chart's category axis, or null when every name fits (or the labels are rotated).
- * @param {ChartSpec} spec @param {{ w: number, h: number } | null} axisPlot
+ * Tableau's column headers stay horizontal while every name fits its slot; otherwise Tableau turns them to read
+ * upwards and, where even turned labels would overlap, shows every second (third …) one. The turn (degrees) and the
+ * label step for a vertical chart's category axis, or null when the labels stay as they are (or the workbook turns them).
+ * @param {ChartSpec} spec @param {{ w: number, h: number } | null} axisPlot @returns {{ rot: number, skip: number } | null}
  */
-function truncatedCategories(spec, axisPlot) {
+function categoryLabelFit(spec, axisPlot) {
   const levels = spec.categories ? spec.categories.levels : [];
-  if (!axisPlot || spec.barDir === "bar" || spec.categoryRotation || spec.categoryAxisHidden || levels.length !== 1 || !levels[0].length) return null;
+  if (!axisPlot || spec.barDir === "bar" || spec.categoryRotation || spec.categoryAxisHidden || spec.dateAxis ||
+      levels.length !== 1 || !levels[0].length) return null;
   const names = levels[0].map(c => String(c == null ? "" : c));
-  const charPx = ((spec.font && spec.font.size) || 9) * 4 / 3 * 0.5;      // average character of the label font
-  const slotPx = spec.categorySlotPx || axisPlot.w / names.length;      // the workbook's cell width, else an equal share
-  const fit = Math.max(4, Math.floor((slotPx - 4) / charPx));
-  const shown = names.map(n => n.length > fit ? n.slice(0, Math.max(1, fit - 2)).trimEnd() + ".." : n);
-  return shown.some((s, i) => s !== names[i]) ? shown : null;
-}
-
-/**
- * Tableau scrolls a chart whose category cells (Format → Cell width) are wider than the view; an Excel chart cannot
- * scroll, so every n-th label is shown instead (Excel's "interval between labels"), as many as fit side by side.
- * Only then – otherwise every label is shown, as before. @returns {number | null}
- */
-function categoryLabelSkip(spec, axisPlot) {
-  const levels = spec.categories ? spec.categories.levels : [];
-  if (!axisPlot || !spec.categorySlotPx || spec.barDir === "bar" || spec.categoryRotation || levels.length !== 1) return null;
-  const n = levels[0].length;
-  if (!n || spec.categorySlotPx * n <= axisPlot.w) return null;            // Tableau does not scroll: unchanged
-  const charPx = ((spec.font && spec.font.size) || 9) * 4 / 3 * 0.5;
-  const widest = Math.max(...levels[0].map(c => String(c == null ? "" : c).length)) * charPx + 8;
-  const skip = Math.ceil(widest / (axisPlot.w / n));
-  return skip > 1 ? skip : null;
+  const fontPx = ((spec.font && spec.font.size) || 9) * 4 / 3;
+  const slot = axisPlot.w / names.length;
+  if (names.every(n => n.length * fontPx * 0.5 <= slot - 4)) return null;     // average character: half the font size
+  // Tableau scrolls a chart whose category cells (Format → Cell width) are wider than the view, its names horizontal
+  // while they fit a cell; an Excel chart cannot scroll, so every n-th is shown instead, as many as fit side by side
+  if (spec.categorySlotPx > slot && names.every(n => n.length * fontPx * 0.5 <= spec.categorySlotPx - 4)) {
+    return { rot: 0, skip: Math.max(1, Math.ceil((Math.max(...names.map(n => n.length)) * fontPx * 0.5 + 8) / slot)) };
+  }
+  // numbers (bins, years) stay horizontal like an axis: every n-th, as far apart as the longest needs
+  if (names.every(n => /^-?[\d.,]+%?$/.test(n.trim()))) {
+    return { rot: 0, skip: Math.max(1, Math.ceil((Math.max(...names.map(n => n.length)) * fontPx * 0.55 + 10) / slot)) };
+  }
+  return { rot: -90, skip: Math.max(1, Math.ceil(fontPx * 1.4 / slot)) };      // a turned label's line, with spacing
 }
 
 /** @param {ChartSpec} spec @param {ChartRefs} refs @param {{ w: number, h: number } | null} [plot] plot area in px (manual layout)
  *  @param {{ w: number, h: number } | null} [axisPlot] approximate plot area of a chart with axes, for Tableau-like tick spacing */
 function plotAreaXml(spec, refs, plot = null, axisPlot = null) {
-  spec.categoryShown = spec.dateAxis ? null : truncatedCategories(spec, axisPlot);
-  spec.categoryLabelSkip = spec.dateAxis ? null : categoryLabelSkip(spec, axisPlot);
+  spec.categoryFit = categoryLabelFit(spec, axisPlot);
   spec.dateTicks = dateTicks(spec, axisPlot);
   const k = spec.kind;
   if (k === "pie" || k === "doughnut") {
@@ -10511,9 +10868,13 @@ function plotAreaXml(spec, refs, plot = null, axisPlot = null) {
   }
   // a hidden value axis beside a second axis group is kept, not drawn: Excel would draw a deleted axis's series on the
   // other group's axis, losing the scale Tableau gives each axis
-  let axes = catAxis(spec, AX.cat, AX.val, { deleted: spec.categoryAxisHidden, rot: (spec.categoryRotation || 0) * 60000 }) +
-    valAxis(spec, AX.val, AX.cat, { title: spec.valueAxisHidden ? null : spec.valueTitle, numFmt: spec.numFmt, values: axisValues(false),
-                                    fixed, deleted: spec.valueAxisHidden && !hasSecondary, hidden: spec.valueAxisHidden && hasSecondary,
+  let axes = catAxis(spec, AX.cat, AX.val, { deleted: spec.categoryAxisHidden,
+                                     rot: (spec.categoryRotation || (spec.categoryFit ? spec.categoryFit.rot : 0)) * 60000, skip: spec.categoryFit ? spec.categoryFit.skip : 1 }) +
+    valAxis(spec, AX.val, AX.cat, { title: spec.rowTitle !== undefined ? spec.rowTitle : spec.valueAxisHidden ? null : spec.valueTitle,
+                                    titleFlat: spec.rowTitle !== undefined && !(spec.grid && spec.grid.rowVertical),
+                                    numFmt: spec.numFmt, values: axisValues(false), fixed,
+                                    deleted: spec.valueAxisHidden && !hasSecondary && spec.rowTitle === undefined,
+                                    hidden: spec.valueAxisHidden && (hasSecondary || spec.rowTitle !== undefined),
                                     majorUnit: unit, tickFmt: spec.valueAxisNumFmt, reversed: spec.valueReversed });
   if (hasSecondary) {
     axes += catAxis(spec, AX.cat2, AX.val2, { deleted: true }) +
@@ -10529,15 +10890,57 @@ function plotAreaXml(spec, refs, plot = null, axisPlot = null) {
   return xml + overlay + axes + overlayAxes;
 }
 
+/* small multiples: room round Tableau's pane grid for the headers and axes (px) */
+const GRID_TOP = 18, GRID_BOTTOM = 22, GRID_PAD = 1, GRID_OVERLAP = 14, GRID_OVERLAP_V = 10, GRID_AXIS = 34;
+
+/** the grid's left margin (px): the row headers (turned: one line high; else as wide as the longest, at most 120 px)
+ * and the value axis labels unless the workbook hides them @param {any} g spec.grid @param {ChartSpec} spec */
+function gridLeft(g, spec) {
+  const fontPx = ((spec.font && spec.font.size) || 9) * 4 / 3;
+  const head = !g.rowLen ? 0 : g.rowVertical ? fontPx + 6 : Math.min(120, g.rowLen * fontPx * 0.55 + 10);
+  return Math.round(head + (spec.valueAxisHidden ? 0 : GRID_AXIS) + 4);
+}
+
+/** a pane chart's margins round its plot area (px): headers and axes only on the grid's outer panes; inner edges reach
+ * into the neighbouring panes (the charts are see-through), so labels at a pane's edge keep their room and Excel never
+ * moves a plot area to fit them – every pane's plot stays exactly at its place in the grid
+ * @param {any} g spec.grid @param {ChartSpec} spec */
+function gridInset(g, spec) {
+  return { l: (g.col === 0 ? gridLeft(g, spec) : GRID_OVERLAP) + GRID_PAD, r: (g.col === g.cols - 1 ? 0 : GRID_OVERLAP) + GRID_PAD,
+           t: (g.row === 0 ? GRID_TOP : GRID_OVERLAP_V) + GRID_PAD, b: (g.row === g.rows - 1 ? GRID_BOTTOM : GRID_OVERLAP_V) + GRID_PAD };
+}
+
+/** a pane chart's frame inside its block (px): the panes share the block evenly, the outer ones also hold the
+ * headers and axes, so every plot area is the same size
+ * @param {any} g spec.grid @param {ChartSpec} spec @param {number} W @param {number} H */
+function gridFrame(g, spec, W, H) {
+  const GRID_LEFT = gridLeft(g, spec);
+  const pw = Math.max(12, (W - GRID_LEFT) / g.cols), ph = Math.max(12, (H - GRID_TOP - GRID_BOTTOM) / g.rows);
+  const x = g.col === 0 ? 0 : GRID_LEFT + g.col * pw - GRID_OVERLAP, y = g.row === 0 ? 0 : GRID_TOP + g.row * ph - GRID_OVERLAP_V;
+  const x2 = GRID_LEFT + (g.col + 1) * pw + (g.col === g.cols - 1 ? 0 : GRID_OVERLAP);
+  const y2 = GRID_TOP + (g.row + 1) * ph + (g.row === g.rows - 1 ? GRID_BOTTOM : GRID_OVERLAP_V);
+  return { x: Math.round(x), y: Math.round(y), w: Math.round(x2) - Math.round(x), h: Math.round(y2) - Math.round(y) };
+}
+
 /** chart part XML (xl/charts/chartN.xml)
  * @param {ChartSpec} spec @param {ChartRefs} refs
  * @param {{ widthPx?: number, heightPx?: number }} [size] the chart frame, for maps / packed bubbles
  * @returns {string} */
 function chartXml(spec, refs, size) {
+  // a pane of small multiples: the column's header above the top row, the row's header as the left column's axis
+  // title, value labels on the left column and the category axis on the bottom row only (Tableau's shared axes)
+  const g = spec.grid;
+  if (g) {
+    spec = { ...spec, legend: false, categoryTitle: "", background: null, categoryAxisHidden: spec.categoryAxisHidden || g.row !== g.rows - 1,
+             valueAxisHidden: spec.valueAxisHidden || g.col !== 0, valueTitle: null, rowTitle: g.col === 0 ? g.rowLabel : undefined };
+  }
   // no axes: the plot area fills the frame (room for the legend), so its size in px is known
   const frame = spec.axesHidden && spec.packed ? bubbleFrame(spec) : null;
   const plot = frame && { w: ((size && size.widthPx) || 600) * frame.w, h: ((size && size.heightPx) || 400) * frame.h };
-  const axisPlot = size && size.widthPx ? { w: size.widthPx * 0.85, h: (size.heightPx || 300) * 0.72 } : null;
+  const gi = g && gridInset(g, spec);
+  const axisPlot = !size || !size.widthPx ? null
+    : gi ? { w: size.widthPx - gi.l - gi.r, h: (size.heightPx || 300) - gi.t - gi.b }
+    : { w: size.widthPx * 0.85, h: (size.heightPx || 300) * 0.72 };
   const layout = frame
     ? `<c:layout><c:manualLayout><c:layoutTarget val="inner"/><c:xMode val="edge"/><c:yMode val="edge"/>` +
       `<c:x val="${frame.x}"/><c:y val="${frame.y}"/><c:w val="${frame.w}"/><c:h val="${frame.h}"/></c:manualLayout></c:layout>`
@@ -10563,11 +10966,29 @@ function chartXml(spec, refs, size) {
     plotLayout = `<c:layout><c:manualLayout><c:layoutTarget val="inner"/><c:xMode val="edge"/><c:yMode val="edge"/>` +
       `<c:x val="${box.x}"/><c:y val="${box.y}"/><c:w val="${box.w}"/><c:h val="${box.h}"/></c:manualLayout></c:layout>`;
   }
+  if (g) {
+    // every pane's plot area at the same place inside its chart, so the grid lines up like Tableau's panes
+    const W = (size && size.widthPx) || 200, H = (size && size.heightPx) || 150, i = gridInset(g, spec);
+    const f = v => Math.max(0, Math.min(1, v)).toFixed(4);
+    plotLayout = `<c:layout><c:manualLayout><c:layoutTarget val="inner"/><c:xMode val="edge"/><c:yMode val="edge"/>` +
+      `<c:x val="${f(i.l / W)}"/><c:y val="${f(i.t / H)}"/><c:w val="${f((W - i.l - i.r) / W)}"/><c:h val="${f((H - i.t - i.b) / H)}"/></c:manualLayout></c:layout>`;
+    // the row's header on one line left of its pane (turned or not, as in the workbook), cut short with ".." like Tableau's
+    if (g.col === 0 && spec.rowTitle) {
+      const charPx = (spec.font.size || 9) * 4 / 3 * 0.55;
+      const room = Math.floor((g.rowVertical ? H - i.t - i.b : i.l - (spec.valueAxisHidden ? 0 : GRID_AXIS) - 8) / charPx);
+      if (spec.rowTitle.length > room) spec.rowTitle = spec.rowTitle.slice(0, Math.max(1, room - 2)).trimEnd() + "..";
+    }
+    if (g.row === 0 && g.colLabel) {
+      const tw = String(g.colLabel).length * (spec.font.size || 9) * 4 / 3 * 0.55 + 8;
+      titleXml = title(g.colLabel, spec.font, false).replace("<c:overlay", `<c:layout><c:manualLayout><c:xMode val="edge"/><c:yMode val="edge"/>` +
+        `<c:x val="${f((i.l + (W - i.l - i.r) / 2 - tw / 2) / W)}"/><c:y val="0"/></c:manualLayout></c:layout><c:overlay`);
+    }
+  }
   return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n` +
     `<c:chartSpace xmlns:c="${NS.c}" xmlns:a="${NS.a}" xmlns:r="${NS.r}">` +
     `<c:date1904 val="0"/><c:lang val="en-US"/><c:roundedCorners val="0"/>` +
     `<c:chart>${titleXml}<c:autoTitleDeleted val="${titleXml ? 0 : 1}"/><c:plotArea>${plotLayout}${plotAreaXml(spec, refs, plot, axisPlot)}` +
-    `<c:spPr><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr></c:plotArea>${legend}` +
+    `<c:spPr><a:noFill/>${g ? line("D9D9D9", 6350) : "<a:ln><a:noFill/></a:ln>"}</c:spPr></c:plotArea>${legend}` +
     `<c:plotVisOnly val="1"/><c:dispBlanksAs val="gap"/></c:chart>` +
     `<c:spPr>${spec.background === null ? "<a:noFill/>" : solid(spec.background || "FFFFFF")}<a:ln><a:noFill/></a:ln></c:spPr>${txPr(spec.font)}` +
     `<c:printSettings><c:headerFooter/><c:pageMargins b="0.75" l="0.7" r="0.7" t="0.75" header="0.3" footer="0.3"/>` +
@@ -10803,7 +11224,7 @@ async function buildFilterCards(dashboard, sheets, fmtModel, layoutMap) {
     const custom = (sheetRules["quick-filter"] || []).find(r => r.attr === "title" && r.field && tfSameField(tfParseFieldRef(r.field), ref));
     const title = !z.showTitle ? "" : (custom && custom.value) || f.fieldName || (info && info.caption) || ref.name;
     cards.push({ type: "filterValue", isFilterCard: true, name: `filter:${z.id}`, visualName: title || f.fieldName,
-                 filterName: title, values: [text], layout, rowCount: 2 });
+                 filterName: title, values: [text], layout, rowCount: 2, filter: f, field: ref, sheetName: ws.name, mode: z.mode || null });
   }
   if (cards.length) console.log(`[Filters] ${cards.length} filter card(s): ${cards.map(c => `${c.visualName} = ${c.values[0]}`).join(" | ")}`);
   return cards;
@@ -11650,6 +12071,972 @@ function uniqueExcelSheetName(dashboardName, usedLower) {
 }
 
 
+/* ═══ export/slicers.js ═══════════════════════════════════════════════════════════════════════════ */
+/* Tableau filter cards → Excel slicers that cross-filter the dashboard. The rows of the filtered field's data source go
+ * to one hidden table ("Slicer Data"); a slicer on one of its columns hides the rows of the values not picked, and every
+ * chart value, table cell and KPI value that follows the slicers is a formula over the table's visible rows
+ * (SUBTOTAL(103) = 1) – one click filters every chart and table of that data source, in every dashboard of the file.
+ *   Each visual gets a key column: the mark (row of its summary data) each data-source row belongs to, found by the
+ * visual's dimensions (Region, MONTH(Order Date) …) under the sheet's other filters. A measure becomes SUMIFS,
+ * AVERAGEIFS, MINIFS, MAXIFS, COUNTIFS or a distinct count over the rows of its key, or a calculation of those
+ * (SUM([Profit]) / SUM([Sales])). Before a visual is bound, those formulas are worked out on the rows with Tableau's
+ * current selection and have to give Tableau's own numbers: a visual that does not (a calculated dimension, an LOD
+ * expression, a table calculation, a filter that cannot be told) keeps its fixed values, and the report says why. */
+
+const SLICER_DATA_SHEET = "Slicer Data";
+const SLICER_LISTS_SHEET = "Slicer Lists";                       // the dropdown cells' lists of values
+const SLICER_TABLE = "SlicerData";
+const SLICER_ALL = "(All)";
+
+/**
+ * A calculated filter that keeps the dates between two date parameters – Tableau's usual "Start Date / End Date"
+ * pattern: [Order Date] >= [Parameters].[Start] AND [Order Date] <= [Parameters].[End] (also inside IF … THEN TRUE
+ * ELSE FALSE END). Returns the date field, the parameters and whether each bound is strict; null for anything else.
+ * @param {string} formula
+ */
+function slicerParamRange(formula) {
+  let f = String(formula || "").replace(/\/\/[^\n]*/g, "").replace(/\s+/g, " ").trim();
+  const wrapped = f.match(/^IF (.+?) THEN TRUE ELSE FALSE END$/i);
+  if (wrapped) f = wrapped[1];
+  const cmp = "\\(?\\s*\\[([^\\]]+)\\]\\s*(>=|>|<=|<)\\s*\\[Parameters\\]\\.\\[([^\\]]+)\\]\\s*\\)?";
+  const m = f.match(new RegExp(`^\\(?\\s*${cmp}\\s+AND\\s+${cmp}\\s*\\)?$`, "i"));
+  if (!m) return null;
+  const a = { date: m[1], op: m[2], param: m[3] }, b = { date: m[4], op: m[5], param: m[6] };
+  if (a.date.toLowerCase() !== b.date.toLowerCase()) return null;
+  const lo = [a, b].find(x => x.op[0] === ">"), hi = [a, b].find(x => x.op[0] === "<");
+  if (!lo || !hi) return null;
+  return { date: a.date, lo: lo.param, hi: hi.param, loStrict: lo.op === ">", hiStrict: hi.op === "<" };
+}
+/* a slicer as Excel draws it (default style): its caption, its buttons, a little padding; px */
+const SLICER_HEADER_PX = 34, SLICER_ITEM_PX = 26, SLICER_PAD_PX = 10, SLICER_ITEM_MIN_W_PX = 90, SLICER_MAX_ITEM_ROWS = 8;
+/** TWB derivations of a date a slicer key can be built from (YEAR, QUARTER, MONTH, DAY, and their truncated forms) */
+const SLICER_DATE_PARTS = new Set(["yr", "qr", "mn", "dy", "tyr", "tqr", "tmn", "tdy"]);
+/** Tableau aggregations → the slicer formulas' aggregations */
+const SLICER_AGGS = { sum: "SUM", avg: "AVG", min: "MIN", max: "MAX", cnt: "COUNT", ctd: "COUNTD" };
+
+/** a date value as { y, m, d } – Tableau's dates arrive at midnight, sometimes in local time: the nearest day
+ * @param {DataValue} dv */
+function slicerDate(dv) {
+  const s = tvExcelSerial(dv);
+  if (s === null) return null;
+  const t = new Date(Math.round(s - 25569) * 86400000);
+  return { y: t.getUTCFullYear(), m: t.getUTCMonth() + 1, d: t.getUTCDate() };
+}
+
+/** @param {{ y: number, m: number, d: number }} d @param {string} deriv */
+function slicerDatePart(d, deriv) {
+  const two = n => String(n).padStart(2, "0");
+  switch (deriv) {
+    case "yr": case "tyr": return String(d.y);
+    case "qr": return String(Math.ceil(d.m / 3));
+    case "tqr": return `${d.y}-Q${Math.ceil(d.m / 3)}`;
+    case "mn": return String(d.m);
+    case "tmn": return `${d.y}-${two(d.m)}`;
+    case "dy": return String(d.d);
+    default: return `${d.y}-${two(d.m)}-${two(d.d)}`;
+  }
+}
+
+/**
+ * A data-source value as the key text of a field derived as `deriv` (YEAR → "2023", MONTH → "7", a truncated month →
+ * "2023-07", a date → "2023-07-14", anything else its value); null when it cannot be told.
+ * @param {DataValue} dv @param {string} deriv @param {boolean} isDate the column holds dates
+ */
+function slicerRowText(dv, deriv, isDate) {
+  if (tfIsNull(dv)) return "\u0000";
+  if (isDate || SLICER_DATE_PARTS.has(deriv)) { const d = slicerDate(dv); return d ? slicerDatePart(d, deriv) : null; }
+  return String(dv.nativeValue !== undefined ? dv.nativeValue : dv.value);
+}
+
+/** The same key text of a mark's or a filter's value: summary data has YEAR as 2023, MONTH as 7 or "July", QUARTER as
+ * "Q3", a truncated month as its first day. @param {DataValue} dv @param {string} deriv @param {boolean} isDate */
+function slicerMarkText(dv, deriv, isDate) {
+  if (tfIsNull(dv)) return "\u0000";
+  const v = dv.nativeValue !== undefined ? dv.nativeValue : dv.value;
+  if (/^(yr|qr|mn|dy)$/.test(deriv) && !(v instanceof Date)) {
+    const text = tfDvText(dv).trim();
+    if (deriv === "mn") { const r = tfCalendarRank(text); if (r && r.kind === "month") return String(r.rank + 1); }
+    if (deriv === "qr") { const q = text.match(/^Q?\s*([1-4])$/i); if (q) return q[1]; }
+    const n = typeof v === "number" ? v : Number(String(v).trim());
+    return isFinite(n) ? String(Math.round(n)) : null;
+  }
+  return slicerRowText(dv, deriv, isDate);
+}
+
+/** the worksheet's data source that has the field (a blend lists several), else its first; null when Tableau gives none
+ * @param {any} ws @param {string} fieldName */
+async function slicerDataSourceOf(ws, fieldName) {
+  if (typeof ws.getDataSourcesAsync !== "function") return null;
+  const sources = (await ws.getDataSourcesAsync()) || [];
+  const has = ds => (ds.fields || []).some(f => tfNorm(f.name) === tfNorm(fieldName));
+  return sources.find(has) || sources[0] || null;
+}
+
+/**
+ * The rows of the data source a worksheet draws the field from: one logical table, at most FORMAT_CONFIG.slicerMaxRows rows.
+ * @param {any} ws a Tableau worksheet @param {string} fieldName @returns {Promise<SlicerSource>}
+ * @typedef {{ id: string, name: string, columns: { name: string, dataType: string }[], rows: DataValue[][] }} SlicerSource
+ */
+async function readSlicerSource(ws, fieldName) {
+  const ds = await slicerDataSourceOf(ws, fieldName);
+  if (!ds) throw new Error("Tableau does not give this worksheet's data source here");
+  if (typeof ds.getLogicalTablesAsync !== "function") throw new Error("the worksheet's data source cannot be read");
+  const tables = await ds.getLogicalTablesAsync();
+  if (tables.length !== 1) throw new Error(`"${ds.name}" relates ${tables.length} tables – slicers need a data source of one table`);
+  const max = FORMAT_CONFIG.slicerMaxRows;
+  const tooMany = n => new Error(`"${ds.name}" has ${n} rows, more than FORMAT_CONFIG.slicerMaxRows`);
+  let table;
+  if (typeof ds.getLogicalTableDataReaderAsync === "function") {
+    const reader = await ds.getLogicalTableDataReaderAsync(tables[0].id, 10000, { ignoreAliases: false });
+    try {
+      if (reader.totalRowCount > max) throw tooMany(reader.totalRowCount);
+      table = await reader.getAllPagesAsync(max);
+    } finally { await reader.releaseAsync(); }
+  } else if (typeof ds.getLogicalTableDataAsync === "function") {
+    table = await ds.getLogicalTableDataAsync(tables[0].id, { ignoreAliases: false, maxRows: max + 1 });
+    if (table.data.length > max) throw tooMany(`over ${max}`);
+  } else {
+    throw new Error("this Tableau version cannot read a data source's rows");
+  }
+  console.log(`[Slicers] ${ds.name}: ${table.data.length} rows, ${table.columns.length} columns`);
+  return { id: ds.id, name: ds.name, rows: table.data,
+           columns: table.columns.map(c => ({ name: c.fieldName, dataType: String(c.dataType || "").toLowerCase() })) };
+}
+
+/** a workbook field → its column in the source rows (by caption, else by name); -1 when the rows do not have it (most
+ * calculations – a row-level one Tableau includes is used, the check against Tableau's numbers decides)
+ * @param {SlicerSource} source @param {FormatModel} model @param {FieldRef} ref */
+function slicerColumnOf(source, model, ref) {
+  const info = tfFieldInfo(model, { ...ref, deriv: null });
+  const names = [info && info.caption, ref.name].filter(Boolean).map(tfNorm);
+  return source.columns.findIndex(c => names.includes(tfNorm(c.name)));
+}
+
+/** a filter's field name ("Region", "YEAR(Order Date)") → the field and its date part */
+function slicerFilterField(fieldName) {
+  const m = String(fieldName || "").match(/^(YEAR|QUARTER|MONTH|DAY)\((.+)\)$/i);
+  const deriv = m ? { year: "yr", quarter: "qr", month: "mn", day: "dy" }[m[1].toLowerCase()] : "none";
+  const name = m ? m[2] : String(fieldName || "");
+  return { ref: /** @type {FieldRef} */ ({ raw: name, ds: null, deriv, name, type: "nk", inner: name }), deriv };
+}
+
+/**
+ * A measure as aggregations of source columns: [sum:Sales] → SUM(Sales); a calculated field of aggregations
+ * (SUM([Profit])/SUM([Sales]), SUM([Sales])/COUNTD([Customer Name])) → its expression; null for anything else
+ * (table calculations, LOD expressions, row-level calculations, functions other than + − × ÷ and ZN).
+ * @param {SlicerSource} source @param {FormatModel} model @param {FieldRef | null} ref
+ * @returns {SlicerExpr | null}
+ * @typedef {{ op: string, fn?: string, col?: number, v?: number, a?: SlicerExpr, b?: SlicerExpr }} SlicerExpr
+ */
+function slicerMeasureExpr(source, model, ref) {
+  if (!ref) return null;
+  const deriv = String(ref.deriv || "").toLowerCase();
+  if (SLICER_AGGS[deriv]) {
+    const col = slicerColumnOf(source, model, ref);
+    return col >= 0 ? { op: "agg", fn: SLICER_AGGS[deriv], col } : null;
+  }
+  const info = deriv === "usr" ? tfFieldInfo(model, ref) : null;
+  return info && info.formula ? slicerParseCalc(source, model, info.formula, 0) : null;
+}
+
+/** a Tableau calculation of aggregations → SlicerExpr, null when it holds anything else */
+function slicerParseCalc(source, model, formula, depth) {
+  if (depth > 4) return null;
+  const tokens = String(formula).replace(/\/\*[\s\S]*?\*\//g, " ").replace(/\/\/[^\n]*/g, " ")
+    .match(/\[[^\]]+\]|[A-Za-z_]\w*|\d+(?:\.\d+)?|\S/g) || [];
+  let i = 0;
+  const fail = () => { throw new Error("not translatable"); };
+  const expect = t => { if (tokens[i++] !== t) fail(); };
+  /** @returns {SlicerExpr} */
+  const expr = () => {
+    let a = term();
+    while (tokens[i] === "+" || tokens[i] === "-") { const op = tokens[i++]; a = { op, a, b: term() }; }
+    return a;
+  };
+  const term = () => {
+    let a = unary();
+    while (tokens[i] === "*" || tokens[i] === "/") { const op = tokens[i++]; a = { op, a, b: unary() }; }
+    return a;
+  };
+  const unary = () => (tokens[i] === "-" ? (i++, { op: "neg", a: unary() }) : primary());
+  const primary = () => {
+    const t = tokens[i++];
+    if (t === undefined) fail();
+    if (t === "(") { const e = expr(); expect(")"); return e; }
+    if (/^\d/.test(t)) return { op: "num", v: Number(t) };
+    if (t[0] === "[") {                       // another calculated field – of aggregations, else not translatable
+      const info = tfFieldInfo(model, tfParseFieldRef(t));
+      const e = info && info.formula ? slicerParseCalc(source, model, info.formula, depth + 1) : null;
+      return e || fail();
+    }
+    const fn = t.toUpperCase();
+    expect("(");
+    if (fn === "ZN") { const e = expr(); expect(")"); return { op: "zn", a: e }; }
+    const agg = { SUM: "SUM", AVG: "AVG", MIN: "MIN", MAX: "MAX", COUNT: "COUNT", COUNTD: "COUNTD" }[fn];
+    const field = tokens[i++];
+    if (!agg || !field || field[0] !== "[") fail();
+    expect(")");
+    const col = slicerColumnOf(source, model, tfParseFieldRef(field));
+    return col >= 0 ? { op: "agg", fn: agg, col } : fail();
+  };
+  try {
+    const e = expr();
+    return i === tokens.length ? e : null;
+  } catch (err) { return null; }
+}
+
+/** the expression's value over some source rows, as Tableau computes it (null: no value) @param {SlicerExpr} e
+ * @param {number[]} rows indexes into source.rows @param {SlicerSource} source @returns {number | null} */
+function slicerEval(e, rows, source) {
+  if (e.op === "num") return /** @type {number} */ (e.v);
+  if (e.op === "zn") return slicerEval(/** @type {SlicerExpr} */ (e.a), rows, source) ?? 0;
+  if (e.op === "neg") { const a = slicerEval(/** @type {SlicerExpr} */ (e.a), rows, source); return a === null ? null : -a; }
+  if (e.op === "agg") {
+    const dvs = rows.map(r => source.rows[r][/** @type {number} */ (e.col)]).filter(dv => !tfIsNull(dv));
+    if (e.fn === "COUNT") return dvs.length;
+    if (e.fn === "COUNTD") return new Set(dvs.map(dv => String(dv.nativeValue !== undefined ? dv.nativeValue : dv.value))).size;
+    const nums = dvs.map(tfDvNum).filter(n => n !== null);
+    if (!nums.length) return null;
+    if (e.fn === "SUM") return nums.reduce((s, n) => s + n, 0);
+    if (e.fn === "AVG") return nums.reduce((s, n) => s + n, 0) / nums.length;
+    return e.fn === "MIN" ? Math.min(...nums) : Math.max(...nums);
+  }
+  const a = slicerEval(/** @type {SlicerExpr} */ (e.a), rows, source), b = slicerEval(/** @type {SlicerExpr} */ (e.b), rows, source);
+  if (a === null || b === null) return null;
+  if (e.op === "/") return b === 0 ? null : a / b;
+  return e.op === "+" ? a + b : e.op === "-" ? a - b : a * b;
+}
+
+/** the expression as an Excel formula over the rows of key k that the slicers leave visible
+ * @param {SlicerExpr} e @param {{ col: (c: number) => string, key: string, vis: string }} R ranges @param {string} k */
+function slicerExcel(e, R, k) {
+  if (e.op === "num") return String(e.v);
+  if (e.op === "zn") return `IFERROR(${slicerExcel(/** @type {SlicerExpr} */ (e.a), R, k)},0)`;
+  if (e.op === "neg") return `-(${slicerExcel(/** @type {SlicerExpr} */ (e.a), R, k)})`;
+  if (e.op === "agg") {
+    const F = R.col(/** @type {number} */ (e.col)), on = `${R.key},${k},${R.vis},1`;
+    switch (e.fn) {
+      case "SUM": return `SUMIFS(${F},${on})`;
+      case "AVG": return `AVERAGEIFS(${F},${on})`;
+      case "MIN": return `_xlfn.MINIFS(${F},${on})`;
+      case "MAX": return `_xlfn.MAXIFS(${F},${on})`;
+      case "COUNT": return `COUNTIFS(${on},${F},"<>")`;
+      default: return `IFERROR(ROWS(_xlfn.UNIQUE(_xlfn._xlws.FILTER(${F},(${R.key}=${k})*(${R.vis}=1)*(${F}<>"")))),0)`;
+    }
+  }
+  return `(${slicerExcel(/** @type {SlicerExpr} */ (e.a), R, k)}${e.op}${slicerExcel(/** @type {SlicerExpr} */ (e.b), R, k)})`;
+}
+
+/** an expression that can fail in Excel (a division, an average, min or max of no rows) */
+const slicerMayFail = e => !!e && (e.op === "/" || (e.op === "agg" && /^(AVG|MIN|MAX)$/.test(e.fn || "")) ||
+                                   slicerMayFail(e.a) || slicerMayFail(e.b));
+
+/**
+ * One export's slicers, shared by every dashboard of the file: the source rows, the slicer fields with Tableau's
+ * selection, the columns of the hidden table, and the visuals bound to it.
+ */
+function createSlicerModel() {
+  /** @type {SlicerSource | null} */
+  let source = null;
+  /**
+   * kind "slicer": an Excel slicer (selected: the items ticked); "list": a dropdown cell (current: its value, null =
+   * (All)); "range": From / To date cells (lo / hi: day serials). pass(r): row r is in the selection. control: the
+   * cells the dashboard sheet holds for a list / range, set when its card is written.
+   * @type {{ kind: string, col: number, deriv: string, isDate: boolean, header: string, values: any[], items: string[],
+   *          selected: Set<string> | null, pass: (r: number) => boolean, tableCol: number, [k: string]: any }[]}
+   */
+  const fields = [];
+  /** extra table columns after Row and Visible @type {{ header: string, values: any[] }[]} */
+  const columns = [];
+  const headers = new Set(["row", "visible"]);
+  const fieldCols = new Map();              // source column → table column (measures' fields)
+  let locked = false;                       // a visual is bound: the slicer fields are final
+  let failed = null;                        // why the data source could not be read
+  const uniqueHeader = name => {
+    let h = String(name || "Column").replace(/[\r\n]+/g, " ").trim() || "Column", n = 2;
+    while (headers.has(h.toLowerCase())) h = `${name} (${n++})`;
+    headers.add(h.toLowerCase());
+    return h;
+  };
+  const addColumn = (header, values) => { columns.push({ header: uniqueHeader(header), values }); return columns.length + 1; };
+  const N = () => (source ? source.rows.length : 0);
+  const range = c => cellRef(SLICER_DATA_SHEET, c, 1, c, N());
+  const visible = r => fields.every(f => f.pass(r));
+  const shownBySlicers = r => fields.every(f => f.kind !== "slicer" || f.pass(r));     // the rows the table's filter hides
+  let lists = 0;                            // dropdown fields: one column each on the lists sheet
+  /** other dropdowns' lists (a date's year / month / day) on the lists sheet @type {{ col: number, values: any[] }[]} */
+  const extraLists = [];
+
+  /** the table column of a source column (written the first time a formula needs it) */
+  const fieldColumn = col => {
+    if (!fieldCols.has(col)) {
+      const c = /** @type {SlicerSource} */ (source).columns[col];
+      const numeric = /^(int|integer|float|real|number|double)/.test(c.dataType);
+      const values = /** @type {SlicerSource} */ (source).rows.map(r => tfIsNull(r[col]) ? null
+        : numeric ? tfDvNum(r[col]) : slicerRowText(r[col], "none", /date/.test(c.dataType)));
+      fieldCols.set(col, addColumn(c.name, values));
+    }
+    return /** @type {number} */ (fieldCols.get(col));
+  };
+
+  /**
+   * The days of source column col kept between two bounds → a "range" field (loDv / hiDv: DataValues of its bounds,
+   * missing = the data's first / last day); a reason (string) when the column has no dates. opts: includeNull,
+   * loStrict / hiStrict (> / < instead of >= / <=), calc (the calculated filter it stands for).
+   */
+  const rangeField = (col, name, loDv, hiDv, opts) => {
+    // the days of the rows (a date at midnight may arrive in local time: its nearest day; a date-time: its day)
+    const timed = /time/.test(/** @type {SlicerSource} */ (source).columns[col].dataType);
+    const day = dv => { const s = !dv || tfIsNull(dv) ? null : tvExcelSerial(dv); return s === null ? null : timed ? Math.floor(s + 1e-9) : Math.round(s); };
+    const serials = /** @type {SlicerSource} */ (source).rows.map(r => day(r[col]));
+    let min = Infinity, max = -Infinity;
+    serials.forEach(s => { if (s !== null) { if (s < min) min = s; if (s > max) max = s; } });
+    if (min === Infinity) return "has no dates in the data source";
+    const lo = day(loDv) ?? min, hi = day(hiDv) ?? max;
+    const above = opts.loStrict ? v => v > lo : v => v >= lo, below = opts.hiStrict ? v => v < hi : v => v <= hi;
+    /** @type {any} */
+    const field = { kind: "range", col, deriv: "none", isDate: true, header: uniqueHeader(name), values: serials, items: [], selected: null,
+                    tableCol: -1, lo, hi, min, max, includeNull: !!opts.includeNull, loStrict: !!opts.loStrict, hiStrict: !!opts.hiStrict,
+                    calc: opts.calc || null, control: null,
+                    pass: r => serials[r] === null ? field.includeNull : above(serials[r]) && below(serials[r]) };
+    columns.push({ header: field.header, values: serials, date: true });
+    field.tableCol = columns.length + 1;
+    fields.push(field);
+    return field;
+  };
+
+  /** a control field's condition on table row R (a dropdown's value, a range's From / To – or its bounds when a card
+   * is not on the sheet) */
+  const condOf = (f, R) => {
+    const c = `${getExcelColumnName(f.tableCol)}${R}`;
+    if (f.kind === "list") return `OR(${f.control.cell}="${SLICER_ALL}",${c}=${f.control.cell})`;
+    const from = (f.control && f.control.from) || String(f.lo), to = (f.control && f.control.to) || String(f.hi);
+    return `IF(ISNUMBER(${c}),AND(OR(${from}="",${c}${f.loStrict ? ">" : ">="}${from}),OR(${to}="",${c}${f.hiStrict ? "<" : "<="}${to})),` +
+           `${f.includeNull ? "TRUE" : "FALSE"})`;
+  };
+  /** Visible on row R: SUBTOTAL(103) – 0 on a row the slicers hide – and 0 when one of these controls leaves the row out */
+  const visibleFormula = (R, controls) => {
+    const conds = controls.filter(f => f.kind === "list" ? f.control : true).map(f => condOf(f, R));
+    return conds.length ? `IF(AND(${conds.join(",")}),SUBTOTAL(103,A${R}),0)` : `SUBTOTAL(103,A${R})`;
+  };
+
+  return {
+    get active() { return fields.length > 0 && !!source; },
+
+    /** a dropdown's list of values on the lists sheet (the same values: the same list) → its range, for Data Validation
+     * @param {any[]} values */
+    listRef(values) {
+      const key = JSON.stringify(values);
+      let l = extraLists.find(x => x.key === key);
+      if (!l) { l = { key, col: lists++, values }; extraLists.push(l); }
+      const letter = getExcelColumnName(l.col);
+      return sheetRef(SLICER_LISTS_SHEET, `$${letter}$1:$${letter}$${values.length}`);
+    },
+    get fields() { return fields; },
+    get failure() { return failed; },
+
+    /**
+     * A filter card → a field the visuals follow: a card of a field's values becomes a slicer – a dropdown cell when
+     * Tableau's card picks one value (Single Value dropdown / list / slider) – and a range of dates becomes From / To
+     * date cells. Returns the field, or a reason (string) the card stays text.
+     * @param {ExportItem & { filter: any, field: FieldRef, sheetName: string, mode: string | null }} card @param {any} ws @param {FormatModel} model
+     */
+    async adoptCard(card, ws, model) {
+      const f = card.filter, ref = card.field;
+      const type = String((f && f.filterType) || "").toLowerCase(), isRange = type === "range";
+      if (type !== "categorical" && !isRange) return "only a filter of a field's values or a range of dates can follow in Excel";
+      if (!ref || /^(measure names|:measure names)$/i.test(ref.name) || (ref.type === "qk" && !isRange)) return "not a filter of a dimension's values";
+      let deriv = String(ref.deriv || "none").toLowerCase();
+      if (isRange && deriv === "tdy") deriv = "none";                     // exact date
+      // a range of an aggregate (SUM(Sales)) filters marks, not the rows
+      if (isRange && deriv !== "none") return `a range of ${TF_DERIV_LABEL[deriv] || deriv}(${ref.name})`;
+      if (deriv !== "none" && !SLICER_DATE_PARTS.has(deriv)) return `a filter on ${TF_DERIV_LABEL[deriv] || deriv}(${ref.name})`;
+      if (failed) return failed;
+      if (!source) {
+        try { source = await readSlicerSource(ws, f.fieldName); }
+        catch (e) { failed = `the data source's rows could not be read: ${e.message}`; return failed; }
+      } else {
+        const ds = await slicerDataSourceOf(ws, f.fieldName);
+        if (!ds || ds.id !== source.id) return `another data source than "${source.name}" (slicers filter one data source)`;
+      }
+      const col = slicerColumnOf(source, model, ref);
+      if (col < 0) return `"${ref.name}" is not a column of "${source.name}"`;
+      const isDate = /date/.test(source.columns[col].dataType);
+      if (deriv !== "none" && !isDate) return `"${ref.name}" holds no dates`;
+      if (isRange && !isDate) return `a range of "${ref.name}", which holds no dates`;
+      const known = fields.find(x => x.col === col && x.deriv === deriv && (x.kind === "range") === isRange && !x.calc);
+      if (known) return known;
+      if (locked) return "visuals are already bound to the other slicers";
+      if (isRange) {
+        const field = rangeField(col, card.filterName || card.visualName || source.columns[col].name, f.minValue, f.maxValue,
+                                 { includeNull: !!f.includeNullValues });
+        if (typeof field === "string") return `"${ref.name}" ${field}`;
+        console.log(`[Slicers] "${field.header}": dates ${field.lo}–${field.hi} of ${field.min}–${field.max} (From / To cells)`);
+        return field;
+      }
+      const values = source.rows.map(r => slicerRowText(r[col], deriv, isDate) ?? "");
+      const items = [...new Set(values)].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+      let selected = null;
+      if (!f.isAllSelected) {
+        const applied = (f.appliedValues || []).map(dv => slicerMarkText(dv, deriv, isDate));
+        if (applied.some(v => v === null || !items.includes(v))) return "its selected values are not values of the data source";
+        selected = new Set(f.isExcludeMode ? items.filter(v => !applied.includes(v)) : applied);
+        if (selected.size === items.length) selected = null;
+      }
+      // a card that picks one value (and has one, or all, picked) → a dropdown cell; else a slicer
+      const current = selected ? [...selected][0] : null;
+      const single = /^(dropdown|radiolist|slider)$/i.test(card.mode || "") && (!selected || selected.size === 1) && current !== "\u0000";
+      /** @type {any} */
+      const field = single
+        ? { kind: "list", col, deriv, isDate, header: "", values, items, selected, tableCol: -1, current, control: null,
+            listCol: lists++, pass: r => current === null || values[r] === current }
+        : { kind: "slicer", col, deriv, isDate, header: "", values, items, selected, tableCol: -1,
+            pass: r => !selected || selected.has(values[r]) };
+      field.header = uniqueHeader(card.filterName || card.visualName || source.columns[col].name);
+      columns.push({ header: field.header, values: values.map(v => (v === "\u0000" ? null : v)) });
+      field.tableCol = columns.length + 1;
+      if (single) {
+        const choices = [SLICER_ALL, ...items.filter(v => v !== "\u0000")], letter = getExcelColumnName(field.listCol);
+        field.choices = choices;
+        field.listRef = sheetRef(SLICER_LISTS_SHEET, `$${letter}$1:$${letter}$${choices.length}`);
+      }
+      fields.push(field);
+      console.log(`[Slicers] "${field.header}": ${items.length} values, ${selected ? selected.size + " selected" : "all selected"}` +
+                  (single ? " (dropdown)" : ""));
+      return field;
+    },
+
+    /**
+     * A calculated filter keeping a date between two date parameters (slicerParamRange) → a "range" field whose
+     * From / To are the parameters' cells on the dashboard. spec: { calc: the calculation's FieldRef, date: the date
+     * field's name, lo / hi: the parameters' current DataValues, loStrict / hiStrict }. Returns the field or a reason.
+     * @param {any} spec @param {any} ws a worksheet filtered by it @param {FormatModel} model
+     */
+    async adoptParamRange(spec, ws, model) {
+      if (failed) return failed;
+      if (!source) {
+        try { source = await readSlicerSource(ws, spec.date); }
+        catch (e) { failed = `the data source's rows could not be read: ${e.message}`; return failed; }
+      } else {
+        const ds = await slicerDataSourceOf(ws, spec.date);
+        if (!ds || ds.id !== source.id) return `another data source than "${source.name}" (slicers filter one data source)`;
+      }
+      const col = slicerColumnOf(source, model, /** @type {any} */ ({ name: spec.date, ds: spec.calc.ds, deriv: null }));
+      if (col < 0) return `"${spec.date}" is not a column of "${source.name}"`;
+      if (!/date/.test(source.columns[col].dataType)) return `"${spec.date}" holds no dates`;
+      const known = fields.find(x => x.calc && x.calc.name === spec.calc.name && (x.calc.ds || "") === (spec.calc.ds || ""));
+      if (known) return known;
+      if (locked) return "visuals are already bound to the other slicers";
+      const field = rangeField(col, source.columns[col].name, spec.lo, spec.hi, { calc: spec.calc, loStrict: spec.loStrict, hiStrict: spec.hiStrict });
+      if (typeof field === "string") return `"${spec.date}" ${field}`;
+      console.log(`[Slicers] "${field.header}": dates ${field.lo}–${field.hi} of ${field.min}–${field.max} (date parameters)`);
+      return field;
+    },
+
+    /**
+     * Binds a visual to the slicers: its marks found in the source rows, each measure checked against Tableau's
+     * numbers. Returns the binding (vm.slicerBinding) – or a reason (string) the visual keeps fixed values.
+     * @param {ViewModel} vm @param {string} sheetName @param {any[]} filters the sheet's Tableau filters @param {FormatModel} model
+     */
+    bind(vm, sheetName, filters, model) {
+      if (!source || !fields.length) return "no slicer";
+      const src = source;
+      // Tableau filters this sheet by every slicer field (else the slicer would filter what Tableau does not)
+      const resolved = (filters || []).map(f => {
+        const { ref, deriv } = slicerFilterField(f.fieldName);
+        const col = slicerColumnOf(src, model, ref);
+        return { f, col, deriv, isDate: col >= 0 && /date/.test(src.columns[col].dataType) };
+      });
+      // which fields Tableau filters it by: a calculated date filter by the sheet's own filter list (its datasource:
+      // two calculations can share a caption)
+      const sheetFilters = ((model && model.sheets[sheetName]) || {}).filterRefs || [];
+      const applies = fd => fd.calc ? sheetFilters.some(r => r.name === fd.calc.name && (r.ds || "") === (fd.calc.ds || ""))
+        : resolved.some(x => x.col === fd.col && x.deriv === fd.deriv);
+      // a slicer filters every visual (it hides the table's rows); a dropdown or date range only those it applies to
+      const missing = fields.filter(fd => fd.kind === "slicer" && !applies(fd));
+      if (missing.length) return `Tableau does not filter it by ${missing.map(m => m.header).join(", ")}`;
+      const own = fields.filter(fd => fd.kind !== "slicer" && applies(fd));
+      const shown = r => fields.every(fd => (fd.kind !== "slicer" && !own.includes(fd)) || fd.pass(r));
+      // its dimensions → source columns: headers, and continuous dimensions such as a date axis (MONTH(Order Date));
+      // the latitude / longitude Tableau generates follow the geographic fields
+      const heads = [], colHeads = [];
+      const generated = c => /^(latitude|longitude) \(generated\)$/i.test(c.name);
+      /** a dimension field → its source column, or the reason it has none */
+      const headOf = (ref, label) => {
+        if (!ref) return `"${label}" is not a workbook field`;
+        const deriv = String(ref.deriv || "none").toLowerCase();
+        const col = slicerColumnOf(src, model, ref);
+        if (col < 0) return `"${label}" is a calculation or not a column of "${src.name}"`;
+        const isDate = /date/.test(src.columns[col].dataType);
+        if (!(deriv === "none" || deriv === "attr" || (isDate && SLICER_DATE_PARTS.has(deriv)))) return `"${label}" (${deriv}) cannot be matched to the rows`;
+        return { col, deriv: deriv === "attr" ? "none" : deriv, isDate };
+      };
+      for (let ci = 0; ci < vm.cols.length; ci++) {
+        const c = vm.cols[ci];
+        if (c.pivoted || generated(c)) continue;
+        const deriv = String((c.ref && c.ref.deriv) || "none").toLowerCase();
+        if (!c.isHeader && (!c.ref || SLICER_AGGS[deriv] || deriv === "usr")) continue;
+        const h = headOf(c.ref, c.label || c.name);
+        if (typeof h === "string") return h;
+        heads.push({ ci, ...h });
+      }
+      // a matrix: the fields on Columns are in each value column's members (vm.cols[ci].matrixKey)
+      for (const ref of (vm.matrix && vm.matrix.colFields) || []) {
+        const h = headOf(ref, ref ? ref.name : "?");
+        if (typeof h === "string") return h;
+        colHeads.push(h);
+      }
+      // marks: one key per distinct combination of dimension values (a matrix cell: its row's and its column's)
+      const ids = new Map();
+      /** the mark of row r's value in column ci, or 0 when it cannot be told */
+      const idOf = (r, ci) => {
+        const t = heads.map(h => slicerMarkText(r[h.ci], h.deriv, h.isDate));
+        if (colHeads.length) {
+          const mk = vm.cols[ci] && vm.cols[ci].matrixKey;
+          if (!mk) return 0;
+          colHeads.forEach((h, l) => t.push(slicerMarkText(mk[l], h.deriv, h.isDate)));
+        }
+        if (t.some(x => x === null)) return 0;
+        const key = t.join("\u0001");
+        if (!ids.has(key)) ids.set(key, ids.size + 1);
+        return /** @type {number} */ (ids.get(key));
+      };
+      const valueCols = vm.cols.map((c, ci) => ci).filter(ci => !heads.some(h => h.ci === ci) && !generated(vm.cols[ci]));
+      vm.rows.forEach(r => valueCols.forEach(ci => idOf(r, ci)));
+      // the sheet's other filters on the rows (a filter of a measure or a calculation applies to marks, not rows)
+      const tests = [];
+      resolved.forEach(({ f, col, deriv, isDate }) => {
+        if (col < 0 || fields.some(fd => fd.col === col && fd.deriv === deriv)) return;
+        const type = String(f.filterType || "").toLowerCase();
+        if (type === "categorical" && !f.isAllSelected) {
+          const set = new Set((f.appliedValues || []).map(dv => slicerMarkText(dv, deriv, isDate)));
+          tests.push(r => set.has(slicerRowText(r[col], deriv, isDate)) !== !!f.isExcludeMode);
+        } else if (type === "range" && deriv === "none" && isDate) {
+          const day = dv => { const s = tfIsNull(dv) ? null : tvExcelSerial(dv); return s === null ? null : Math.round(s); };
+          const lo = f.minValue ? day(f.minValue) : null, hi = f.maxValue ? day(f.maxValue) : null;
+          tests.push(r => { const v = day(r[col]); return v === null ? !!f.includeNullValues : (lo === null || v >= lo) && (hi === null || v <= hi); });
+        }
+      });
+      // every source row → its mark (null: no mark of this visual, or filtered out by the sheet)
+      const keys = src.rows.map(r => {
+        if (!tests.every(t => t(r))) return null;
+        return ids.get([...heads, ...colHeads].map(h => slicerRowText(r[h.col], h.deriv, h.isDate)).join("\u0001")) || null;
+      });
+      /** @type {Map<number, number[]>} the rows of each mark under Tableau's current selection */
+      const rowsOf = new Map();
+      keys.forEach((k, r) => { if (k && shown(r)) { if (!rowsOf.has(k)) rowsOf.set(k, []); /** @type {number[]} */ (rowsOf.get(k)).push(r); } });
+
+      // each measure: translated, then checked mark by mark against Tableau's value
+      /** @type {Map<number, { expr: SlicerExpr } | { reason: string }>} */
+      const measures = new Map();
+      valueCols.forEach(ci => {
+        const c = vm.cols[ci], label = c.label || c.name;
+        const expr = slicerMeasureExpr(src, model, c.ref);
+        if (!expr) { measures.set(ci, { reason: `${label}: not a sum, average, min, max or (distinct) count of a data-source field, nor a calculation of those` }); return; }
+        for (const r of vm.rows) {
+          const t = tfDvNum(r[ci]);
+          if (t === null) continue;
+          const v = slicerEval(expr, rowsOf.get(idOf(r, ci)) || [], src);
+          if (v === null || Math.abs(v - t) > 1e-6 * Math.max(1, Math.abs(t))) {
+            measures.set(ci, { reason: `${label}: the data source's rows give ${v === null ? "no value" : +v.toPrecision(6)} where Tableau shows ${tfDvText(r[ci])}` });
+            return;
+          }
+        }
+        measures.set(ci, { expr });
+      });
+      const ok = [...measures.values()].filter(m => "expr" in m).length;
+      if (!ok) return [...measures.values()].map(m => /** @type {any} */ (m).reason)[0] || "no measure";
+      locked = true;
+
+      let keyCol = -1;
+      // Visible – or, when a dropdown / date range does not apply to it, a Visible of its own (writeTable: c.vis)
+      const controls = fields.filter(fd => fd.kind !== "slicer");
+      let visCol = own.length === controls.length ? 1 : -1;
+      const R = { col: c => range(fieldColumn(c)), get key() { return range(keyCol); },
+                  get vis() {
+                    if (visCol < 0) { columns.push({ header: uniqueHeader(`Visible: ${sheetName}`), values: src.rows.map((_, r) => (shown(r) ? 1 : 0)), vis: own }); visCol = columns.length + 1; }
+                    return range(visCol);
+                  } };
+      /**
+       * The formula of a value made of these marks' measure ci; null when it cannot follow the slicers.
+       * "chart": a mark the slicers leave empty is #N/A (no point, no bar); "cell": an empty cell.
+       */
+      const formula = (rows, ci, mode) => {
+        const m = measures.get(ci);
+        if (!m || !("expr" in m) || !rows.length) return null;
+        const ks = [...new Set(rows.map(r => idOf(r, ci)))];
+        if (ks.some(k => !k)) return null;
+        if (keyCol < 0) keyCol = addColumn(`Key: ${sheetName}`, keys);
+        const empty = mode === "chart" ? "NA()" : '""';
+        if (ks.length > 1) {                               // several marks summed into one value: only sums and counts add up
+          if (m.expr.op !== "agg" || !/^(SUM|COUNT)$/.test(m.expr.fn || "")) return null;
+          const k = `{${ks.join(",")}}`;
+          return `IF(SUM(COUNTIFS(${R.key},${k},${R.vis},1))=0,${empty},SUM(${slicerExcel(m.expr, R, k)}))`;
+        }
+        const k = String(ks[0]);
+        const body = slicerExcel(m.expr, R, k);
+        return `IF(COUNTIFS(${R.key},${k},${R.vis},1)=0,${empty},${slicerMayFail(m.expr) ? `IFERROR(${body},${empty})` : body})`;
+      };
+      const reasons = [...measures.entries()].filter(([ci, m]) => !("expr" in m) && vm.order.includes(ci)).map(([, m]) => /** @type {any} */ (m).reason);
+      console.log(`[Slicers] ${sheetName}: follows the slicers (${ids.size} marks, ${ok} measure${ok === 1 ? "" : "s"})` +
+                  (reasons.length ? ` – fixed: ${reasons.join("; ")}` : ""));
+      const binding = {
+        sheetName, reasons,
+        /** values written as formulas, and values that stayed fixed (what the report says of the visual) */
+        written: 0, fixed: 0,
+        /** a written number cell → its formula (Tableau's number stays as the cached result) */
+        bindCell(cell, rows, ci) {
+          if (typeof cell.value !== "number") return;
+          const f = formula(rows, ci, "cell");
+          if (f) { cell.value = { formula: f, result: cell.value }; binding.written++; } else binding.fixed++;
+        },
+        /** the formula of the value of these rows' measure ci (a pie's slice, a label's measure); null: it stays fixed */
+        formulaFor: (rows, ci, mode) => formula(rows, ci, mode),
+        /** a chart value whose array knows its marks (values.src: tvSum) → its formula */
+        valueFormula(values, i) {
+          const s = values && values.src;
+          const f = s ? formula(s.rows[i], s.ci, "chart") : null;
+          if (f) binding.written++; else binding.fixed++;
+          return f;
+        }
+      };
+      return binding;
+    },
+
+    /** the hidden "Slicer Data" sheet: Row, Visible, the slicer fields, measure fields and keys; rows hidden as Tableau's
+     * selection on the slicers leaves them. Visible is SUBTOTAL(103) – 0 on a row the slicers hide – and 0 too when a
+     * dropdown cell or the From / To cells leave the row out. The dropdowns' lists go to a hidden sheet of their own.
+     * @param {import("exceljs").Workbook} workbook */
+    writeTable(workbook) {
+      const ws = workbook.addWorksheet(SLICER_DATA_SHEET, { state: "hidden" });
+      const head = ["Row", "Visible", ...columns.map(c => c.header)];
+      head.forEach((h, c) => { ws.getCell(1, c + 1).value = h; });
+      // the dropdown / From–To conditions (a dropdown no dashboard shows leaves its field out)
+      const controls = fields.filter(f => f.kind !== "slicer");
+      const dates = columns.map(c => !!c.date);
+      for (let r = 0; r < N(); r++) {
+        const row = ws.getRow(r + 2);
+        row.getCell(1).value = r + 1;
+        row.getCell(2).value = { formula: visibleFormula(r + 2, controls), result: visible(r) ? 1 : 0 };
+        columns.forEach((c, k) => {
+          if (c.values[r] === null || c.values[r] === undefined) return;
+          const cell = row.getCell(k + 3);
+          cell.value = c.vis ? { formula: visibleFormula(r + 2, c.vis), result: c.values[r] } : c.values[r];
+          if (dates[k]) cell.numFmt = "yyyy-mm-dd";
+        });
+        if (!shownBySlicers(r)) row.hidden = true;
+      }
+      ws.columns.forEach((col, c) => { col.width = c < 2 ? 8 : 16; });
+      const listed = fields.filter(f => f.kind === "list");
+      if (listed.length || extraLists.length) {
+        const ls = workbook.addWorksheet(SLICER_LISTS_SHEET, { state: "hidden" });
+        listed.forEach(f => f.choices.forEach((v, i) => { const cell = ls.getCell(i + 1, f.listCol + 1); cell.value = v; cell.numFmt = "@"; }));
+        extraLists.forEach(l => l.values.forEach((v, i) => { ls.getCell(i + 1, l.col + 1).value = v; }));
+      }
+      return { sheetName: ws.name, ref: `A1:${getExcelColumnName(head.length - 1)}${N() + 1}`, headers: head,
+               visibleFormula: visibleFormula(2, controls), columnFormulas: columns.map(c => (c.vis ? visibleFormula(2, c.vis) : null)) };
+    },
+
+    /** the package parts' plan for injectSlicers @param {any[]} placed slicers placed on the dashboard sheets */
+    packagePlan(table, placed) {
+      const slicerFields = fields.filter(f => f.kind === "slicer");
+      const caches = slicerFields.map(f => ({
+        name: "Slicer_" + (f.header.replace(/[^A-Za-z0-9_]/g, "_").replace(/^(\d)/, "_$1") || "Field"),
+        sourceName: f.header, column: table.headers.indexOf(f.header) + 1,
+        filter: f.selected ? [...f.selected].map(v => (v === "\u0000" ? "" : v)) : null
+      }));
+      caches.forEach((c, i) => { let n = 2; while (caches.slice(0, i).some(x => x.name === c.name)) c.name = `${c.name.replace(/\d+$/, "")}${n++}`; });
+      const taken = new Set();                       // a slicer's name is unique in the workbook: "Region", "Region 2" …
+      return { table, caches, slicers: placed.map(p => {
+        let name = p.caption, n = 2;
+        while (taken.has(name.toLowerCase())) name = `${p.caption} ${n++}`;
+        taken.add(name.toLowerCase());
+        return { ...p, name, cache: caches[slicerFields.indexOf(p.field)].name };
+      }) };
+    },
+
+    /** the slicer fields of a dashboard none of whose visuals could follow them: dropped again (nothing is bound yet) */
+    discard() {
+      if (locked) return;
+      fields.length = 0;
+      columns.length = 0;
+      lists = 0;
+      extraLists.length = 0;
+      fieldCols.clear();
+      headers.clear();
+      headers.add("row").add("visible");
+    },
+
+    /** how big a card's slicer is drawn: its zone, and tall enough for its buttons (columns across a wide zone)
+     * @param {{ items: string[] }} field @param {{ widthPx?: number, heightPx?: number }} layout */
+    sizeOf(field, layout) {
+      const w = layout.widthPx || 160, n = field.items.length;
+      const columnCount = Math.max(1, Math.min(n, Math.floor(w / SLICER_ITEM_MIN_W_PX)));
+      const rows = Math.min(SLICER_MAX_ITEM_ROWS, Math.ceil(n / columnCount));
+      return { columnCount, heightPx: Math.max(layout.heightPx || 0, SLICER_HEADER_PX + rows * SLICER_ITEM_PX + SLICER_PAD_PX) };
+    }
+  };
+}
+
+/**
+ * Binds a pie / donut to the slicers: its slices are the marks (their summary rows), its angle measure the value each
+ * slice must rebuild from the data source's rows. Returns the binding, or why the pie keeps Tableau's values.
+ * @param {ReturnType<typeof createSlicerModel>} slicers @param {any} pie @param {string} sheetName @param {any[]} filters @param {FormatModel} model
+ */
+function bindPie(slicers, pie, sheetName, filters, model) {
+  if (pie.valueCol < 0) return "its slices have no size measure";
+  const rows = pie.points.map(p => pie.data[p.row]);
+  const vm = /** @type {any} */ ({
+    cols: pie.columns.map(c => ({ name: c.name, label: c.name, ref: c.ref, isHeader: !c.numeric })),
+    rows, order: [pie.valueCol], matrix: null
+  });
+  const binding = slicers.bind(vm, sheetName, filters, model);
+  if (typeof binding === "string") return binding;
+  if (rows.some(r => !binding.formulaFor([r], pie.valueCol, "chart")))
+    return binding.reasons[0] || `${pie.valueCaption}: its slices cannot be rebuilt from the data source's rows`;
+  return binding;
+}
+
+const DATE_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/**
+ * A Start / End date parameter's control whose date a calculated filter compares (adoptParamRange): its title, Year /
+ * Month / Day dropdowns (the card's zone split in three columns: item.splitCuts), and the date they make – the cell
+ * the visuals follow, the From (or To) of each such range. A day past the month's end is its last day. Shown on
+ * another dashboard again, the card shows the first one's date.
+ * @param {import("exceljs").Worksheet} worksheet @param {any} item @param {any} tracker
+ * @param {ReturnType<typeof createSlicerModel>} slicers (its lists sheet holds the dropdowns' lists)
+ */
+function writeParamDateCard(worksheet, item, tracker, slicers) {
+  const first = item.paramFields[0];
+  const serial = first.end === "from" ? first.field.lo : first.field.hi;
+  const date = new Date(Math.round((serial - 25569) * 86400000));
+  const C = item.gridCol, W = Math.max(1, item.gridW), top = item.gridRow + 2;      // 1-based row of the dropdowns
+  writeIndividualFilterTable(worksheet, item.filterName, ["", date], item.gridRow, C, tracker, W);
+  const dateCell = worksheet.getCell(top + 1, C + 1);
+  dateCell.numFmt = "m/d/yyyy";
+  const abs = cell => { const m = String(cell.address).match(/^([A-Z]+)(\d+)$/); return `$${m[1]}$${m[2]}`; };
+  const owner = item.paramFields.map(pf => pf.field.control && pf.field.control[pf.end]).find(Boolean);
+  if (owner) {                                         // shown again: the first card's date
+    dateCell.value = { formula: owner, result: date };
+    worksheet.getCell(top, C + 1).value = "(set on the first dashboard)";
+    return;
+  }
+  // the three dropdowns: one per part of the split zone (or per column when the zone was not split)
+  const cuts = item.splitCuts && item.splitCuts.length === 2 ? item.splitCuts : W >= 3 ? [1, 2] : null;
+  if (cuts) {
+    const starts = [0, ...cuts], ends = [...cuts, W];
+    if (W > 1) { try { worksheet.unMergeCells(top, C + 1, top, C + W); } catch (e) { /* not merged */ } }
+    /** @type {Partial<import("exceljs").Border>} */
+    const edge = { style: "thin", color: { argb: "FFBFBFBF" } };
+    const y0 = Math.min(...item.paramFields.map(pf => pf.field.min)), y1 = Math.max(...item.paramFields.map(pf => pf.field.max));
+    const yearOf = s => new Date(Math.round((s - 25569) * 86400000)).getUTCFullYear();
+    const years = [];
+    for (let y = Math.min(yearOf(y0), date.getUTCFullYear()); y <= Math.max(yearOf(y1), date.getUTCFullYear()); y++) years.push(y);
+    const parts = [
+      { value: date.getUTCFullYear(), list: years, name: "year" },
+      { value: DATE_MONTHS[date.getUTCMonth()], list: DATE_MONTHS, name: "month" },
+      { value: date.getUTCDate(), list: Array.from({ length: 31 }, (_, i) => i + 1), name: "day" }
+    ];
+    const cells = parts.map((p, k) => {
+      const c0 = C + starts[k], c1 = C + Math.max(starts[k] + 1, ends[k]) - 1;
+      if (c1 > c0) { try { worksheet.mergeCells(top, c0 + 1, top, c1 + 1); } catch (e) { /* already merged */ } }
+      const cell = worksheet.getCell(top, c0 + 1);
+      cell.value = p.value;
+      cell.font = dateCell.font;
+      cell.alignment = { horizontal: "left", vertical: "middle" };
+      cell.border = { top: edge, left: edge, right: edge };
+      cell.dataValidation = { type: "list", allowBlank: true, formulae: [slicers.listRef(p.list)], showErrorMessage: true,
+                              errorTitle: item.filterName, error: `Pick a ${p.name} from the list.` };
+      return abs(cell);
+    });
+    const [y, m, d] = cells, mi = `MATCH(${m},{${DATE_MONTHS.map(x => `"${x}"`).join(",")}},0)`;
+    dateCell.value = { formula: `IF(OR(${y}="",${m}="",${d}=""),"",DATE(${y},${mi},MIN(${d},DAY(EOMONTH(DATE(${y},${mi},1),0)))))`, result: date };
+  } else {                                             // too narrow for three: the date typed in
+    dateCell.dataValidation = { type: "date", operator: "greaterThan", allowBlank: true, formulae: [new Date(Date.UTC(1900, 0, 1))],
+                                showErrorMessage: true, errorTitle: item.filterName, error: "A date, e.g. 1/1/2024." };
+  }
+  const ref = sheetRef(worksheet.name, abs(dateCell));
+  item.paramFields.forEach(pf => { pf.field.control = pf.field.control || {}; pf.field.control[pf.end] = ref; });
+}
+
+/**
+ * A filter card the visuals follow through cells, drawn as Tableau's card: its title, then a dropdown cell (a list of
+ * (All) and the field's values) or From / To date cells (dates within the data's). The first card of a field owns
+ * the cells the Visible formulas read; another card of it (another dashboard) shows them.
+ * @param {import("exceljs").Worksheet} worksheet @param {any} item @param {any} tracker
+ */
+function writeControlCard(worksheet, item, tracker) {
+  const field = item.control.field, list = field.kind === "list";
+  const dateOf = serial => new Date(Math.round((serial - 25569) * 86400000));
+  const values = list ? [field.current === null ? SLICER_ALL : field.current] : [dateOf(field.lo), dateOf(field.hi)];
+  writeIndividualFilterTable(worksheet, item.filterName || field.header, values, item.gridRow, item.gridCol, tracker, item.gridW);
+  const cells = values.map((v, i) => worksheet.getCell(item.gridRow + 2 + i, item.gridCol + 1));
+  const ref = cell => { const m = String(cell.address).match(/^([A-Z]+)(\d+)$/); return sheetRef(worksheet.name, `$${m[1]}$${m[2]}`); };
+  if (!list) cells.forEach((c, i) => { c.numFmt = i ? '"To   "d mmm yyyy' : '"From "d mmm yyyy'; });
+  const owner = field.control;
+  if (owner) {                                         // shown again: the cells of the card that owns the field
+    const refs = list ? [owner.cell] : [owner.from, owner.to];
+    cells.forEach((c, i) => { c.value = { formula: refs[i], result: values[i] }; });
+    return;
+  }
+  if (list) {
+    const c = cells[0];
+    c.numFmt = "@";                                    // a value picked stays text ("2024", not the number)
+    c.dataValidation = { type: "list", allowBlank: false, formulae: [field.listRef], showErrorMessage: true,
+                         errorTitle: field.header, error: "Pick a value from the list." };
+    field.control = { cell: ref(c) };
+  } else {
+    const fmt = s => dateOf(s).toISOString().slice(0, 10);
+    cells.forEach(c => {
+      c.dataValidation = { type: "date", operator: "between", allowBlank: true, formulae: [dateOf(field.min), dateOf(field.max)],
+                           showErrorMessage: true, errorTitle: field.header, error: `A date from ${fmt(field.min)} to ${fmt(field.max)}.` };
+    });
+    field.control = { from: ref(cells[0]), to: ref(cells[1]) };
+  }
+}
+
+/**
+ * Adds the slicer table, the slicer caches and the slicers (drawn where the filter cards were) to a written XLSX –
+ * the parts Excel itself writes for a table slicer.
+ * @param {ArrayBuffer | Uint8Array} buffer
+ * @param {{ table: { sheetName: string, ref: string, headers: string[] }, caches: { name: string, sourceName: string, column: number, filter: string[] | null }[],
+ *           slicers: { sheetName: string, name: string, caption: string, cache: string, columnCount: number,
+ *                      from: { col: number, colOff: number, row: number, rowOff: number }, to: { col: number, colOff: number, row: number, rowOff: number } }[] }} plan
+ */
+async function injectSlicers(buffer, plan) {
+  const zip = await JSZip.loadAsync(buffer);
+  const read = p => zip.file(p) ? zip.file(p).async("string") : Promise.resolve(null);
+  const NS_X14 = "http://schemas.microsoft.com/office/spreadsheetml/2009/9/main";
+  const NS_X15 = "http://schemas.microsoft.com/office/spreadsheetml/2010/11/main";
+  const NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+  const REL_TABLE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/table";
+  const REL_SLICER = "http://schemas.microsoft.com/office/2007/relationships/slicer";
+  const REL_SLICER_CACHE = "http://schemas.microsoft.com/office/2007/relationships/slicerCache";
+  let wbXml = await read("xl/workbook.xml");
+  let wbRels = await read("xl/_rels/workbook.xml.rels");
+  let ct = await read("[Content_Types].xml");
+  const unescapeXml = v => String(v || "").replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+  const sheetPathOf = name => {
+    const tag = (wbXml.match(/<sheet\b[^>]*>/g) || []).find(t => unescapeXml(attr(t, "name")) === name);
+    if (!tag) throw new Error(`sheet "${name}" not found in the workbook package`);
+    return resolve("xl/", relTarget(wbRels, attr(tag, "r:id")));
+  };
+  /** an <ext> into the part's <extLst> (created before the closing tag when missing) */
+  const addExt = (xml, closing, ext) => xml.includes("</extLst>") ? xml.replace(/<\/extLst>(?![\s\S]*<\/extLst>)/, ext + "</extLst>")
+    : xml.replace(closing, `<extLst>${ext}</extLst>${closing}`);
+
+  // ── the table over the slicer data, filtered as Tableau's selection is ──
+  const { table } = plan;
+  const dataPath = sheetPathOf(table.sheetName);
+  let dataXml = await read(dataPath);
+  let dataRels = (await read(relsPathOf(dataPath))) || EMPTY_RELS;
+  const tableN = nextFreeIndex(zip, "xl/tables/table", ".xml");
+  const ids = [];
+  for (const p of Object.keys(zip.files).filter(n => /^xl\/tables\/table\d+\.xml$/.test(n))) ids.push(+attr(((await read(p)) || "").match(/<table\b[^>]*>/)[0], "id") || 0);
+  const tableId = Math.max(0, ...ids) + 1;
+  const filterCols = plan.caches.filter(c => c.filter).map(c => `<filterColumn colId="${c.column - 1}"><filters${c.filter.includes("") ? ' blank="1"' : ""}>` +
+    c.filter.filter(v => v !== "").map(v => `<filter val="${esc(v)}"/>`).join("") + `</filters></filterColumn>`).join("");
+  zip.file(`xl/tables/table${tableN}.xml`, `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n` +
+    `<table xmlns="${NS_MAIN}" id="${tableId}" name="${SLICER_TABLE}" displayName="${SLICER_TABLE}" ref="${table.ref}" totalsRowShown="0">` +
+    `<autoFilter ref="${table.ref}">${filterCols}</autoFilter><tableColumns count="${table.headers.length}">` +
+    table.headers.map((h, i) => {
+      const f = i === 1 ? table.visibleFormula || "SUBTOTAL(103,A2)" : i > 1 && table.columnFormulas ? table.columnFormulas[i - 2] : null;
+      return `<tableColumn id="${i + 1}" name="${esc(h)}"${f ? `><calculatedColumnFormula>${esc(f)}</calculatedColumnFormula></tableColumn>` : "/>"}`;
+    }).join("") +
+    `</tableColumns><tableStyleInfo name="TableStyleLight1" showFirstColumn="0" showLastColumn="0" showRowStripes="1" showColumnStripes="0"/></table>`);
+  ct = addOverride(ct, `xl/tables/table${tableN}.xml`, "application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml");
+  const tableRid = nextRelId(dataRels);
+  dataRels = addRel(dataRels, tableRid, REL_TABLE, `../tables/table${tableN}.xml`);
+  if (!/<worksheet\b[^>]*\sxmlns:r=/.test(dataXml)) dataXml = dataXml.replace(/<worksheet\b/, `<worksheet xmlns:r="${NS.r}"`);
+  const tablePart = `<tableParts count="1"><tablePart r:id="${tableRid}"/></tableParts>`;
+  dataXml = dataXml.includes("<extLst") ? dataXml.replace("<extLst", tablePart + "<extLst") : dataXml.replace("</worksheet>", tablePart + "</worksheet>");
+  zip.file(dataPath, dataXml);
+  zip.file(relsPathOf(dataPath), dataRels);
+
+  // ── a slicer cache per field (workbook part, named in definedNames and the workbook's slicer list) ──
+  const cacheRids = [];
+  plan.caches.forEach(c => {
+    const n = nextFreeIndex(zip, "xl/slicerCaches/slicerCache", ".xml");
+    zip.file(`xl/slicerCaches/slicerCache${n}.xml`, `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n` +
+      `<slicerCacheDefinition xmlns="${NS_X14}" xmlns:mc="${NS.mc}" mc:Ignorable="x" xmlns:x="${NS_MAIN}" name="${esc(c.name)}" sourceName="${esc(c.sourceName)}">` +
+      `<extLst><x:ext uri="{2F2917AC-EB37-4324-AD4E-5DD8C200BD13}" xmlns:x15="${NS_X15}"><x15:tableSlicerCache tableId="${tableId}" column="${c.column}"/></x:ext></extLst>` +
+      `</slicerCacheDefinition>`);
+    ct = addOverride(ct, `xl/slicerCaches/slicerCache${n}.xml`, "application/vnd.ms-excel.slicerCache+xml");
+    const rid = nextRelId(wbRels);
+    wbRels = addRel(wbRels, rid, REL_SLICER_CACHE, `slicerCaches/slicerCache${n}.xml`);
+    cacheRids.push(rid);
+  });
+  if (!plan.caches.length) {                     // only dropdown / date cells: the table alone
+    zip.file("[Content_Types].xml", ct);
+    return zip.generateAsync({ type: "uint8array", compression: "DEFLATE" });
+  }
+  const names = plan.caches.map(c => `<definedName name="${esc(c.name)}">#N/A</definedName>`).join("");
+  wbXml = wbXml.includes("</definedNames>") ? wbXml.replace("</definedNames>", names + "</definedNames>")
+    : wbXml.includes("<definedNames/>") ? wbXml.replace("<definedNames/>", `<definedNames>${names}</definedNames>`)
+    : wbXml.replace("</sheets>", `</sheets><definedNames>${names}</definedNames>`);
+  wbXml = addExt(wbXml, "</workbook>", `<ext uri="{46BE6895-7355-4a93-B00E-2C351335B9C9}" xmlns:x15="${NS_X15}">` +
+    `<x15:slicerCaches xmlns:x14="${NS_X14}">${cacheRids.map(r => `<x14:slicerCache r:id="${r}"/>`).join("")}</x15:slicerCaches></ext>`);
+  zip.file("xl/workbook.xml", wbXml);
+  zip.file("xl/_rels/workbook.xml.rels", wbRels);
+
+  // ── the slicers of each dashboard sheet: a slicers part, and each slicer drawn where its filter card was ──
+  for (const sheetName of [...new Set(plan.slicers.map(s => s.sheetName))]) {
+    const own = plan.slicers.filter(s => s.sheetName === sheetName);
+    const sheetPath = sheetPathOf(sheetName);
+    let sheetXml = await read(sheetPath);
+    let sheetRels = (await read(relsPathOf(sheetPath))) || EMPTY_RELS;
+    if (!/<worksheet\b[^>]*\sxmlns:r=/.test(sheetXml)) sheetXml = sheetXml.replace(/<worksheet\b/, `<worksheet xmlns:r="${NS.r}"`);
+    const n = nextFreeIndex(zip, "xl/slicers/slicer", ".xml");
+    zip.file(`xl/slicers/slicer${n}.xml`, `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n` +
+      `<slicers xmlns="${NS_X14}" xmlns:mc="${NS.mc}" mc:Ignorable="x" xmlns:x="${NS_MAIN}">` +
+      own.map(s => `<slicer name="${esc(s.name)}" cache="${esc(s.cache)}" caption="${esc(s.caption)}" columnCount="${s.columnCount}" rowHeight="${SLICER_ITEM_PX * EMU_PER_PX}"/>`).join("") +
+      `</slicers>`);
+    ct = addOverride(ct, `xl/slicers/slicer${n}.xml`, "application/vnd.ms-excel.slicer+xml");
+    const slicerRid = nextRelId(sheetRels);
+    sheetRels = addRel(sheetRels, slicerRid, REL_SLICER, `../slicers/slicer${n}.xml`);
+    sheetXml = addExt(sheetXml, "</worksheet>", `<ext uri="{3A4CF648-6AED-40f4-86FF-DC5316D8AED3}" xmlns:x15="${NS_X15}">` +
+      `<x14:slicerList xmlns:x14="${NS_X14}"><x14:slicer r:id="${slicerRid}"/></x14:slicerList></ext>`);
+
+    // the sheet's drawing (charts and pictures are in it already), else a new one
+    let drawingPath, drawingXml;
+    const existingRid = (sheetXml.match(/<drawing\b[^>]*r:id="([^"]+)"/) || [])[1];
+    if (existingRid) {
+      drawingPath = resolve(dirOf(sheetPath), relTarget(sheetRels, existingRid));
+      drawingXml = await read(drawingPath);
+    } else {
+      const d = nextFreeIndex(zip, "xl/drawings/drawing", ".xml");
+      drawingPath = `xl/drawings/drawing${d}.xml`;
+      drawingXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<xdr:wsDr xmlns:xdr="${NS.xdr}" xmlns:a="${NS.a}"></xdr:wsDr>`;
+      const rid = nextRelId(sheetRels);
+      sheetRels = addRel(sheetRels, rid, REL_DRAWING, `../drawings/drawing${d}.xml`);
+      sheetXml = insertDrawingTag(sheetXml, rid);
+      ct = addOverride(ct, drawingPath, CT_DRAWING);
+    }
+    if (!/<xdr:wsDr\b[^>]*\sxmlns:a=/.test(drawingXml)) drawingXml = drawingXml.replace(/<xdr:wsDr\b/, `<xdr:wsDr xmlns:a="${NS.a}"`);
+    const used = [...drawingXml.matchAll(/<xdr:cNvPr\b[^>]*\sid="(\d+)"/g)].map(m => +m[1]);
+    let shapeId = (used.length ? Math.max(...used) : 1) + 1;
+    const marker = (tag, p) => `<xdr:${tag}><xdr:col>${p.col}</xdr:col><xdr:colOff>${p.colOff}</xdr:colOff><xdr:row>${p.row}</xdr:row><xdr:rowOff>${p.rowOff}</xdr:rowOff></xdr:${tag}>`;
+    const anchors = own.map(s => `<xdr:twoCellAnchor editAs="oneCell">${marker("from", s.from)}${marker("to", s.to)}` +
+      `<mc:AlternateContent xmlns:mc="${NS.mc}"><mc:Choice xmlns:sle15="http://schemas.microsoft.com/office/drawing/2012/slicer" Requires="sle15">` +
+      `<xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="${shapeId++}" name="${esc(s.name)}"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>` +
+      `<xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm><a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/drawing/2010/slicer">` +
+      `<sle:slicer xmlns:sle="http://schemas.microsoft.com/office/drawing/2010/slicer" name="${esc(s.name)}"/></a:graphicData></a:graphic></xdr:graphicFrame></mc:Choice>` +
+      `<mc:Fallback><xdr:sp macro="" textlink=""><xdr:nvSpPr><xdr:cNvPr id="0" name=""/><xdr:cNvSpPr><a:spLocks noTextEdit="1"/></xdr:cNvSpPr></xdr:nvSpPr>` +
+      `<xdr:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:solidFill><a:prstClr val="white"/></a:solidFill></xdr:spPr>` +
+      `<xdr:txBody><a:bodyPr vertOverflow="clip" horzOverflow="clip"/><a:lstStyle/><a:p><a:r><a:rPr lang="en-US" sz="1100"/>` +
+      `<a:t>Slicer "${esc(s.caption)}": table slicers need Excel 2013 or later.</a:t></a:r></a:p></xdr:txBody></xdr:sp></mc:Fallback>` +
+      `</mc:AlternateContent><xdr:clientData/></xdr:twoCellAnchor>`).join("");
+    drawingXml = drawingXml.replace("</xdr:wsDr>", anchors + "</xdr:wsDr>");     // over the charts: a slicer is clicked
+    zip.file(drawingPath, drawingXml);
+    zip.file(sheetPath, sheetXml);
+    zip.file(relsPathOf(sheetPath), sheetRels);
+  }
+  zip.file("[Content_Types].xml", ct);
+  return zip.generateAsync({ type: "uint8array", compression: "DEFLATE" });
+}
+
+
 /* ═══ export/export.js ════════════════════════════════════════════════════════════════════════════ */
 /* The export: Tableau dashboard → formatted XLSX with native charts. */
 const makeExportFileName = exportFileName;
@@ -11721,12 +13108,13 @@ async function exportToExcel() {
     // ── one sheet per dashboard ──
     const workbook = new ExcelJS.Workbook();
     // the helper sheets' names are taken: a dashboard called "Chart Data" becomes "Chart Data (2)"
-    const usedSheetNames = new Set([CHART_DATA_SHEET, DATA_SHEET, REPORT_SHEET].map(s => s.toLowerCase()));
+    const usedSheetNames = new Set([CHART_DATA_SHEET, DATA_SHEET, REPORT_SHEET, SLICER_DATA_SHEET, SLICER_LISTS_SHEET].map(s => s.toLowerCase()));
     const chartData = { sheet: null, row: 0 };                  // one hidden "Chart Data" sheet for every dashboard
+    const slicers = FORMAT_CONFIG.slicers && fmtModel ? createSlicerModel() : null;   // one slicer table for every dashboard
     const written = [];
     for (const target of targets) {
       const sheetName = uniqueExcelSheetName(target.dashboard.name, usedSheetNames);
-      const result = await writeDashboardSheet(workbook, sheetName, target, { titleMap, fmtModel, chartData });
+      const result = await writeDashboardSheet(workbook, sheetName, target, { titleMap, fmtModel, chartData, slicers });
       if (result) written.push(result);
       else {
         usedSheetNames.delete(sheetName.toLowerCase());
@@ -11736,6 +13124,9 @@ async function exportToExcel() {
     }
     if (!written.length) throw new Error("No data found in any visible worksheet.");
     const tSheetsDone = performance.now();
+    // the slicers' data source rows: a hidden table every bound formula reads; Excel recalculates them on opening
+    const slicerTable = slicers && slicers.active ? slicers.writeTable(workbook) : null;
+    if (slicerTable) workbook.calcProperties = { ...(workbook.calcProperties || {}), fullCalcOnLoad: true };
 
     if (FORMAT_CONFIG.conversionReport) writeConversionReports(workbook, written.map(w => w.report));
 
@@ -11759,6 +13150,17 @@ async function exportToExcel() {
           const status = w.visualStatuses.find(entry => entry.worksheet === job.item.name);
           if (status) { status.status = "warning"; status.reason = `chart injection failed: ${err.message}`; }
         });
+      }
+    }
+    // the slicers where the filter cards were (after the charts: they share the sheet's drawing, slicers on top)
+    if (slicerTable) {
+      try {
+        const placed = written.flatMap(w => w.finalizeSlicers());
+        buffer = await injectSlicers(buffer, slicers.packagePlan(slicerTable, placed));
+        console.log(`[Slicers] ${placed.length} slicer(s) over ${slicerTable.ref} of "${SLICER_DATA_SHEET}"`);
+      } catch (err) {
+        console.error("[Slicers] could not add the slicers", err);
+        notes.push(`slicers could not be added (${err.message}) – the filtered values stay as Tableau shows them`);
       }
     }
 
@@ -12110,7 +13512,7 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
         used.add(control);
         filterValueItems.push({
           type: "filterValue", isParameter: true, name: param.name, visualName: param.name,
-          filterName: param.name, values: [value], layout: layoutMap.get(control.name), rowCount: 2
+          filterName: param.name, values: [value], layout: layoutMap.get(control.name), rowCount: 2, param
         });
       });
       if (params.length) console.log(`[Parameters] ${used.size} of ${params.length} parameters have a control on the dashboard`);
@@ -12137,6 +13539,93 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
         });
       } catch (err) {
         console.warn("[Filters] filter cards left out:", err.message);
+      }
+    }
+
+    // ── filter cards of a field's values → Excel slicers; the visuals whose numbers the data source's rows rebuild
+    //    follow them (vm.slicerBinding: their chart values, table cells and KPI values become formulas)
+    const slicers = ctx.slicers;
+    if (slicers) {
+      for (const card of filterValueItems.filter(it => it.isFilterCard)) {
+        const ws = sheets.find(s => s.name === card.sheetName);
+        const field = ws ? await slicers.adoptCard(card, ws, fmtModel) : "its worksheet is not on the dashboard";
+        if (typeof field === "string") { console.log(`[Slicers] "${card.visualName}" stays a card: ${field}`); continue; }
+        if (field.kind !== "slicer") {                                   // a dropdown cell, or From / To date cells
+          card.control = { field };
+          card.rowCount = field.kind === "range" ? 3 : 2;
+          continue;
+        }
+        const size = slicers.sizeOf(field, card.layout);
+        card.slicer = { field, ...size };
+        card.rowCount = Math.max(card.rowCount, Math.ceil(size.heightPx / EXCEL_ROW_PX));
+      }
+      // Start / End date parameters a calculated filter keeps a date between (Date Flag: [Order Date] >= [Start Date]
+      // AND [Order Date] <= [End Date]): their cells become the range's From / To
+      const dateParams = filterValueItems.filter(it => it.isParameter && it.param && it.layout && /date/i.test(String(it.param.dataType || "")));
+      if (dateParams.length) {
+        // the parameter's control: by its id ([Parameters].[Parameter 1]), else by its caption
+        const paramCard = name => {
+          const id = tfNorm(`[Parameters].[${name}]`);
+          const info = fmtModel.fields["Parameters|" + String(name).toLowerCase()];
+          const names = [name, info && info.caption].filter(Boolean).map(tfNorm);
+          return dateParams.find(it => it.param.id && tfNorm(it.param.id) === id) ||
+                 dateParams.find(it => names.includes(tfNorm(it.param.name)));
+        };
+        const seen = new Set();
+        for (const item of dataWorksheetItems) {
+          for (const ref of ((fmtModel.sheets[item.name] || {}).filterRefs || [])) {
+            const key = `${ref.ds || ""}|${ref.name}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            const info = tfFieldInfo(fmtModel, ref);
+            const spec = info && slicerParamRange(info.formulaFull || info.formula);
+            const lo = spec && paramCard(spec.lo), hi = spec && paramCard(spec.hi);
+            if (!spec || !lo || !hi) continue;
+            const ws = sheets.find(s => s.name === item.name);
+            const field = await slicers.adoptParamRange({ calc: ref, date: spec.date, lo: lo.param.currentValue, hi: hi.param.currentValue,
+                                                          loStrict: spec.loStrict, hiStrict: spec.hiStrict }, ws, fmtModel);
+            if (typeof field === "string") { console.log(`[Slicers] ${info.caption || ref.name} (dates between ${lo.param.name} and ${hi.param.name}) stays fixed: ${field}`); continue; }
+            (lo.paramFields = lo.paramFields || []).push({ field, end: "from" });
+            (hi.paramFields = hi.paramFields || []).push({ field, end: "to" });
+            lo.rowCount = hi.rowCount = 3;                       // title, Year / Month / Day dropdowns, the date
+          }
+        }
+      }
+      if (filterValueItems.some(it => it.slicer || it.control || it.paramFields)) {
+        for (const item of dataWorksheetItems) {
+          const vmod = item.visualModel;
+          const pie = vmod && vmod.pie;
+          if (!item.vm || !vmod || vmod.gauge || vmod.renderer === "tableau-image" || (pie && (pie.gauge || pie.inner))) {
+            item.slicerNote = pie && pie.inner ? "fixed values: a nested donut keeps Tableau's numbers"
+              : "fixed values: gauges and pictures keep Tableau's numbers";
+            continue;
+          }
+          const sheet = sheets.find(s => s.name === item.name);
+          let filters = [];
+          try { filters = sheet && typeof sheet.getFiltersAsync === "function" ? (await sheet.getFiltersAsync()) || [] : []; }
+          catch (e) { /* bound without its filters: the check against Tableau's numbers decides */ }
+          if (pie) {
+            const binding = bindPie(slicers, pie, item.name, filters, fmtModel);
+            if (typeof binding === "string") item.slicerNote = `fixed values: ${binding}`;
+            else {
+              item.vm.slicerBinding = pie.slicerBinding = binding;
+              item.slicerNote = "follows the slicers (Excel draws its labels; Tableau's tooltips are left out" +
+                (pie.centerText ? "; the text over its centre keeps Tableau's numbers)" : ")");
+            }
+            continue;
+          }
+          const binding = slicers.bind(item.vm, item.name, filters, fmtModel);
+          if (typeof binding === "string") item.slicerNote = `fixed values: ${binding}`;
+          else {
+            item.vm.slicerBinding = binding;
+            item.slicerNote = binding.reasons.length ? `follows the slicers, except ${binding.reasons.join("; ")}` : "follows the slicers";
+          }
+        }
+        if (!dataWorksheetItems.some(it => it.vm && it.vm.slicerBinding)) {
+          console.log(`[Slicers] ${dashboard.name}: no visual can follow the slicers – the filter cards stay cards`);
+          filterValueItems.forEach(it => { if (it.slicer || it.control || it.paramFields) { delete it.slicer; delete it.control; delete it.paramFields; it.rowCount = 2; } });
+          slicers.discard();
+        }
       }
     }
 
@@ -12226,6 +13715,7 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
         item.splitPx = tableColumnPx(item.vm);                 // the widths Tableau draws the table at
       } else if (item.isKPI && !item.kpiCard) item.split = [1, 1];
       else if (item.kpiCard && item.kpiCard.tiles.length > 1) item.split = item.kpiCard.tiles.map(() => 1);
+      else if (item.paramFields) item.split = [4, 4, 3];                  // a date's Year / Month / Day dropdowns
     });
     const grid = buildColumnGrid(allItems);
     const placedItems = allItems.map((item, idx) => {
@@ -12361,6 +13851,9 @@ setTableVisibleRows(placedItems);
 
     /** @type {{ item: ExportItem, top: number, panes: Map<string, any> }[]} pies, laid out with the final column widths */
     const pieJobs = [];
+    /** @type {ExportItem[]} filter cards drawn as slicers, placed with the final column widths */
+    const slicerJobs = [];
+    let controlCards = 0;                                          // dropdown / From–To cards written
     // one hidden data sheet for the charts of every dashboard in the file (ctx.chartData: { sheet, row })
     const chartDataSheetOf = () => {
       if (!chartData.sheet) chartData.sheet = workbook.addWorksheet(CHART_DATA_SHEET, { state: "hidden" });
@@ -12392,7 +13885,8 @@ setTableVisibleRows(placedItems);
         reserveGraphicBlock(item);
         const pie = item.visualModel.pie;
         item.visualModel.status = "success";
-        item.visualModel.statusReason = `native Excel ${pie.hole || pie.inner ? "donut" : "pie"} chart with Tableau labels and tooltips`;
+        item.visualModel.statusReason = `native Excel ${pie.hole || pie.inner ? "donut" : "pie"} chart ` +
+          (pie.slicerBinding ? "following the slicers, its labels drawn by Excel from formula cells" : "with Tableau labels and tooltips");
         if (status) { status.status = "success"; status.reason = item.visualModel.statusReason; }
         continue;
       }
@@ -12408,6 +13902,12 @@ setTableVisibleRows(placedItems);
         const specs = item.visualModel.chartSpecs;
         const paneH = Math.floor(item.box.heightPx / specs.length);     // separate panes stack vertically
         specs.forEach((spec, k) => {
+          if (item.vm.slicerBinding) {
+            spec.valueFormula = item.vm.slicerBinding.valueFormula;
+            // an axis range taken from Tableau's values would clip the values another selection gives: Excel scales it
+            if (spec.dataRange && spec.dataRange.min) delete spec.valueMin;
+            if (spec.dataRange && spec.dataRange.max) delete spec.valueMax;
+          }
           const refs = ExcelChartWriter.writeChartData(chartDataSheetOf(), spec, chartData.row);
           chartData.row = refs.nextRow;
           const offPx = k * paneH;
@@ -12421,7 +13921,7 @@ setTableVisibleRows(placedItems);
         reserveGraphicBlock(item);
         item.visualModel.status = "success";
         item.visualModel.statusReason = `native Excel ${[...new Set(specs.map(s => s.kind))].join("/")} chart` +
-          (specs.length > 1 ? ` (${specs.length} panes)` : "");
+          (specs.length > 1 ? ` (${specs.length} panes${specs[0].grid ? ` in a ${specs[0].grid.rows} × ${specs[0].grid.cols} grid` : ""})` : "");
         if (status) { status.status = "success"; status.reason = item.visualModel.statusReason; }
         continue;
       }
@@ -12466,6 +13966,22 @@ setTableVisibleRows(placedItems);
           }
           console.warn(`[Visual] ${item.name}: image renderer failed; using data fallback`, err);
         }
+      }
+
+      if (item.type === "filterValue" && item.slicer) {           // drawn by injectSlicers, over its block
+        reserveGraphicBlock(item);
+        slicerJobs.push(item);
+        continue;
+      }
+      if (item.type === "filterValue" && item.control) {          // a dropdown cell / From–To cells the visuals follow
+        writeControlCard(worksheet, item, tracker);
+        controlCards++;
+        continue;
+      }
+      if (item.type === "filterValue" && item.paramFields) {      // a Start / End date parameter the visuals follow
+        writeParamDateCard(worksheet, item, tracker, ctx.slicers);
+        controlCards++;
+        continue;
       }
 
       if (item.type === "filterValue") {
@@ -12719,14 +14235,37 @@ setTableVisibleRows(placedItems);
                                  output: "Picture" })),
       ...pieLegendItems.map(it => ({ name: it.visualName, kind: "Colour legend", output: "Cells: a colour key per item" })),
       ...filterValueItems.map(it => ({ name: it.filterName, kind: it.isParameter ? "Parameter control" : "Filter card",
-                                       output: it.isParameter ? "Cells: its value" : "Cells: the selected values" })),
+                                       output: it.isParameter ? (it.paramFields ? "Date cell: the visuals follow it" : "Cells: its value")
+                                         : it.slicer ? "Excel slicer (its selection as in Tableau)"
+                                         : it.control ? (it.control.field.kind === "list" ? "Dropdown cell (its value as in Tableau)" : "From / To date cells (the range as in Tableau)")
+                                         : "Cells: the selected values" })),
       ...[...pieCentreSheets].map(name => ({ name, kind: "Worksheet in a donut's hole", output: "The donut's centre text" }))
     ];
     const report = {
       dashboard: dashboardName, workbookFile: formatModelFileName(), visuals: reportVisuals, objects, skipped,
       filters: Object.entries(filterValuesMap).map(([name, values]) => ({ name, values: values.map(String) })),
-      parameters: reportParams
+      parameters: reportParams,
+      // which visuals follow the slicers, and why the others keep Tableau's values
+      slicers: slicerJobs.length || controlCards ? dataWorksheetItems.filter(it => it.slicerNote).map(it => {
+        const b = it.vm && it.vm.slicerBinding;
+        if (!b) return { worksheet: it.name, follows: false, note: it.slicerNote };
+        if (!b.written) return { worksheet: it.name, follows: false, note: `fixed values: this ${it.visualModel.type.toLowerCase()} is not drawn from values a formula can give` };
+        const part = b.fixed ? `partly (${b.written} of ${b.written + b.fixed} values; the rest keep Tableau's numbers)` : "";
+        return { worksheet: it.name, follows: true, note: part ? it.slicerNote.replace("follows the slicers", `follows the slicers ${part}`) : it.slicerNote };
+      }) : []
     };
+    report.slicers.forEach(s => console.log(`[Slicers] ${s.worksheet}: ${s.note}`));
+
+    // the slicers at their blocks, now that the final column widths / row heights are known
+    const finalizeSlicers = () => slicerJobs.map(item => {
+      let w = 0, h = 0;
+      for (let c = item.gridCol; c < item.gridCol + item.gridW; c++) w += colPx(c);
+      for (let r = item.gridRow; r < item.gridRow + item.allocatedRows; r++) h += rowPx(r);
+      const at = (x, y) => { const a = nativeAnchor(item.gridCol, item.gridRow, x, y, colPx, rowPx);
+                             return { col: a.nativeCol, colOff: a.nativeColOff, row: a.nativeRow, rowOff: a.nativeRowOff }; };
+      return { sheetName: worksheet.name, field: item.slicer.field, caption: item.filterName || item.slicer.field.header,
+               columnCount: item.slicer.columnCount, from: at(0, 0), to: at(Math.max(60, w), Math.max(SLICER_HEADER_PX + SLICER_ITEM_PX, h)) };
+    });
 
     // native charts, once ExcelJS has written the file: pies and donuts get Tableau's pane cells inside the block
     // (slices link back to the block's first cell); every chart is fitted to its block's final px size
@@ -12755,6 +14294,14 @@ setTableVisibleRows(placedItems);
           let w = 0, h = 0;
           for (let c = job.item.gridCol; c < job.item.gridCol + job.item.gridW; c++) w += colPx(c);
           for (let r = job.top; r < job.item.gridRow + job.item.allocatedRows; r++) h += rowPx(r);
+          if (job.spec.grid) {
+            // small multiples: each pane at its place in Tableau's grid
+            const f = gridFrame(job.spec.grid, job.spec, w, h);
+            const at = nativeAnchor(job.item.gridCol, job.top, f.x, f.y, colPx, rowPx);
+            Object.assign(job, { col: at.nativeCol, colOffPx: at.nativeColOff / 9525, row: at.nativeRow, rowOffPx: at.nativeRowOff / 9525,
+                                 widthPx: Math.max(12, f.w), heightPx: Math.max(12, f.h) });
+            return;
+          }
           job.widthPx = Math.max(40, w);
           if (job.item.pairedCard) { job.colOffPx = 2; job.widthPx = Math.max(40, w - 4); }     // the card's white edges
           // stacked panes split the block's real height (rows may be taller, shorter or collapsed), each from its own spot
@@ -12774,7 +14321,7 @@ setTableVisibleRows(placedItems);
       return [];
     };
 
-    return { worksheet, dashboardName, visualStatuses, workbookWarning, report, finalizeCharts };
+    return { worksheet, dashboardName, visualStatuses, workbookWarning, report, finalizeCharts, finalizeSlicers };
 }
 
 
