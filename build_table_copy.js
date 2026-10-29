@@ -778,7 +778,15 @@ function tfBuildColorScale(fmt, enc, values) {
   }
   // categorical
   const map = {};
-  if (def) for (const [k, c] of Object.entries(def.map)) fmt.bucketAliases(k).forEach(a => { map[tfNorm(a)] = c; });
+  if (def) {
+    // one palette can hold a measure under several aggregations (SUM and AVG of the same calculation, each its own
+    // colour): the entries of the measures this sheet shows (its Measure Names list) are applied last, so they win
+    const bare = k => tfNorm(String(k).replace(/^"|"$/g, "").replace(/\\(.)/g, "$1"));
+    const shown = new Set(((fmt.sheetModel || {}).measureFilter || []).map(bare));
+    const entries = Object.entries(def.map);
+    const mine = ([k]) => shown.has(bare(k));
+    [...entries.filter(e => !mine(e)), ...entries.filter(mine)].forEach(([k, c]) => fmt.bucketAliases(k).forEach(a => { map[tfNorm(a)] = c; }));
+  }
   const used = new Set(Object.values(map));
   const pool = TABLEAU_10.filter(c => !used.has(c));
   const auto = {};
@@ -1399,7 +1407,12 @@ function createSheetFormatter(model, sheetName, onlyPanes) {
      * A layer underneath that the top layer covers is dropped (plain pie). The id-less "All" pane draws nothing.
      * null: not a pie (or 3+ layers). */
     pieLayers() {
-      const drawn = panes.length > 1 && panes.some(p => p.id) ? panes.filter(p => p.id) : panes;
+      // the drawn layers: on a dual axis the panes with their own axis (the "All" marks card, pane 1 in some
+      // workbooks, has an id but no axis); on map layers the panes with an id
+      const axisPanes = panes.filter(p => p.yAxisName || p.xAxisName);
+      // on map layers the "All" pane has an id too, but no field of its own
+      const layerPanes = panes.filter(p => p.id && (p.encodings || []).length);
+      const drawn = axisPanes.length >= 2 ? axisPanes : panes.length > 1 && layerPanes.length ? layerPanes : panes;
       const isPieP = p => /^pie$/i.test(p.markClass || "");
       if (drawn.length === 1) return isPieP(drawn[0]) ? { outer: drawn[0], hole: null, inner: null } : null;
       if (drawn.length !== 2) return null;
@@ -1415,6 +1428,9 @@ function createSheetFormatter(model, sheetName, onlyPanes) {
         if (!drawn.every(isPieP)) return null;
         const size = p => parseFloat(markRule(p, "size")) || 1;
         const [bottom, top] = drawn;
+        // a gauge's hole drawn as a second pie: smaller, on top, Marks colour white – the hole with its text
+        const white = p => /^#?f{6}$/i.test(String(markRule(p, "mark-color") || "").trim());
+        if (size(top) < size(bottom) && white(top) && !white(bottom)) return { outer: bottom, hole: top, inner: null };
         return size(top) < size(bottom) ? { outer: bottom, hole: null, inner: top } : { outer: top, hole: null, inner: null };
       }
       if (!isPieP(drawn[oi]) || !/^(pie|circle)$/i.test(drawn[hi].markClass || "")) return null;
@@ -1565,8 +1581,10 @@ function createSheetFormatter(model, sheetName, onlyPanes) {
     /* display names for Measure-Names buckets like "[ds].[sum:Sales:qk]" */
     bucketAliases(bucketKey) {
       if (!/^\[.*\]$/.test(bucketKey)) return [bucketKey];
-      const ref = tfParseFieldRef(bucketKey);
-      return ref ? [bucketKey, ...tfDisplayNames(model, ref)] : [bucketKey];
+      // Tableau escapes some characters in a member's field name ("[sum:gray>50\% (copy 2)_…]")
+      const plain = bucketKey.replace(/\\(.)/g, "$1");
+      const ref = tfParseFieldRef(plain);
+      return ref ? [bucketKey, ...(plain !== bucketKey ? [plain] : []), ...tfDisplayNames(model, ref)] : [bucketKey];
     }
   };
 }
@@ -4050,7 +4068,13 @@ function buildPieSpec(fmt, summary, opts = {}) {
   const rowHdr = hdr("rows"), colHdr = hdr("cols");
   const keyOf = (r, idx) => idx.map(i => tfDvText(r[i])).join(" | ");
   const hdrSet = new Set([...rowHdr, ...colHdr]);
-  const dimIdx = cols.map((c, i) => !c.numeric && !hdrSet.has(i) && !/^measure values$/i.test(c.name) ? i : -1).filter(i => i >= 0);
+  // a slice's name: its dimensions – not a field only another layer uses (a hole's "dummy" colour field)
+  const sheetPanes = ((fmt.sheetModel || {}).panes) || [];
+  const mineRefs = fmt.encodingRefs(/./);
+  const otherLayerOnly = ref => !mineRefs.some(r => tfSameField(r, ref)) &&
+    sheetPanes.some(p => (p.encodings || []).some(e => e.field && tfSameField(e.field, ref)));
+  const dimIdx = cols.map((c, i) => !c.numeric && !hdrSet.has(i) && !/^measure values$/i.test(c.name) &&
+                                    !(c.ref && !/^measure names$/i.test(c.name) && otherLayerOnly(c.ref)) ? i : -1).filter(i => i >= 0);
 
   const valueCaption = vi >= 0 ? fmt.captionFor(angleRef, cols[vi].name) : "Marks";
   const showLabels = fmt.markLabelsShown();
@@ -4106,7 +4130,8 @@ function buildHoleSpec(fmt, pie) {
   const ai = ax ? pie.columns.findIndex(c => c.ref && tfSameField(c.ref, ax)) : -1;
   // the hole's own row: one the slices don't use (on one shared axis measure every row has an axis value)
   const sliceRows = new Set(pie.points.map(p => p.row));
-  const axisRows = ai >= 0 ? pie.data.filter(r => !tfIsNull(r[ai])) : [];
+  // map layers have no axis: every row is a candidate – the hole's own row is one no slice uses
+  const axisRows = ai >= 0 ? pie.data.filter(r => !tfIsNull(r[ai])) : ax ? [] : pie.data;
   const spare = axisRows.filter(r => !sliceRows.has(pie.data.indexOf(r)));
   const own = new Map((spare.length ? spare : axisRows).map(r => [pie.paneOf(r), r]));
   const valueOf = pts => ref => {
@@ -5026,7 +5051,9 @@ function buildMapGaugeModel(model, sheetName, summary) {
 
     // the other layers: a needle (a line from the centre outwards) and text
     const toUnit = ([x, y]) => [(x - c.cx) / R, (y - c.cy) / R];
-    const wrap = a => { while (a < start - 180) a += 360; while (a > start + 180) a -= 360; return a; };
+    // an angle in the dial's own frame: within 180° of the dial's middle (a dial can sweep more than 180°)
+    const mid = start + span / 2;
+    const wrap = a => { while (a < mid - 180) a += 360; while (a > mid + 180) a -= 360; return a; };
     let needle = null, hub = null;
     const needleShape = shapes.find(sh => sh.role === "needle");
     if (needleShape) {
@@ -5247,10 +5274,15 @@ function buildGaugeCharts(gauge, block, refs, o) {
 
 /** a pie / donut gauge: one slice painted the background colour (Tableau's trick to hide the bottom half) */
 function pieIsGauge(pie, bg) {
-  const total = pie.points.reduce((s, p) => s + Math.abs(p.value || 0), 0);
   const bgU = String(bg || "FFFFFF").toUpperCase();
-  return total > 0 && pie.points.some(p => p.color && String(p.color).toUpperCase() === bgU &&
-                                         Math.abs(p.value) / total >= 0.2 && Math.abs(p.value) / total <= 0.6);
+  // each pie on its own: small multiples (one gauge per member) share the points list
+  const pies = new Map();
+  pie.points.forEach(p => { const k = `${p.rowKey}\u0001${p.colKey}`; if (!pies.has(k)) pies.set(k, []); pies.get(k).push(p); });
+  return [...pies.values()].some(pts => {
+    const total = pts.reduce((s, p) => s + Math.abs(p.value || 0), 0);
+    return total > 0 && pts.some(p => p.color && String(p.color).toUpperCase() === bgU &&
+                                      Math.abs(p.value) / total >= 0.2 && Math.abs(p.value) / total <= 0.6);
+  });
 }
 
 
