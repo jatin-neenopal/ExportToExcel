@@ -4228,6 +4228,14 @@ function buildPieModel(model, sheetName, summary, opts) {
   if (layers.hole) pie.hole = buildHoleSpec(scoped(layers.hole), pie);
   if (layers.inner) pie.inner = buildPieSpec(scoped(layers.inner), summary, opts);
   pie.gauge = !layers.inner && pieIsGauge(pie, (fmt.tableBackground() || "FFFFFFFF").slice(2));
+  // headers hidden in Tableau (Show Header off on every discrete field of a shelf): the pies get no title from them
+  const sm = fmt.sheetModel || {};
+  const hiddenRefs = ((((sm.style || {}).rules || {}).label) || []).filter(r => r.attr === "display" && r.value === "false")
+    .map(r => tfParseFieldRef(r.field)).filter(Boolean);
+  const allHidden = shelf => { const dims = (sm[shelf] || []).filter(r => r && r.type !== "qk");
+    return dims.length > 0 && dims.every(f => hiddenRefs.some(h => tfSameField(h, f))); };
+  pie.hideRowHeaders = allHidden("rows");
+  pie.hideColHeaders = allHidden("cols");
   const fit = fmt.fitMode(opts.dashboardName);                 // Entire View / Fit Width / Fit Height → the pane fills the zone
   if (/^(entire-view|fit-width)$/.test(fit || "")) pie.stretch.w = true;
   if (/^(entire-view|fit-height)$/.test(fit || "")) pie.stretch.h = true;
@@ -4421,7 +4429,22 @@ function buildPieCharts(pie, block, paneRefs, o) {
     // a gauge's slice in the background colour hides part of the dial: see-through (on any background); its label
     // and tooltip stay as Tableau shows them
     const bgU = String(o.bg || "").toUpperCase();
-    const shown = pts.map(p => pie.gauge && p.color && String(p.color).toUpperCase() === bgU ? { ...p, hidden: true } : p);
+    let shown = pts.map(p => pie.gauge && p.color && String(p.color).toUpperCase() === bgU ? { ...p, hidden: true } : p);
+    // a gauge's label that is the same on every slice (its name: "BNI / Kredit Konsumer / Limit : 80%") is
+    // shown once by Tableau, above the dial: kept on the visible slice nearest 12 o'clock, dropped on the others
+    if (pie.gauge) {
+      const textOf = p => (p.label ? JSON.stringify((p.label || []).map(l => (Array.isArray(l) ? l : [l]).map(x => (x && x.text !== undefined ? x.text : x)))) : "");
+      const labelled = shown.map((p, i) => i).filter(i => textOf(shown[i]));
+      if (labelled.length > 1 && labelled.every(i => textOf(shown[i]) === textOf(shown[labelled[0]]))) {
+        const total = shown.reduce((t, p) => t + Math.abs(p.value || 0), 0) || 1;
+        let a = 0;
+        const mid = shown.map(p => { const st = a; a += 360 * Math.abs(p.value || 0) / total; return (st + a) / 2; });
+        const top = i => Math.min(mid[i], 360 - mid[i]);
+        const pick = labelled.filter(i => !shown[i].hidden && Math.abs(shown[i].value || 0) > 0)
+                             .sort((x, y) => top(x) - top(y))[0];
+        if (pick !== undefined) shown = shown.map((p, i) => (i === pick || !p.label ? p : { ...p, label: null }));
+      }
+    }
     const texts = bound ? [] : [...labelsOf(shown, D / 2, pie.cullLabels), ...(innerPts.length ? labelsOf(innerPts, innerD / 2, pie.inner.cullLabels) : [])];
     // Excel's hole is see-through (it shows the chart background): a hole in another colour is a filled circle
     // under the labels. Bound to the slicers, a donut is a pie under such a circle: Excel puts a pie's labels outside
@@ -4440,7 +4463,7 @@ function buildPieCharts(pie, block, paneRefs, o) {
     const x = M + cj * pw, y = ri * ph;
     const spec = {
       seriesName: pie.valueCaption, categories: pts.map(p => p.category), values: pts.map(p => p.value), ref: refs.ref,
-      title: [rk, ck].filter(Boolean).join(" | ") || null, titleFont: pie.font, font: pie.font, bg: o.bg,
+      title: [pie.hideRowHeaders ? null : rk, pie.hideColHeaders ? null : ck].filter(Boolean).join(" | ") || null, titleFont: pie.font, font: pie.font, bg: o.bg,
       plot: { x: (1 - D / pw) / 2, y: (1 - D / ph) / 2, w: D / pw, h: D / ph },
       holeSize: holeAsCircle ? null : holeD ? 100 * holeD / D : innerPts.length ? 100 * innerD / D : null,
       points: shown.map(p => ({ color: p.hidden ? null : p.color, selected: p.selected })), hasShapes: texts.length > 0, cellLabels
@@ -7798,7 +7821,10 @@ function appendExportNotes(notes) {
  * ============================================================================= */
 
 const DEFAULT_BACKEND_URL = "";      // production: the hosted Worker URL, e.g. "https://export-to-excel-backend.<account>.workers.dev"
-const EXTENSION_VERSION = "2.0.0";
+const EXTENSION_VERSION = "2.0.2";
+/** which build made an export: shown in the Conversion Report and the panel (old cached files are easy to spot) */
+const EXTENSION_BUILD = "2026-10-30 multi-gauge";
+console.info(`[Export to Excel] v${EXTENSION_VERSION} · build ${EXTENSION_BUILD}`);
 /** Links shown with the licence status (leave "" to hide). */
 const PRODUCT_LINKS = { buy: "", help: "" };
 
@@ -7932,7 +7958,7 @@ function ensureLicenceBox() {
       </div>
       <div style="color:#6b7a73;margin-top:2px">Saved with this workbook, so viewers don't need it.</div>
     </div>
-    <div style="color:#9aa6a0;margin-top:2px">v${EXTENSION_VERSION}</div>`;
+    <div style="color:#9aa6a0;margin-top:2px">v${EXTENSION_VERSION} · ${EXTENSION_BUILD}</div>`;
   exportBtn.parentNode.insertBefore(box, exportBtn);
   return box;
 }
@@ -10152,7 +10178,8 @@ function writeConversionReport(workbook, report) {
   put(r, 1, "Tableau → Excel conversion report", { ...font, size: 14, bold: true }, { alignment: { wrapText: false } });
   ws.mergeCells(r, 1, r, 6);
   r++;
-  put(r, 1, `Dashboard: ${report.dashboard}` + (report.workbookFile ? `   ·   Workbook: ${report.workbookFile}` : "   ·   no workbook loaded"),
+  put(r, 1, `Dashboard: ${report.dashboard}` + (report.workbookFile ? `   ·   Workbook: ${report.workbookFile}` : "   ·   no workbook loaded") +
+           `   ·   Export to Excel v${EXTENSION_VERSION} (${EXTENSION_BUILD})`,
       font, { alignment: { wrapText: false } });
   ws.mergeCells(r, 1, r, 6);
   r++;
@@ -10237,7 +10264,8 @@ function writeConversionReports(workbook, reports) {
   const all = reports.flatMap(rep => rep.visuals);
   banner("Tableau → Excel conversion report", { ...font, size: 14, bold: true });
   r++;
-  banner(`${reports.length} dashboards` + (reports[0].workbookFile ? `   ·   Workbook: ${reports[0].workbookFile}` : "   ·   no workbook loaded"), font);
+  banner(`${reports.length} dashboards` + (reports[0].workbookFile ? `   ·   Workbook: ${reports[0].workbookFile}` : "   ·   no workbook loaded") +
+         `   ·   Export to Excel v${EXTENSION_VERSION} (${EXTENSION_BUILD})`, font);
   r++;
   banner(`${all.length} visual${all.length === 1 ? "" : "s"}: ` + (strategyCounts(all).map(([s, n]) => `${n} ${s}`).join("   ·   ") || "none"), bold);
 
