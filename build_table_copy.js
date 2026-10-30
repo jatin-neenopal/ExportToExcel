@@ -568,7 +568,8 @@ function tvApplyWorkbookAxes(spec, ctx) {
 function tfIsNull(dv) {
   if (!dv) return true;
   const v = dv.nativeValue !== undefined ? dv.nativeValue : dv.value;
-  return v === null || v === undefined || v === "%null%";
+  // a range card's open end ("Null – 0.9") arrives as NaN
+  return v === null || v === undefined || v === "%null%" || (typeof v === "number" && isNaN(v));
 }
 
 /** @param {DataValue} dv @returns {string} */
@@ -1939,8 +1940,11 @@ function parseTableauFormatting(xmlString) {
     ].filter(x => x.field && x.measure) : [];
     // members kept by the Measure Names filter, in filter order
     sheet.measureFilter = [];
-    // the fields the sheet filters by (a calculated filter's own datasource: two calculations can share a caption)
-    sheet.filterRefs = view ? tfKids(view, "filter").map(f => tfParseFieldRef(f.getAttribute("column") || "")).filter(Boolean) : [];
+    // the fields the sheet filters by (a calculated filter's own datasource: two calculations can share a caption) –
+    // with its slices: a filter that keeps everything (a range card at Null – max) is saved only there
+    const sliceCols = view ? tfKids(view, "slices").flatMap(s => tfKids(s, "column").map(c => c.textContent || "")) : [];
+    sheet.filterRefs = view ? [...tfKids(view, "filter").map(f => f.getAttribute("column") || ""), ...sliceCols]
+      .map(c => tfParseFieldRef(c)).filter(Boolean) : [];
     if (view) tfKids(view, "filter").forEach(f => {
       if (!/\[:Measure Names\]$/.test(f.getAttribute("column") || "")) return;
       Array.from(f.getElementsByTagName("groupfilter")).forEach(g => {
@@ -4170,13 +4174,8 @@ function buildPieSpec(fmt, summary, opts = {}) {
   // colour member – a donut's hole total comes back as Country = Null
   const enc0 = fmt.colorEncoding(), ci0 = enc0 && !enc0.continuous ? colFor(enc0.ref) : -1;
   if (axisCol >= 0 && ci0 >= 0 && marks.some(({ r }) => !tfIsNull(r[ci0]))) marks = marks.filter(({ r }) => !tfIsNull(r[ci0]));
-  const nAxis = marks.length;
   if (vi >= 0) marks = marks.filter(({ r }) => { const v = tfDvNum(r[vi]); return v !== null && v > 0; });   // Tableau drops null / ≤ 0 wedges
-  if (!marks.length) {
-    if (opts.why) opts.why.reason = `no slice left: ${(summary.data || []).length} rows; angle column ${vi} (${angleRef ? angleRef.name : "none"}); ` +
-      `axis column ${axisCol} (${fmt.axisRefs().map(r => r.name).join(", ") || "none"}); colour column ${ci0}; ${nAxis} rows after the axis / colour steps, 0 with a value > 0`;
-    return null;
-  }
+  if (!marks.length) return null;
 
   // a field's value as Tableau shows it; % of total computed when the table calc isn't in the summary data
   const totals = {};
@@ -4374,39 +4373,13 @@ function pieCenterText(model, dashName, sheetName, g, dataOf) {
  * @param {FormatModel} model @param {string} sheetName @param {any} summary
  * @param {{ dashboardName: string, selectedTables?: any[], dataOf: (name: string) => any }} opts
  */
-/* Diagnostics: a sheet drawn with Pie marks that does not take the pie path is written to a "Pie Debug" sheet – the
- * reason, its layers and the exact summary data Tableau sent (columns with their field ids, the first rows). */
-const PIE_DEBUG = [];
-function writePieDebug(workbook) {
-  const ws = workbook.addWorksheet("Pie Debug", { state: "hidden" });   // for support only: Excel → right-click a tab → Unhide
-  let r = 1;
-  const put = (vals, bold) => { vals.forEach((v, k) => { const c = ws.getCell(r, k + 1); c.value = v === undefined ? null : v; if (bold) c.font = { bold: true }; }); r++; };
-  put([`Export to Excel v${EXTENSION_VERSION} (${EXTENSION_BUILD}) – sheets with Pie marks that were not drawn as pies`], true);
-  for (const d of PIE_DEBUG) {
-    r++;
-    put([`${d.dashboard} / ${d.sheet}`], true);
-    put(["Reason", d.reason]); put(["Layers", d.layers || "–"]);
-    d.panes.forEach(p => put(["Pane", p]));
-    const cols = (d.summary && d.summary.columns) || [];
-    put(["Columns:"], true);
-    put(["#", "fieldName", "fieldId", "dataType"], true);
-    cols.forEach((c, i) => put([i, c.fieldName, c.fieldId || "(none)", c.dataType]));
-    const data = (d.summary && d.summary.data) || [];
-    put([`Rows: ${data.length} (first 40)`], true);
-    put(cols.map(c => c.fieldName), true);
-    data.slice(0, 40).forEach(row => put(row.map(v => (v == null ? "∅" : v.value === null || v.value === undefined ? `null (${v.formattedValue})` : String(v.formattedValue !== undefined ? v.formattedValue : v.value)))));
-  }
-  ws.getColumn(1).width = 26; ws.getColumn(2).width = 60; ws.getColumn(3).width = 60;
-}
-
 function buildPieModel(model, sheetName, summary, opts) {
   const fmt = createSheetFormatter(model, sheetName);
   const layers = fmt.pieLayers();
-  if (!layers) { if (opts.why) opts.why.reason = "the pie layers were not recognised"; return null; }
+  if (!layers) return null;
   const scoped = pane => createSheetFormatter(model, sheetName, [pane]);
-  if (opts.why) opts.why.layers = `outer ${layers.outer && layers.outer.id}, hole ${layers.hole && layers.hole.id}, inner ${layers.inner && layers.inner.id}`;
   const pie = buildPieSpec(scoped(layers.outer), summary, opts);
-  if (!pie) { if (opts.why && !opts.why.reason) opts.why.reason = "the outer layer gave no pie"; return null; }
+  if (!pie) return null;
   if (layers.hole) pie.hole = buildHoleSpec(scoped(layers.hole), pie);
   if (layers.inner) pie.inner = buildPieSpec(scoped(layers.inner), summary, opts);
   pie.gauge = !layers.inner && pieIsGauge(pie, (fmt.tableBackground() || "FFFFFFFF").slice(2));
@@ -4526,9 +4499,38 @@ function writePieData(ds, startRow, pie, name) {
   pie.rowKeys.forEach(rk => pie.colKeys.forEach(ck => {
     const pts = pie.points.filter(p => p.rowKey === rk && p.colKey === ck);
     if (!pts.length) return;
+    const first = row;
     const ref = writeRows(pts, pie);
     const innerPts = pie.inner ? pie.inner.points.filter(p => p.rowKey === rk && p.colKey === ck) : [];
     const innerRef = innerPts.length ? writeRows(innerPts, pie.inner) : null;
+    // a gauge the slicers filter out empties: its slices #N/A, its name and centre text blank (pie.gaugeShown)
+    const show = pie.gaugeShown && !innerPts.length ? pie.gaugeShown.show(pie.data[pts[0].row]) : null;
+    if (show) {
+      putRow(row, ["Gauge shown"]);
+      ds.getCell(row, 2).value = { formula: `IF(ISNUMBER(${show}),1,NA())`, result: 1 };
+      const on = `$B$${row++}`;
+      const ifShown = text => ({ formula: `IF(ISNUMBER(${on}),${String(text).split("\n").map(xlText).join("&CHAR(10)&")},"")`, result: text });
+      const labels = pts.map((p, i) => {
+        if (typeof p.value === "number") ds.getCell(`${valCol}${first + i}`).value = { formula: `${p.value}*${on}`, result: p.value };
+        if (!p.label) return null;
+        ds.getCell(`${lblCol}${first + i}`).value = ifShown(plainText(p.label));
+        return sheetRef(ds.name, `$${lblCol}$${first + i}`);
+      });
+      pie.gaugeShown.binding.written += pts.length;
+      const lines = (single && pie.centerText && pie.centerText.lines) || (pie.hole && pie.hole.labelFor(pts)) || [];
+      let centre = null;
+      if (lines.length) {
+        putRow(row, ["Centre text"]);
+        centre = lines.map((l, i) => {
+          const cell = ds.getCell(row, i + 2);
+          cell.value = ifShown(plainText([l]));
+          return sheetRef(ds.name, `$${cell.address.replace(/\d+$/, "")}$${row}`);
+        });
+        row++;
+      }
+      panes.set(rk + "\u0001" + ck, { ref, innerRef, centre, labels });
+      return;
+    }
     // the hole's label: a line showing the total of the slices' measure follows them; the rest keeps its text
     let centre = null;
     const lp = bound && pie.hole && !(single && pie.centerText) ? pie.hole.labelPartsFor(pts) : null;
@@ -4576,9 +4578,10 @@ function buildPieCharts(pie, block, paneRefs, o) {
   const holeD = pie.hole ? Math.min(pieDiameterPx(pie.hole.markSize) * k, D) : 0;
   const innerD = pie.inner ? Math.min(pieDiameterPx(pie.inner.markSize) * k, D) : 0;
   const single = pie.rowKeys.length * pie.colKeys.length === 1;
-  const labelsOf = (pts, R, cull) => {
+  // links: a cell per point whose text the label shows (a gauge that empties with the slicers)
+  const labelsOf = (pts, R, cull, links) => {
     const boxes = pieLabelLayout(pts, { cx: pw / 2, cy: ph / 2, R, w: pw, h: ph, cull, textScale });
-    return pts.map((p, k) => boxes[k] && { ...boxes[k], lines: p.label, anchor: boxes[k].up ? "b" : "t" }).filter(Boolean);
+    return pts.map((p, k) => boxes[k] && { ...boxes[k], lines: p.label, anchor: boxes[k].up ? "b" : "t", link: (links && links[k]) || null }).filter(Boolean);
   };
   // Excel draws slice 1 from 12 o'clock clockwise with |value|; DrawingML angles are 60000ths of a degree
   // clockwise from 3 o'clock
@@ -4630,7 +4633,7 @@ function buildPieCharts(pie, block, paneRefs, o) {
         if (pick !== undefined) shown = shown.map((p, i) => (i === pick || !p.label ? p : { ...p, label: null }));
       }
     }
-    const texts = bound ? [] : [...labelsOf(shown, D / 2, pie.cullLabels), ...(innerPts.length ? labelsOf(innerPts, innerD / 2, pie.inner.cullLabels) : [])];
+    const texts = bound ? [] : [...labelsOf(shown, D / 2, pie.cullLabels, refs.labels), ...(innerPts.length ? labelsOf(innerPts, innerD / 2, pie.inner.cullLabels) : [])];
     // Excel's hole is see-through (it shows the chart background): a hole in another colour is a filled circle
     // under the labels. Bound to the slicers, a donut is a pie under such a circle: Excel puts a pie's labels outside
     // it, as Tableau does, but a doughnut's on the ring
@@ -8007,9 +8010,9 @@ function appendExportNotes(notes) {
  * ============================================================================= */
 
 const DEFAULT_BACKEND_URL = "";      // production: the hosted Worker URL, e.g. "https://export-to-excel-backend.<account>.workers.dev"
-const EXTENSION_VERSION = "2.1.0";
+const EXTENSION_VERSION = "2.0.2";
 /** which build made an export: shown in the Conversion Report and the panel (old cached files are easy to spot) */
-const EXTENSION_BUILD = "2026-10-30 prod";
+const EXTENSION_BUILD = "2026-10-30 multi-gauge";
 console.info(`[Export to Excel] v${EXTENSION_VERSION} · build ${EXTENSION_BUILD}`);
 /** Links shown with the licence status (leave "" to hide). */
 const PRODUCT_LINKS = { buy: "", help: "" };
@@ -14237,6 +14240,39 @@ function bindPie(slicers, pie, sheetName, filters, model) {
   return binding;
 }
 
+/**
+ * A pie gauge (pie.gauge) follows the slicers as a whole: its slices are Tableau's own numbers (calculations on
+ * Measure Names: colored>50%, Needle limit …), but each gauge – one per pane (mitra / product) – is shown while its
+ * marks pass the slicers and empty when they filter it out. Binds one mark per pane on a measure of the sheet the
+ * data source's rows give (SUM(Gauge Value)), Measure Names / Values left out.
+ * @returns {{ binding: any, show: (row: any[]) => string | null } | string} or the reason it keeps fixed values
+ */
+function bindGaugeShown(slicers, pie, sheetName, filters, model) {
+  const reps = [];
+  const seen = new Set();
+  pie.points.forEach(p => { const key = p.rowKey + "\u0001" + p.colKey; if (!seen.has(key)) { seen.add(key); reps.push(pie.data[p.row]); } });
+  // a dimension the same on every gauge does not tell them apart: left out (a constant colour calculation such as
+  // 'dummy', which Tableau's summary data may even leave empty)
+  const constant = k => !pie.columns[k].numeric && new Set(reps.map(r => tfDvText(r[k]))).size === 1;
+  const keep = pie.columns.map((c, k) => k).filter(k => k !== pie.valueCol && !constant(k) &&
+                                                       !/^Measure (Names|Values)$/i.test(String(pie.columns[k].name)));
+  const project = r => keep.map(k => r[k]);
+  const vm = /** @type {any} */ ({
+    cols: keep.map(k => {
+      const c = pie.columns[k], d = String((c.ref && c.ref.deriv) || "").toLowerCase();
+      return { name: c.name, label: c.name, ref: c.ref, isHeader: !c.numeric && !(SLICER_AGGS[d] || d === "usr") };
+    }),
+    rows: reps.map(project), order: [], matrix: null
+  });
+  vm.order = vm.cols.map((c, ci) => ci).filter(ci => !vm.cols[ci].isHeader);
+  const binding = slicers.bind(vm, sheetName, filters, model);
+  if (typeof binding === "string") return binding;
+  // a measure with numbers of its own: a constant 0 (SUM(0)) would match Tableau's even with no rows behind a gauge
+  const ci = vm.order.find(i => vm.rows.some(r => tfDvNum(r[i])) && vm.rows.every(r => binding.formulaFor([r], i, "chart")));
+  if (ci === undefined) return binding.reasons[0] || "no measure of the gauge can be rebuilt from the data source's rows";
+  return { binding, show: row => binding.formulaFor([project(row)], ci, "chart") };
+}
+
 const DATE_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 /**
@@ -14335,7 +14371,9 @@ function writeControlCard(worksheet, item, tracker) {
   writeIndividualFilterTable(worksheet, item.filterName || field.header, values, item.gridRow, item.gridCol, tracker, item.gridW);
   const cells = values.map((v, i) => worksheet.getCell(item.gridRow + 2 + i, item.gridCol + 1));
   const ref = cell => { const m = String(cell.address).match(/^([A-Z]+)(\d+)$/); return sheetRef(worksheet.name, `$${m[1]}$${m[2]}`); };
-  if (!list) cells.forEach((c, i) => { c.numFmt = numeric ? (i ? '"Max   "General;"Max   "-General' : '"Min   "General;"Min   "-General') : i ? '"To   "d mmm yyyy' : '"From "d mmm yyyy'; });
+  // the text section: an open end (Tableau's "Null – 0.9") is an empty cell that still reads "Min"
+  const bound = w => `"${w}   "General;"${w}   "-General;"${w}   "General;"${w}   "@`;
+  if (!list) cells.forEach((c, i) => { c.numFmt = numeric ? bound(i ? "Max" : "Min") : i ? '"To   "d mmm yyyy' : '"From "d mmm yyyy'; });
   // a relative date filter: the window it kept at export, and that the cells hold that window, not "the last 3 months"
   if (field.relative) worksheet.getCell(item.gridRow + 1, item.gridCol + 1).note =
     `Tableau: ${field.relative}. Excel keeps the dates it covered at export – change From / To for another window.`;
@@ -14526,7 +14564,6 @@ const IMAGE_RENDER_TIMEOUT_MS = 30000;
  *   the charts are injected sheet by sheet after ExcelJS has written the file; one Conversion Report covers all.
  * ========================================================================= */
 async function exportToExcel() {
-  PIE_DEBUG.length = 0;
   const dashboard = tableau.extensions.dashboardContent.dashboard;
   const sheets = dashboard.worksheets;
   const btn = /** @type {HTMLButtonElement} */ (document.getElementById("export_button"));
@@ -14604,7 +14641,6 @@ async function exportToExcel() {
     if (slicerTable) workbook.calcProperties = { ...(workbook.calcProperties || {}), fullCalcOnLoad: true };
 
     if (FORMAT_CONFIG.conversionReport) writeConversionReports(workbook, written.map(w => w.report));
-    if (PIE_DEBUG.length) writePieDebug(workbook);
 
     setExportStatus("Building the Excel file…");
     dropEmptyRichTextRuns(workbook);
@@ -14848,16 +14884,11 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
         visualModel.crosstab = asTable;
         let renderDecision = chooseVisualRenderer(visualModel, { asTable });
         // a pie or donut (one or two layers): drawn the way Tableau draws it – slices, labels, hole, tooltips
-        const pieWhy = {};
-        const hasPieMarks = !!(fmtModel && ((fmtModel.sheets[sheet.name] || {}).panes || []).some(p => /^pie$/i.test(p.markClass || "")));
-        if (hasPieMarks && !visualModel.viewModel.fmt.pieLayers()) pieWhy.reason = "the pie layers were not recognised";
-        if (hasPieMarks && (asTable || !FORMAT_CONFIG.nativeCharts)) pieWhy.reason = asTable ? "\"Charts as tables\" is on" : "native charts are off";
         if (!asTable && fmtModel && FORMAT_CONFIG.nativeCharts && visualModel.viewModel.fmt.pieLayers()) {
           const pie = buildPieModel(fmtModel, sheet.name, summaryData, {
             dashboardName: dashboard.name, selectedTables: await fetchSelectedMarks(sheet),
-            dataOf: name => (allSheetsData.find(x => x.sheet.name === name) || { data: null }).data, why: pieWhy
+            dataOf: name => (allSheetsData.find(x => x.sheet.name === name) || { data: null }).data
           });
-          if (!pie && !pieWhy.reason) pieWhy.reason = "no pie was built";
           if (pie) {
             visualModel.pie = pie;
             visualModel.type = VISUAL_TYPES.PIE;
@@ -14868,13 +14899,6 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
             }
             pieLegendItems.push(...pieLegends(pie, sheet.name, visualModel.viewModel));
           }
-        }
-        if (hasPieMarks && !visualModel.pie) {
-          const panes = ((fmtModel.sheets[sheet.name] || {}).panes || []).map(p => `pane ${p.id || "-"}: ${p.markClass}` +
-            `${p.yAxisName || p.xAxisName ? " (own axis)" : ""} [${(p.encodings || []).map(e => e.channel + ":" + (e.field && e.field.name)).join(", ")}]`);
-          PIE_DEBUG.push({ dashboard: dashboard.name, sheet: sheet.name, reason: pieWhy.reason || "unknown", layers: pieWhy.layers || "",
-                           panes, summary: summaryData });
-          console.warn(`[Pie] "${sheet.name}" not drawn as pies: ${pieWhy.reason || "unknown"}`);
         }
         // a gauge drawn with map layers / polygons: rebuilt from its calculations as Excel's doughnut + needle gauge
         if (!asTable && fmtModel && FORMAT_CONFIG.nativeCharts && !visualModel.pie &&
@@ -15105,6 +15129,20 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
         for (const item of dataWorksheetItems) {
           const vmod = item.visualModel;
           const pie = vmod && vmod.pie;
+          if (item.vm && pie && pie.gauge && !pie.inner && !vmod.gauge && vmod.renderer !== "tableau-image") {
+            const sheet = sheets.find(s => s.name === item.name);
+            let filters = [];
+            try { filters = sheet && typeof sheet.getFiltersAsync === "function" ? (await sheet.getFiltersAsync()) || [] : []; }
+            catch (e) { /* bound without its filters: the check against Tableau's numbers decides */ }
+            const shown = bindGaugeShown(slicers, pie, item.name, filters, fmtModel);
+            if (typeof shown === "string") item.slicerNote = `fixed values: ${shown}`;
+            else {
+              item.vm.slicerBinding = shown.binding;
+              pie.gaugeShown = shown;
+              item.slicerNote = "follows the slicers: each gauge shows, or empties, as they keep or filter out its marks (its slices keep Tableau's numbers)";
+            }
+            continue;
+          }
           if (!item.vm || !vmod || vmod.gauge || vmod.renderer === "tableau-image" || (pie && (pie.gauge || pie.inner))) {
             item.slicerNote = pie && pie.inner ? "fixed values: a nested donut keeps Tableau's numbers"
               : "fixed values: gauges and pictures keep Tableau's numbers";
