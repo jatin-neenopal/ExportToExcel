@@ -7860,13 +7860,14 @@ function stNumFmt(f, integerValues) {
   const digits = (d) => (d > 0 ? "." + "0".repeat(Math.min(d, 10)) : "");
   const body = (d) => (grouping ? "#,##0" : "0") + digits(d);
   if (f.style === "percent") return "0" + digits(max ?? min ?? 0) + "%";
+  const neg = fmt => (f.negativeValueFormat === "parentheses" ? `${fmt};(${fmt})` : `${fmt};-${fmt}`);
   if (f.style === "currency") {
     const sym = ST_CURRENCY[String(f.currency || "").toUpperCase()] || "";
-    const fmt = (sym ? `"${sym}"` : "") + body(max ?? min ?? 2);
-    return `${fmt};-${fmt}`;
+    return neg((sym ? `"${sym}"` : "") + body(max ?? min ?? 2));
   }
   if (f.style === "decimal" || max !== null || min !== null || f.useGrouping !== undefined) {
-    return body(max ?? min ?? (integerValues ? 0 : 2));
+    const fmt = body(max ?? min ?? (integerValues ? 0 : 2));
+    return f.negativeValueFormat === "parentheses" ? neg(fmt) : fmt;
   }
   return null;
 }
@@ -7969,6 +7970,25 @@ function applySuperTable(visualModel, st, summary) {
   let shown = stateCols.length
     ? stateCols.filter(s => !s.hide && !internal(s.colId))
     : cols.map(c => ({ colId: c.id }));
+  // column groups (the headers with a ›): closed unless the saved view opened them; a closed group shows its
+  // columns not marked "show when open", an open one those not marked "show when closed"
+  const groupCfg = stJson(st.settings.columnGroupConfig, {}) || {};
+  const groupStates = Array.isArray(st.state.columnGroupState) ? st.state.columnGroupState : [];
+  const groupOpen = name => {
+    const ids = [`>${name}`, name, (groupCfg[name] || {}).columnGroupId].filter(Boolean);
+    const g = groupStates.find(x => ids.includes(x.groupId));
+    return !!(g && g.open);
+  };
+  const closedGroups = new Set();
+  shown = shown.filter(sc => {
+    const cfg = cfgOf(sc.colId);
+    if (!cfg.groupHeader) return true;
+    const open = groupOpen(cfg.groupHeader);
+    if (!open) closedGroups.add(cfg.groupHeader);
+    return open ? cfg.groupShowOpen !== false : cfg.groupShowOpen !== true;
+  });
+  if (closedGroups.size) notes.push(`column groups ${[...closedGroups].join(", ")} closed, as saved`);
+  // columns the grid shows that the data does not have (sparklines, a formula column whose definition is gone …)
   const skippedCols = [];
   shown = shown.filter(s => {
     if (s.colId === "index") return true;
@@ -8113,7 +8133,7 @@ function applySuperTable(visualModel, st, summary) {
     if (!o.numFmt && o.col && tableauFmt.has(o.col.name)) o.numFmt = tableauFmt.get(o.col.name);
     if (!o.numFmt && nums.length) o.numFmt = nums.every(v => Number.isInteger(v)) ? "#,##0" : "#,##0.00";
     o.style = String((o.cfg.format || {}).style || "").toLowerCase();
-    if (o.style === "image") notes.push(`"${o.label || o.id}": images written as their links`);
+    if (o.style === "image") o.imageNote = `"${o.label || o.id || "image"}"`;
     if (o.style === "html") notes.push(`"${o.label || o.id}": HTML written as its text`);
   });
   const cellDv = (o, v) => {
@@ -8155,17 +8175,20 @@ function applySuperTable(visualModel, st, summary) {
   const theme = st.theme || {};
   const fontSize = stPt(theme.fontSize) || 9;
   const headerSize = stPt(theme.headerFontSize) || fontSize;
-  const stripe = st.settings.showOddRowStyling === "false" ? null : (stArgb(theme.oddRowBackgroundColor) || "FFF6F6F6");
+  const stripe = st.settings.showOddRowStyling === "true" || theme.oddRowBackgroundColor ? (stArgb(theme.oddRowBackgroundColor) || "FFF6F6F6") : null;
   const headerBg = stArgb(theme.headerBackgroundColor) || "FFF5F5F5";
   const headerFg = stArgb(theme.headerForegroundColor || theme.headerFontColor) || "FF181D1F";
   const fg = stArgb(theme.foregroundColor || theme.fontColor) || "FF181D1F";
   const font = st.settings.useTableauFont === "true" ? undefined : "Arial";
-  const bars = outCols.map(o => {
+  const num = v => (v !== undefined && v !== null && v !== "" && isFinite(Number(v)) ? Number(v) : null);
+  const bars = outCols.map((o, k) => {
     const c = o.cfg.color || {};
     if (!(o.cfg.showRowAsBarChart === true || c.barChart === true)) return null;
-    return { color: stArgb(c.inColor) || stArgb(c.aboveColor) || "FF2A95BF",
-             min: c.autoMin === false && c.lowerBound !== "" && c.lowerBound !== undefined ? Number(c.lowerBound) : null,
-             max: c.autoMax === false && c.upperBound !== "" && c.upperBound !== undefined ? Number(c.upperBound) : null };
+    const nums = rowsOut.map(r => r.values[k]).filter(x => typeof x === "number");
+    const max = num(c.maxValue) ?? (c.autoMax === false ? num(c.upperBound) : null);
+    const min = num(c.minValue) ?? (c.autoMin === false ? num(c.lowerBound) : null) ?? (nums.every(x => x >= 0) ? 0 : null);
+    const color = stArgb(c.inColor) || stArgb(c.aboveColor) || "FF2A95BF";
+    return { color, negative: stArgb(c.belowColor) || color, min, max };
   });
   if (bars.some(Boolean)) notes.push("bars drawn as Excel data bars");
   const linkOf = (o, rowObj) => {
@@ -8176,7 +8199,10 @@ function applySuperTable(visualModel, st, summary) {
       if (/^(https?:|mailto:|ftp:)/i.test(url)) return { url, text: o.style === "image" ? (o.label || "link") : String(v ?? url) };
       if (/@/.test(url) && !/\s/.test(url)) return { url: `mailto:${url}`, text: String(v ?? url) };
     }
-    if (o.style === "image" && /^https?:/i.test(String(v || ""))) return { url: String(v), text: "image" };
+    if (o.style === "image" && /^https?:/i.test(String(v || ""))) {
+      if (images.has(String(v))) return null;                       // drawn as the picture itself
+      return { url: String(v), text: "image" };
+    }
     if (o.style === "html") { const m = /href=["']([^"']+)["']/i.exec(String(v || "")); if (m) return { url: m[1], text: cellDv(o, v).formattedValue }; }
     return null;
   };
@@ -8187,6 +8213,13 @@ function applySuperTable(visualModel, st, summary) {
   // gradient bounds per column, computed once
   const numsOf = new Map();
   const columnNums = k => { if (!numsOf.has(k)) numsOf.set(k, rowsOut.map(r => r.values[k]).filter(x => typeof x === "number")); return numsOf.get(k); };
+
+  // images: each distinct picture fetched once (fetchSuperTableImages, before writing); size from the column's settings
+  const images = new Map();                        // url → { base64, extension, width, height } once fetched
+  const imageCols = outCols.map((o, k) => (o.style === "image" ? {
+    k, width: num((o.cfg.format || {}).imageWidth), height: num((o.cfg.format || {}).imageHeight),
+    urls: [...new Set(rowsOut.map(r => r.values[k]).filter(v => /^https?:/i.test(String(v || ""))).map(String))]
+  } : null)).filter(Boolean);
 
   // -- the view model the table writer draws
   const scaleW = px => (px ? Math.max(24, Math.round(px)) : null);
@@ -8223,7 +8256,7 @@ function applySuperTable(visualModel, st, summary) {
       if (row.kind !== "detail") { out.p.bold = true; out.fill = "FFF0F0F0"; }
       else if (stripe && row.striped) out.fill = stripe;
       if (o.id === "__group" && row.level) out.p.indent = row.level;
-      const color = colorOf(o, rowIdx);
+      const color = bars[ci] ? null : colorOf(o, rowIdx);          // a bar column: the cell is the bar
       if (color) {
         if (o.cfg.colorCellBackground !== false) out.fill = color; else out.fontColor = color;
         const cc = o.cfg.color || {};
@@ -8235,6 +8268,19 @@ function applySuperTable(visualModel, st, summary) {
     },
     rowMeta: rowIdx => rowsOut[rowIdx],
     bars,
+    images, imageCols,
+    /** the picture for a cell (fetched), its size in px; null when the cell has none */
+    imageAt: (rowIdx, ci) => {
+      const ic = imageCols.find(x => x.k === ci);
+      if (!ic) return null;
+      const v = rowsOut[rowIdx].values[ci];
+      const pic = v ? images.get(String(v)) : null;
+      if (!pic) return null;
+      const w = ic.width || (ic.height ? Math.round(ic.height * pic.width / pic.height) : Math.min(30, pic.width));
+      const h = ic.height || Math.round(w * pic.height / pic.width);
+      return { pic, w, h };
+    },
+    placed: [],                                    // pictures to anchor once the columns are sized: { row, col, lastCol, w, h, pic }
     summary: `${outCols.length} column${outCols.length === 1 ? "" : "s"}` + (groupMode ? `, grouped by ${groupIds.map(labelOf).join(" › ")}` : "")
            + (pivotIds.length ? `, pivoted on ${labelOf(pivotIds[0])}` : "") + (sorts.length ? `, sorted by ${sorts.map(s => labelOf(s.colId)).join(", ")}` : "")
   };
@@ -8264,12 +8310,71 @@ function stMixColors(a, b, t) {
   return "FF" + [0, 1, 2].map(i => h(ch(a, i) + (ch(b, i) - ch(a, i)) * t)).join("");
 }
 
+/**
+ * The pictures of a SuperTable's image columns, each distinct URL fetched once in the browser (the host must allow
+ * it - CORS). PNG, JPEG and GIF are embedded; SVG and refused downloads stay links. Notes say which.
+ * @param {any} spec vm.superTable
+ */
+async function fetchSuperTableImages(spec) {
+  if (!spec || !spec.imageCols.length) return;
+  const urls = [...new Set(spec.imageCols.flatMap(c => c.urls))].slice(0, FORMAT_CONFIG.superTableMaxImageUrls || 200);
+  let failed = 0, svg = 0;
+  const toBase64 = bytes => { let s = ""; for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000)); return btoa(s); };
+  await Promise.all(urls.map(async url => {
+    try {
+      const res = await fetch(url, { mode: "cors", credentials: "omit" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      const type = (res.headers.get("content-type") || "").toLowerCase();
+      const size = stImageSize(bytes);
+      if (!size) { if (/svg/.test(type) || /\.svg(\?|$)/i.test(url)) svg++; else failed++; return; }
+      spec.images.set(url, { base64: toBase64(bytes), extension: size.ext, width: size.width, height: size.height });
+    } catch (e) { failed++; console.warn(`[SuperTables] image not downloaded: ${url} (${e.message})`); }
+  }));
+  const names = spec.imageCols.map(c => c.k);
+  if (spec.images.size) spec.notes.push(`images drawn as pictures (${spec.images.size} distinct)`);
+  if (failed) spec.notes.push(`${failed} image${failed > 1 ? "s" : ""} written as links (the image host does not allow downloading them)`);
+  if (svg) spec.notes.push(`${svg} SVG image${svg > 1 ? "s" : ""} written as links (Excel cannot embed SVG)`);
+  return names;
+}
+
+/** a PNG / JPEG / GIF's pixel size from its bytes; null for anything else */
+function stImageSize(b) {
+  if (b.length > 24 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E && b[3] === 0x47) {
+    return { ext: "png", width: (b[16] << 24 | b[17] << 16 | b[18] << 8 | b[19]) >>> 0, height: (b[20] << 24 | b[21] << 16 | b[22] << 8 | b[23]) >>> 0 };
+  }
+  if (b.length > 10 && b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46) return { ext: "gif", width: b[6] | b[7] << 8, height: b[8] | b[9] << 8 };
+  if (b.length > 4 && b[0] === 0xFF && b[1] === 0xD8) {
+    for (let i = 2; i + 9 < b.length;) {
+      if (b[i] !== 0xFF) { i++; continue; }
+      const m = b[i + 1], len = b[i + 2] << 8 | b[i + 3];
+      if (m >= 0xC0 && m <= 0xCF && m !== 0xC4 && m !== 0xC8 && m !== 0xCC) return { ext: "jpeg", height: b[i + 5] << 8 | b[i + 6], width: b[i + 7] << 8 | b[i + 8] };
+      i += 2 + len;
+    }
+  }
+  return null;
+}
+
+/**
+ * Merge a SuperTables field's cells (a field over several sheet columns) without ExcelJS checking it against every
+ * merge made so far (thousands of rows: quadratic). Its cells belong to its own table, so each merge is checked
+ * against nothing and kept aside; stMergesDone puts them back. Without ExcelJS's merge list: an ordinary merge.
+ */
+function stMerge(ws, held, top, left, bottom, right) {
+  const own = ws._merges;
+  if (!held || !own || typeof own !== "object") { ws.mergeCells(top, left, bottom, right); return; }
+  ws._merges = {};
+  try { ws.mergeCells(top, left, bottom, right); Object.assign(held, ws._merges); } finally { ws._merges = own; }
+}
+function stMergesDone(ws, held) { if (held && ws._merges && typeof ws._merges === "object") Object.assign(ws._merges, held); }
+
 function writeRegularTable(worksheet, vm, originRow, originCol, rangeTracker, allTablesInfo, colWidths, exactWidths,
                                   visibleRows = ROW_GROUP_THRESHOLD, fieldCols = null, zoneW = 0) {
   let r = originRow;
   const C = originCol;
   const { fmt, cols, rows, order } = vm;
   const st = vm.superTable || null;                           // a SuperTable: its own look (export/supertables.js)
+  const stMerges = st ? {} : null;                            // its merged fields, added to the sheet after the rows
   const numCols = order.length;
   // field k's first sheet column, and its last: a field crossed by another block's column edge spans both columns
   const grid = fieldCols && fieldCols.length === numCols ? fieldCols : null;
@@ -8453,26 +8558,21 @@ function writeRegularTable(worksheet, vm, originRow, originCol, rangeTracker, al
         if (o.fontColor) extra.fontColor = o.fontColor;
         if (o.hyperlink) { extra.hyperlink = o.hyperlink; extra.hyperlinkText = o.hyperlinkText; }
         if (Object.keys(o.p).length) p = { ...p, ...o.p };
+        const img = st.imageAt(rowIdx, ci);                     // a picture: drawn over the (empty) cell later
+        if (img) {
+          dv = { value: null, nativeValue: null, formattedValue: "" };
+          st.placed.push({ row: r + 1 - 1, col: colAt(k), lastCol: lastAt(k), w: img.w, h: img.h, pic: img.pic,
+                           align: st.headerStyle(ci).hAlign === "center" || (st.bodyStyle(ci).hAlign === "center") ? "center" : "left" });
+        }
       }
       const pp = /\n/.test(text) ? { ...p, wrap: true } : p;    // wrap only on real line breaks
-      // a SuperTable field over several sheet columns is not merged (thousands of rows): a number sits in the
-      // field's last column (right-aligned at its edge), text in its first and runs on over the empty ones
-      let at = colAt(k);
-      if (st && lastAt(k) > colAt(k)) {
-        const native = dv ? (dv.nativeValue !== undefined ? dv.nativeValue : dv.value) : null;
-        if (pp.hAlign ? pp.hAlign === "right" : typeof native === "number") at = lastAt(k);
-      }
-      const cell = worksheet.getCell(r + 1, at + 1);
+      const cell = worksheet.getCell(r + 1, colAt(k) + 1);
       tfWriteCell(cell, dv, pp, extra);
       if (st && pp.indent) cell.alignment = { ...(cell.alignment || {}), indent: pp.indent };
       if (vm.slicerBinding && !cols[ci].isHeader) vm.slicerBinding.bindCell(cell, [row], ci);
-      if (st && lastAt(k) > colAt(k)) {                         // SuperTables: the span shares the cell's fill and border
-        const centred = pp.hAlign === "center";
-        for (let c = colAt(k); c <= lastAt(k); c++) {
-          const o = worksheet.getCell(r + 1, c + 1);
-          if (c !== at) o.style = cell.style;
-          if (centred) o.alignment = { ...(cell.alignment || {}), horizontal: "centerContinuous" };
-        }
+      if (st && lastAt(k) > colAt(k)) {                         // SuperTables: merged, checked only against its own row
+        for (let c = colAt(k) + 1; c <= lastAt(k); c++) worksheet.getCell(r + 1, c + 1).style = cell.style;
+        stMerge(worksheet, stMerges, r + 1, colAt(k) + 1, r + 1, lastAt(k) + 1);
       } else if (lastAt(k) > colAt(k)) {                         // a field over several columns: one merged cell
         for (let c = colAt(k) + 1; c <= lastAt(k); c++) worksheet.getCell(r + 1, c + 1).style = cell.style;
         worksheet.mergeCells(r + 1, colAt(k) + 1, r + 1, lastAt(k) + 1);
@@ -8482,6 +8582,10 @@ function writeRegularTable(worksheet, vm, originRow, originCol, rangeTracker, al
 
     const excelRow = worksheet.getRow(r + 1);
     if (rowHeightPx && !st) excelRow.height = Math.round(rowHeightPx * 0.75);   // only a height Tableau stores
+    if (st && st.imageCols.length) {                           // a row with a picture: tall enough for it
+      const h = order.reduce((m, ci) => Math.max(m, (st.imageAt(rowIdx, ci) || { h: 0 }).h), 0);
+      if (h) excelRow.height = Math.max(excelRow.height || 15, Math.ceil((h + 6) * 0.75 * 4) / 4);
+    }
     if (st && st.grouped) {                                    // SuperTables' row groups: Excel's outline, closed as saved
       const m = st.rowMeta(rowIdx);
       if (m.level) excelRow.outlineLevel = Math.min(7, m.level);
@@ -8496,6 +8600,7 @@ function writeRegularTable(worksheet, vm, originRow, originCol, rangeTracker, al
 
   if (marks.size) writeMarkBars(worksheet, marks, cols, rows, order, dataStartRow, colAt);
   if (st) {
+    stMergesDone(worksheet, stMerges);
     if (st.grouped) worksheet.properties.outlineProperties = { summaryBelow: false, summaryRight: false };
     st.bars.forEach((b, k) => {                                // "show background as a bar chart": Excel data bars
       if (!b || !totalRows) return;
@@ -17606,6 +17711,7 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
         // SuperTables (Infotopics): the grid as SuperTables shows it - columns, sort, groups, formats (export/supertables.js)
         const superTable = fmtModel ? superTableOf(fmtModel, sheet.name, dashboard.name, liveParams) : null;
         const superSpec = superTable ? applySuperTable(visualModel, superTable, summaryData) : null;
+        if (superSpec) await fetchSuperTableImages(superSpec);       // its image columns' pictures
         if (superSpec) console.log(`[SuperTables] ${sheet.name}: ${superSpec.summary}${superSpec.notes.length ? " - " + superSpec.notes.join("; ") : ""}`);
         if (FORMAT_CONFIG.debug) console.log(`[VisualSpec] ${sheet.name}:`, {
           available: visualModel.metadata.visualSpecAvailable,
@@ -18885,6 +18991,26 @@ setTableVisibleRows(placedItems);
       }));
       return true;
     };
+    // SuperTables' pictures (image columns): inside their cells and sized with them, so a collapsed row hides its
+    // picture; each distinct image is stored once
+    for (const item of adjustedItems.filter(it => it.vm && it.vm.superTable && it.vm.superTable.placed.length)) {
+      const ids = new Map();
+      for (const p of item.vm.superTable.placed) {
+        if (!ids.has(p.pic)) ids.set(p.pic, workbook.addImage({ base64: p.pic.base64, extension: p.pic.extension }));
+        let fieldPx = 0;
+        for (let c = p.col; c <= p.lastCol; c++) fieldPx += colPx(c);
+        const w = Math.min(p.w, Math.max(4, fieldPx - 4)), h = Math.round(p.h * w / p.w);
+        const x0 = p.align === "center" ? Math.max(0, (fieldPx - w) / 2) : Math.min(4, Math.max(0, fieldPx - w));
+        const at = x => { let c = p.col, dx = x; while (c < p.lastCol && dx >= colPx(c)) { dx -= colPx(c); c++; } return { c, dx }; };
+        const a = at(x0), b = at(x0 + w);
+        worksheet.addImage(ids.get(p.pic), /** @type {any} */ ({
+          tl: { nativeCol: a.c, nativeColOff: Math.round(a.dx * 9525), nativeRow: p.row, nativeRowOff: 3 * 9525 },
+          br: { nativeCol: b.c, nativeColOff: Math.round(b.dx * 9525), nativeRow: p.row, nativeRowOff: (3 + h) * 9525 },
+          editAs: "twoCell"
+        }));
+      }
+      console.log(`[SuperTables] ${item.name}: ${item.vm.superTable.placed.length} pictures in their cells`);
+    }
     let picturesAdded = 0;
     for (const item of adjustedItems.filter(it => it.image)) {
       const img = item.image, block = blockPx(item);
