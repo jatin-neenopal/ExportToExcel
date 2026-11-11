@@ -7737,6 +7737,14 @@ function tableColumnPx(vm) {
  * image is written as its link, HTML as its text, a sparkline is left out - each one named in the Conversion Report. */
 
 const SUPERTABLES_ADDIN = /super-?tables/i;
+/** a SuperTables instance: its id says so, or (a development / renamed build) an Infotopics extension with
+ *  SuperTables' settings - a column config and a datasheet or a saved grid */
+function isSuperTablesAddIn(a) {
+  if (!a) return false;
+  if (SUPERTABLES_ADDIN.test(a.id || "")) return true;
+  const s = a.settings || {};
+  return /appsfortableau|infotopics/i.test(a.id || "") && "columnConfig" in s && ("datasheet" in s || "gridState" in s || "stateParameter" in s);
+}
 
 /** the extension instance (add-in) in a dashboard zone or a worksheet pane: its id and settings
  *  (a viz extension's tags may carry Tableau's "_.fcp.VizExtensions.true..." prefix) */
@@ -7768,11 +7776,11 @@ function stJson(v, dflt) {
 function superTableOf(model, sheetName, dashboardName, liveParams) {
   if (!model || !model.sheets) return null;
   const sheet = model.sheets[sheetName];
-  let addIn = sheet && sheet.addIn && SUPERTABLES_ADDIN.test(sheet.addIn.id) ? sheet.addIn : null;
+  let addIn = sheet && isSuperTablesAddIn(sheet.addIn) ? sheet.addIn : null;
   let kind = "viz", zoneId = null;
   if (!addIn) {
     const dash = model.dashboards && model.dashboards[dashboardName];
-    const z = dash && dash.zones.find(q => q.addIn && SUPERTABLES_ADDIN.test(q.addIn.id) && !q.hidden &&
+    const z = dash && dash.zones.find(q => isSuperTablesAddIn(q.addIn) && !q.hidden &&
                                            (q.addIn.settings || {}).datasheet === sheetName);
     if (!z) return null;
     addIn = z.addIn; kind = "dashboard"; zoneId = z.id;
@@ -7809,7 +7817,7 @@ function superTableOf(model, sheetName, dashboardName, liveParams) {
 function reseatSuperTables(model, dashboardName, objects) {
   const dash = model && model.dashboards && model.dashboards[dashboardName];
   if (!dash || !objects) return objects;
-  const zones = dash.zones.filter(z => z.addIn && SUPERTABLES_ADDIN.test(z.addIn.id) && !z.hidden && (z.addIn.settings || {}).datasheet);
+  const zones = dash.zones.filter(z => isSuperTablesAddIn(z.addIn) && !z.hidden && (z.addIn.settings || {}).datasheet);
   if (!zones.length) return objects;
   const byId = new Map(objects.map(o => [String(o.id), o]));
   const seat = new Map();
@@ -13156,6 +13164,55 @@ const arrayFormulaCells = xml => xml.replace(/<c r="([A-Z]+\d+)"([^>]*)><f>(?=[^
 
 /** the package with every worksheet's <sheetPr> in schema order, row groups in Excel's own form and FILTER formulas
  * as array formulas (unchanged buffer when nothing moves) @param {ArrayBuffer | Uint8Array} buffer */
+/**
+ * A worksheet's <extLst> (Excel 2010 parts: data bars, slicers …) is its last element and there is one of them.
+ * ExcelJS writes it before <legacyDrawing> (the notes) when a sheet has both - Excel then reports a problem with the
+ * file's content and offers to repair it. The extLst children of <worksheet> are moved (merged) to the end; nested
+ * ones (inside a conditional format's rule) stay where they are.
+ * @param {string} xml @returns {string}
+ */
+function extLstLast(xml) {
+  const from = xml.indexOf("</sheetData>");
+  if (from < 0) return xml;
+  const tail = xml.slice(from);
+  const re = /<(\/?)([A-Za-z0-9:_.-]+)\b[^>]*?(\/?)>/g;
+  const segs = [];
+  let depth = 2, start = -1, m;                     // </sheetData> closes a child of <worksheet> (depth 2 → 1)
+  while ((m = re.exec(tail))) {
+    const [all, close, tag, self] = m;
+    if (tag === "worksheet") break;
+    if (close) {
+      depth--;
+      if (tag === "extLst" && depth === 1 && start >= 0) { segs.push([start, m.index + all.length]); start = -1; }
+      continue;
+    }
+    if (self) continue;
+    if (tag === "extLst" && depth === 1 && start < 0) start = m.index;
+    depth++;
+  }
+  if (!segs.length) return xml;
+  const end = tail.lastIndexOf("</worksheet>");
+  if (end < 0) return xml;
+  if (segs.length === 1 && !tail.slice(segs[0][1], end).trim()) return xml;   // already the last element
+  const inner = segs.map(([a, b]) => tail.slice(a, b).replace(/^<extLst[^>]*>/, "").replace(/<\/extLst>$/, "")).join("");
+  let out = tail;
+  for (let i = segs.length - 1; i >= 0; i--) out = out.slice(0, segs[i][0]) + out.slice(segs[i][1]);
+  const close = out.lastIndexOf("</worksheet>");
+  return xml.slice(0, from) + out.slice(0, close) + `<extLst>${inner}</extLst>` + out.slice(close);
+}
+
+/** every worksheet's <extLst> last (extLstLast); the file is rewritten only when one was out of place */
+async function fixExtLstOrder(buffer) {
+  const zip = await JSZip.loadAsync(buffer);
+  let changed = false;
+  for (const name of Object.keys(zip.files).filter(n => /^xl\/worksheets\/sheet\d+\.xml$/.test(n))) {
+    const xml = await zip.file(name).async("string");
+    const fixed = extLstLast(xml);
+    if (fixed !== xml) { zip.file(name, fixed); changed = true; console.log(`[Fix] ${name}: <extLst> moved to the end`); }
+  }
+  return changed ? zip.generateAsync({ type: "uint8array", compression: "DEFLATE" }) : buffer;
+}
+
 async function fixSheetProperties(buffer) {
   const zip = await JSZip.loadAsync(buffer);
   let changed = false;
@@ -17322,6 +17379,8 @@ async function exportToExcel() {
       }
     }
 
+    // Excel 2010 parts (data bars, slicers) last in each sheet - else Excel asks to repair the file
+    try { buffer = await fixExtLstOrder(buffer); } catch (err) { console.error("[Fix] extLst order", err); }
     const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
     const waitsForSave = offerSave(blob, exportFileName);           // saved by its own click, once complete
     // the panel's summary: every visual of every dashboard ("Dashboard / Sheet" when there are several), plus
