@@ -1879,7 +1879,7 @@ function tfCalcInfo(calc) {
 
 /* Raise when the parser reads something new: a workbook model remembered by an older version is then
    parsed again from its stored XML (ui/workbook-store.js), so an update reaches workbooks loaded before it. */
-const FORMAT_MODEL_VERSION = 13;
+const FORMAT_MODEL_VERSION = 14;   // 14: SuperTables (extension settings on zones and panes)
 
 /** @param {string} xmlString the .twb XML @returns {FormatModel} */
 function parseTableauFormatting(xmlString) {
@@ -2016,6 +2016,8 @@ function parseTableauFormatting(xmlString) {
       })).filter(e => e.field);
       const cl = tfKid(p, "customized-label");
       const labelRuns = cl ? tfParseRuns(tfKid(cl, "formatted-text")) : [];
+      const paneAddIn = tfParseAddIn(p);                          // a viz extension (SuperTables …): its settings
+      if (paneAddIn && !sheet.addIn) sheet.addIn = paneAddIn;
       const ct = tfKid(p, "customized-tooltip");                 // Tooltip editor text
       const tooltipRuns = ct ? tfParseRuns(tfKid(ct, "formatted-text")) : [];
       sheet.panes.push({
@@ -2132,6 +2134,7 @@ function parseTableauFormatting(xmlString) {
         // Center Image is on unless switched off (is-centered='0')
         centered: c.getAttribute("is-centered") ? c.getAttribute("is-centered") === "1" : undefined,
         url: c.getAttribute("url") || undefined,                   // image / button zones: the link it opens
+        addIn: tfParseAddIn(c),                                     // a dashboard extension: its id and settings
         parent,                                                     // the layout container it sits in
         style: tfZoneStyle(tfKid(c, "zone-style"))
       }));
@@ -7724,11 +7727,541 @@ function tableColumnPx(vm) {
  * @param {{ offset: number, span: number }[] | null} [fieldCols] each field's first column (from originCol) and how
  *   many columns it spans on the dashboard grid; null = one column per field
  */
+/* ═══ export/supertables.js ══════════════════════════════════════════════════════════════════════════════════════
+ * SuperTables (Infotopics): a dashboard or viz extension that draws a worksheet's data as an Excel-like grid. Its
+ * layout lives in the workbook - the extension's settings (columnConfig, calculatedColumns, combinedColumns,
+ * themeConfig …) and a saved grid state (column order / widths / hidden / pinned, sort, row groups, pivot) in its
+ * "gridState" setting or in the parameter named by "stateParameter". The export rebuilds that grid from the sheet's
+ * summary data: the dashboard extension reads a datasheet hidden in a 1 px zone (its data is drawn in the extension's
+ * zone), the viz extension is the worksheet itself. Images, sparklines and HTML are SuperTables' own rendering: an
+ * image is written as its link, HTML as its text, a sparkline is left out - each one named in the Conversion Report. */
+
+const SUPERTABLES_ADDIN = /super-?tables/i;
+
+/** the extension instance (add-in) in a dashboard zone or a worksheet pane: its id and settings
+ *  (a viz extension's tags may carry Tableau's "_.fcp.VizExtensions.true..." prefix) */
+function tfParseAddIn(el) {
+  if (!el) return undefined;
+  const a = Array.from(el.children || []).find(c => c.tagName === "add-in" || /\.\.\.add-in$/.test(c.tagName));
+  if (!a) return undefined;
+  const settings = {};
+  Array.from(a.getElementsByTagName("setting")).forEach(s => { settings[s.getAttribute("key")] = s.getAttribute("value"); });
+  return { id: a.getAttribute("add-in-id") || "", settings };
+}
+
+/** a setting holding JSON, maybe JSON inside a JSON string (a parameter's value) */
+function stJson(v, dflt) {
+  let x = v;
+  for (let i = 0; i < 3 && typeof x === "string"; i++) {
+    if (!x.trim()) return dflt;
+    try { x = JSON.parse(x); } catch (e) { return dflt; }
+  }
+  return x == null ? dflt : x;
+}
+
+/**
+ * The SuperTable a sheet is drawn as on this dashboard: the sheet's own viz extension, or the dashboard extension
+ * whose datasheet it is. null when it is neither.
+ * @param {FormatModel} model @param {string} sheetName @param {string} dashboardName
+ * @param {{ name: string, currentValue?: any }[]} [liveParams] the parameters as Tableau has them now (a saved view)
+ */
+function superTableOf(model, sheetName, dashboardName, liveParams) {
+  if (!model || !model.sheets) return null;
+  const sheet = model.sheets[sheetName];
+  let addIn = sheet && sheet.addIn && SUPERTABLES_ADDIN.test(sheet.addIn.id) ? sheet.addIn : null;
+  let kind = "viz", zoneId = null;
+  if (!addIn) {
+    const dash = model.dashboards && model.dashboards[dashboardName];
+    const z = dash && dash.zones.find(q => q.addIn && SUPERTABLES_ADDIN.test(q.addIn.id) && !q.hidden &&
+                                           (q.addIn.settings || {}).datasheet === sheetName);
+    if (!z) return null;
+    addIn = z.addIn; kind = "dashboard"; zoneId = z.id;
+  }
+  const s = addIn.settings || {};
+  // the layout is kept in the parameter chosen under "Store table layout in" (personal views), else in the
+  // workbook's settings (gridState)
+  let state = null;
+  if (s.stateParameter) {
+    const p = s.stateParameter;
+    const live = (liveParams || []).find(q => q && q.name === p);
+    const liveVal = live && live.currentValue ? (live.currentValue.value ?? live.currentValue.formattedValue) : null;
+    let saved = null;
+    for (const [k, f] of Object.entries(model.fields || {})) {
+      if (/^parameters\|/i.test(k) && f && (f.caption === p || k.slice(11) === String(p).toLowerCase())) { saved = f.value; break; }
+    }
+    state = [stJson(liveVal, null), stJson(saved, null)].find(x => x && Array.isArray(x.columnState)) || null;
+  }
+  if (!state) state = stJson(s.gridState, null);
+  return {
+    kind, zoneId, settings: s, state: state && typeof state === "object" ? state : {},
+    columnConfig: stJson(s.columnConfig, {}) || {},
+    calculated: stJson(s.calculatedColumns, []) || [],
+    combined: stJson(s.combinedColumns, []) || [],
+    theme: stJson(s.themeConfig, {}) || {}
+  };
+}
+
+/**
+ * The dashboard's objects with each SuperTables datasheet moved into its extension's zone (the datasheet itself sits
+ * in a 1 px zone to stay invisible): the export draws the datasheet's data where Tableau shows the SuperTable.
+ * Objects are copied as plain objects; the others are returned unchanged.
+ */
+function reseatSuperTables(model, dashboardName, objects) {
+  const dash = model && model.dashboards && model.dashboards[dashboardName];
+  if (!dash || !objects) return objects;
+  const zones = dash.zones.filter(z => z.addIn && SUPERTABLES_ADDIN.test(z.addIn.id) && !z.hidden && (z.addIn.settings || {}).datasheet);
+  if (!zones.length) return objects;
+  const byId = new Map(objects.map(o => [String(o.id), o]));
+  const seat = new Map();
+  zones.forEach(z => {
+    const ext = byId.get(String(z.id));
+    const sheet = z.addIn.settings.datasheet;
+    if (ext && ext.isVisible !== false && !seat.has(sheet)) seat.set(sheet, ext);
+  });
+  if (!seat.size) return objects;
+  return objects.map(o => {
+    if (o.type !== "worksheet" || !seat.has(o.name)) return o;
+    const ext = seat.get(o.name);
+    console.log(`[SuperTables] "${o.name}": drawn in the SuperTables zone (${Math.round(ext.size.width)} x ${Math.round(ext.size.height)} px)`);
+    return { id: o.id, name: o.name, type: o.type, worksheet: o.worksheet, isVisible: true, isFloating: ext.isFloating,
+             position: { x: ext.position.x, y: ext.position.y }, size: { width: ext.size.width, height: ext.size.height },
+             superTableSeat: true };
+  });
+}
+
+/** SuperTables' column id for a summary column: "SUM(Sales)" → "(Sales)", a dimension keeps its name */
+function stColId(fieldName) {
+  const m = /^[A-Z]+\((.*)\)$/.exec(String(fieldName || ""));
+  return m ? `(${m[1]})` : String(fieldName || "");
+}
+
+const ST_CURRENCY = { EUR: "€", USD: "$", GBP: "£", JPY: "¥", CNY: "¥", INR: "₹", AUD: "A$", CAD: "CA$", CHF: "CHF ", SEK: "kr ", NOK: "kr ", DKK: "kr ", BRL: "R$", ZAR: "R " };
+
+/** Excel number format for SuperTables' Intl-style format (style percent / currency / decimal, fraction digits, grouping) */
+function stNumFmt(f, integerValues) {
+  if (!f || typeof f !== "object") return null;
+  if (f.date) {
+    // moment-style tokens → Excel's (Excel reads "mm" after an hour as minutes)
+    return String(f.date).replace(/YYYY/g, "yyyy").replace(/YY/g, "yy").replace(/MMMM/g, "mmmm").replace(/MMM/g, "mmm")
+      .replace(/MM/g, "mm").replace(/M/g, "m").replace(/DD/g, "dd").replace(/D/g, "d").replace(/HH/g, "hh").replace(/A/g, "AM/PM");
+  }
+  if (/^(image|html)$/i.test(f.style || "")) return null;
+  const max = f.maximumFractionDigits !== undefined && f.maximumFractionDigits !== "" ? Number(f.maximumFractionDigits) : null;
+  const min = f.minimumFractionDigits !== undefined && f.minimumFractionDigits !== "" ? Number(f.minimumFractionDigits) : null;
+  const grouping = f.useGrouping !== false;
+  const digits = (d) => (d > 0 ? "." + "0".repeat(Math.min(d, 10)) : "");
+  const body = (d) => (grouping ? "#,##0" : "0") + digits(d);
+  if (f.style === "percent") return "0" + digits(max ?? min ?? 0) + "%";
+  if (f.style === "currency") {
+    const sym = ST_CURRENCY[String(f.currency || "").toUpperCase()] || "";
+    const fmt = (sym ? `"${sym}"` : "") + body(max ?? min ?? 2);
+    return `${fmt};-${fmt}`;
+  }
+  if (f.style === "decimal" || max !== null || min !== null || f.useGrouping !== undefined) {
+    return body(max ?? min ?? (integerValues ? 0 : 2));
+  }
+  return null;
+}
+
+/** a SuperTables formula ("SUM(Profit)/SUM(Sales)") → a function of an aggregate lookup; null when it cannot be read */
+function stCompileFormula(text) {
+  const src = String(text || "");
+  const toks = [];
+  const re = /\s*(?:([A-Za-z_]+)\s*\(\s*([^()]*?)\s*\)|(\d+(?:\.\d+)?)|([-+*/()]))/y;
+  let m, pos = 0;
+  while (pos < src.length) {
+    re.lastIndex = pos;
+    m = re.exec(src);
+    if (!m) { if (/^\s*$/.test(src.slice(pos))) break; return null; }
+    pos = re.lastIndex;
+    if (m[1]) toks.push({ t: "ref", fn: m[1].toUpperCase(), field: m[2].replace(/^\[|\]$/g, "") });
+    else if (m[3]) toks.push({ t: "num", v: Number(m[3]) });
+    else toks.push({ t: "op", v: m[4] });
+  }
+  let i = 0;
+  const peek = () => toks[i], next = () => toks[i++];
+  const expr = () => { let n = term(); while (peek() && peek().t === "op" && /[+-]/.test(peek().v)) { const o = next().v, r = term(); n = { o, a: n, b: r }; } return n; };
+  const term = () => { let n = unary(); while (peek() && peek().t === "op" && /[*/]/.test(peek().v)) { const o = next().v, r = unary(); n = { o, a: n, b: r }; } return n; };
+  const unary = () => { if (peek() && peek().t === "op" && peek().v === "-") { next(); return { o: "neg", a: unary() }; } return atom(); };
+  const atom = () => {
+    const t = next();
+    if (!t) throw new Error("end");
+    if (t.t === "num") return { v: t.v };
+    if (t.t === "ref") return { ref: t };
+    if (t.t === "op" && t.v === "(") { const n = expr(); const c = next(); if (!c || c.v !== ")") throw new Error(")"); return n; }
+    throw new Error("token");
+  };
+  let ast;
+  try { ast = expr(); if (i !== toks.length) return null; } catch (e) { return null; }
+  const refs = toks.filter(t => t.t === "ref");
+  const run = (n, get) => {
+    if (n.v !== undefined) return n.v;
+    if (n.ref) return get(n.ref.fn, n.ref.field);
+    if (n.o === "neg") { const a = run(n.a, get); return a == null ? null : -a; }
+    const a = run(n.a, get), b = run(n.b, get);
+    if (a == null || b == null) return null;
+    if (n.o === "+") return a + b;
+    if (n.o === "-") return a - b;
+    if (n.o === "*") return a * b;
+    return b === 0 ? null : a / b;
+  };
+  return { refs, eval: get => run(ast, get) };
+}
+
+/** #rrggbb → ARGB; null for anything else */
+function stArgb(c) {
+  const m = /^"?#?([0-9a-f]{6})"?$/i.exec(String(c || "").trim());
+  return m ? "FF" + m[1].toUpperCase() : null;
+}
+const stPt = px => { const n = parseFloat(px); return isFinite(n) && n > 0 ? Math.round(n * 0.75 * 2) / 2 : null; };
+
+/**
+ * Rebuild a visual model as its SuperTable: columns, rows (sorted, grouped with subtotals, or pivoted) and the
+ * formatting the writer applies (vm.superTable). Called after buildVisualModel; the view model becomes a plain
+ * table of the SuperTable's grid.
+ * @param {any} visualModel @param {any} st superTableOf(...) @param {{ columns: any[], data: any[][] }} summary
+ */
+function applySuperTable(visualModel, st, summary) {
+  const vm = visualModel.viewModel;
+  const notes = [];
+  const cfgOf = id => (st.columnConfig && st.columnConfig[id]) || {};
+  const dvVal = dv => (dv == null ? null : (dv.nativeValue !== undefined ? dv.nativeValue : dv.value));
+  const isNull = v => v === null || v === undefined || v === "%null%" || v === "";
+  // -- the data columns: each summary column under SuperTables' id, then calculated and combined columns
+  const cols = (summary.columns || []).map((c, i) => ({ id: stColId(c.fieldName), name: c.fieldName, dataType: c.dataType, src: i }));
+  const byName = new Map();
+  cols.forEach(c => { byName.set(c.name, c); if (!byName.has(c.id)) byName.set(c.id, c); });
+  const tableauFmt = new Map();                    // Tableau's own number format for a column, when SuperTables sets none
+  (vm.cols || []).forEach(c => {
+    if (!c.ref || !vm.fmt) return;
+    try { const p = vm.fmt.markCellStyle(c.ref); if (p && p.numFmt) tableauFmt.set(c.name, p.numFmt); } catch (e) { /* no format */ }
+  });
+  const rowsIn = (summary.data || []);
+  const valueOf = (row, c) => (c.calc ? c.calcAt(row) : c.combine ? c.combine(row) : dvVal(row[c.src]));
+  const colForRef = (fn, field) => byName.get(`${fn}(${field})`) || byName.get(`(${field})`) || byName.get(field) || null;
+  (st.calculated || []).forEach(k => {
+    const f = stCompileFormula(k.calculation);
+    if (!f || f.refs.some(r => !colForRef(r.fn, r.field))) { notes.push(`calculated column "${k.fieldName}" not rebuilt (${k.calculation})`); return; }
+    const c = { id: k.index, name: k.fieldName, dataType: "float", calc: f };
+    c.calcAt = row => f.eval((fn, field) => { const v = dvVal(row[colForRef(fn, field).src]); return typeof v === "number" ? v : null; });
+    c.calcAgg = members => f.eval((fn, field) => stAggregate(fn, members.map(r => dvVal(r[colForRef(fn, field).src]))));
+    cols.push(c); byName.set(c.id, c);
+  });
+  (st.combined || []).forEach(k => {
+    const parts = (((k.combinedColRenderParams || {}).data || {}).dataColumns || []).map(n => byName.get(n)).filter(Boolean);
+    if (!parts.length) return;
+    const c = { id: k.index, name: k.fieldName, dataType: "string", combine: row => parts.map(p => dvVal(row[p.src])).filter(v => !isNull(v)).join(" ") };
+    cols.push(c); byName.set(c.id, c);
+  });
+
+  // -- the grid state: order, visibility, widths, pinning, sorting, grouping, pivot
+  const stateCols = Array.isArray(st.state.columnState) ? st.state.columnState : [];
+  const known = new Map(stateCols.map((s, i) => [s.colId, { ...s, at: i }]));
+  const internal = id => /^(ag-Grid-|pivot_)/.test(id);
+  let shown = stateCols.length
+    ? stateCols.filter(s => !s.hide && !internal(s.colId))
+    : cols.map(c => ({ colId: c.id }));
+  const skippedCols = [];
+  shown = shown.filter(s => {
+    if (s.colId === "index") return true;
+    if (byName.has(s.colId)) return true;
+    skippedCols.push(/^sparkline_/.test(s.colId) ? "sparkline" : s.colId);
+    return false;
+  });
+  if (skippedCols.length) notes.push(`not drawn: ${[...new Set(skippedCols)].join(", ")}`);
+  const pinRank = s => (s.pinned === "left" ? 0 : s.pinned === "right" ? 2 : 1);
+  shown.sort((a, b) => pinRank(a) - pinRank(b) || (known.get(a.colId).at - known.get(b.colId).at));
+  const groupIds = stateCols.filter(s => s.rowGroup).sort((a, b) => (a.rowGroupIndex ?? 0) - (b.rowGroupIndex ?? 0))
+    .map(s => s.colId).filter(id => byName.has(id));
+  const pivotIds = st.state.pivotMode ? stateCols.filter(s => s.pivot).sort((a, b) => (a.pivotIndex ?? 0) - (b.pivotIndex ?? 0))
+    .map(s => s.colId).filter(id => byName.has(id)) : [];
+  const sorts = stateCols.filter(s => s.sort && byName.has(s.colId)).sort((a, b) => (a.sortIndex ?? 0) - (b.sortIndex ?? 0));
+  const labelOf = id => {
+    const c = byName.get(id) || { name: id };
+    const cfg = cfgOf(id);
+    if (cfg.hideHeaderName) return "";
+    if (cfg.fieldName) return cfg.fieldName;
+    if (id === "index") return "#";
+    if (c.calc || c.combine) return c.name;                       // a calculated / combined column: its own name
+    return id.replace(/^\((.*)\)$/, "$1") || c.name;
+  };
+  const numericCol = c => rowsIn.some(r => typeof valueOf(r, c) === "number");
+  // a column's aggregation in group / total rows: the one set in the grid, else (unless "show aggregation" is off)
+  // its default aggregation or a sum for a measure. A pivot shows only the grid's value columns (an aggFunc).
+  const aggOf = (id, pivot) => {
+    const s = known.get(id) || {};
+    const c = byName.get(id);
+    if (s.aggFunc) return c && c.calc ? "calc" : String(s.aggFunc).toLowerCase();
+    if (pivot || cfgOf(id).showAggregation === false) return null;
+    if (c && c.calc) return "calc";
+    const a = String(cfgOf(id).defaultAggregation || "").toLowerCase();
+    if (a) return a;
+    return c && numericCol(c) ? "sum" : null;
+  };
+
+  // -- rows: sorted detail rows, then grouped / pivoted
+  const cmp = (x, y) => (x === y ? 0 : isNull(x) ? 1 : isNull(y) ? -1
+    : typeof x === "number" && typeof y === "number" ? x - y : String(x).localeCompare(String(y), undefined, { numeric: true }));
+  let detail = rowsIn.slice();
+  if (sorts.length) {
+    detail.sort((r1, r2) => {
+      for (const s of sorts) {
+        const c = byName.get(s.colId);
+        const d = cmp(valueOf(r1, c), valueOf(r2, c));
+        if (d) return s.sort === "desc" ? -d : d;
+      }
+      return 0;
+    });
+  }
+
+  /** a value column of the grid: its id, label, width, format and how it aggregates */
+  const outCols = [];
+  const addOut = (o) => { outCols.push(o); return o; };
+  const groupMode = groupIds.length > 0;
+  if (groupMode) {
+    const w = (known.get("ag-Grid-AutoColumn") || {}).width || Math.max(...groupIds.map(id => (known.get(id) || {}).width || 160));
+    addOut({ id: "__group", label: groupIds.map(labelOf).join(" › "), width: w, group: true });
+  }
+  const valueIds = shown.map(s => s.colId).filter(id => !groupIds.includes(id) && !pivotIds.includes(id) && !(groupMode && id === "index"));
+  if (pivotIds.length) {
+    // pivot: one column per pivot value and value column, the values aggregated over the group's rows
+    const pv = byName.get(pivotIds[0]);
+    const keys = [...new Set(detail.map(r => valueOf(r, pv)).filter(v => !isNull(v)))].sort(cmp);
+    const valCols = valueIds.filter(id => aggOf(id, true));
+    if (pivotIds.length > 1) notes.push(`pivot on ${pivotIds.length} fields shown on the first (${labelOf(pivotIds[0])})`);
+    keys.forEach(key => valCols.forEach(id => {
+      const width = (known.get(`pivot_${pivotIds[0]}_${key}_${id}`) || known.get(id) || {}).width;
+      addOut({ id, label: valCols.length > 1 ? labelOf(id) : String(key), headerGroup: valCols.length > 1 ? String(key) : labelOf(pivotIds[0]),
+               width, pivotKey: key, pivotCol: pv });
+    }));
+  } else {
+    valueIds.forEach(id => addOut({ id, label: labelOf(id), width: (known.get(id) || {}).width, headerGroup: cfgOf(id).groupHeader || null }));
+  }
+  outCols.forEach(o => {
+    o.col = o.id === "__group" ? null : o.id === "index" ? { id: "index", index: true } : byName.get(o.id);
+    o.cfg = o.id === "__group" ? {} : cfgOf(o.id);
+    o.agg = o.id === "__group" ? null : aggOf(o.id, o.pivotKey !== undefined);
+  });
+
+  const rowsOut = [];                  // [{ kind, level, hidden, values: (number|string|null)[], src?: row, label? }]
+  const cellOf = (o, members, single) => {
+    if (o.id === "__group") return null;
+    const c = o.col;
+    if (!c) return null;
+    if (c.index) return single ? detail.indexOf(single) + 1 : null;
+    const rows = o.pivotKey !== undefined ? members.filter(r => cmp(valueOf(r, o.pivotCol), o.pivotKey) === 0) : members;
+    if (single && o.pivotKey === undefined) return valueOf(single, c);
+    if (!rows.length) return null;
+    if (c.calc) return c.calcAgg(rows);
+    if (!o.agg) return null;
+    return stAggregate(o.agg, rows.map(r => valueOf(r, c)));
+  };
+  const expandedAll = st.settings.autoExpandGroups === "true" || st.settings.showOpenedGroup === "true";
+  const expanded = st.state.expandedRowGroups && typeof st.state.expandedRowGroups === "object" ? st.state.expandedRowGroups : {};
+  const suppressCount = st.settings.groupSuppressCount !== "false";
+  if (groupMode) {
+    const walk = (members, depth, parentHidden, path) => {
+      const gc = byName.get(groupIds[depth]);
+      const gSort = sorts.find(s => s.colId === groupIds[depth]);
+      const keys = [...new Set(members.map(r => valueOf(r, gc)))].sort(cmp);
+      if (gSort && gSort.sort === "desc") keys.reverse();
+      keys.forEach(key => {
+        const sub = members.filter(r => cmp(valueOf(r, gc), key) === 0);
+        const id = [...path, String(key)];
+        const open = expandedAll || !!expanded[id.join("|")] || !!expanded[String(key)];
+        const label = `${isNull(key) ? "(blank)" : String(key)}${suppressCount ? "" : ` (${sub.length})`}`;
+        rowsOut.push({ kind: "group", level: depth, hidden: parentHidden, label,
+                       values: outCols.map(o => (o.id === "__group" ? label : cellOf(o, sub, null))) });
+        const childHidden = parentHidden || !open;
+        if (depth + 1 < groupIds.length) walk(sub, depth + 1, childHidden, id);
+        else if (!pivotIds.length) sub.forEach(r => rowsOut.push({ kind: "detail", level: depth + 1, hidden: childHidden, src: r,
+                                                                    values: outCols.map(o => cellOf(o, [r], r)) }));
+      });
+    };
+    walk(detail, 0, false, []);
+    if (st.settings.showGroupIncludeTotalFooter === "true") {
+      rowsOut.push({ kind: "total", level: 0, hidden: false, label: "Total",
+                     values: outCols.map(o => (o.id === "__group" ? "Total" : cellOf(o, detail, null))) });
+    }
+  } else if (pivotIds.length) {
+    rowsOut.push({ kind: "total", level: 0, hidden: false, values: outCols.map(o => cellOf(o, detail, null)) });
+  } else {
+    detail.forEach(r => rowsOut.push({ kind: "detail", level: 0, hidden: false, src: r, values: outCols.map(o => cellOf(o, [r], r)) }));
+  }
+
+  // -- formats: SuperTables' own, else Tableau's; dates as Excel dates
+  const excelDate = v => {
+    if (v instanceof Date) return (v.getTime() - Date.UTC(1899, 11, 30)) / 86400000;
+    const m = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?/.exec(String(v));
+    if (!m) return null;
+    return (Date.UTC(+m[1], +m[2] - 1, +m[3], +(m[4] || 0), +(m[5] || 0), +(m[6] || 0)) - Date.UTC(1899, 11, 30)) / 86400000;
+  };
+  outCols.forEach((o, k) => {
+    const isDate = o.col && !o.col.index && /^date/i.test(o.col.dataType || "");
+    const nums = rowsOut.map(r => r.values[k]).filter(v => typeof v === "number");
+    o.isDate = isDate;
+    o.numFmt = stNumFmt(o.cfg.format, nums.every(v => Number.isInteger(v)));
+    if (isDate && !o.numFmt) o.numFmt = /date-?time/i.test(o.col.dataType || "") ? "yyyy-mm-dd hh:mm" : "yyyy-mm-dd";
+    if (!o.numFmt && o.col && tableauFmt.has(o.col.name)) o.numFmt = tableauFmt.get(o.col.name);
+    if (!o.numFmt && nums.length) o.numFmt = nums.every(v => Number.isInteger(v)) ? "#,##0" : "#,##0.00";
+    o.style = String((o.cfg.format || {}).style || "").toLowerCase();
+    if (o.style === "image") notes.push(`"${o.label || o.id}": images written as their links`);
+    if (o.style === "html") notes.push(`"${o.label || o.id}": HTML written as its text`);
+  });
+  const cellDv = (o, v) => {
+    if (isNull(v)) return { value: null, nativeValue: null, formattedValue: "" };
+    if (o.isDate) { const n = excelDate(v); if (n !== null) return { value: n, nativeValue: n, formattedValue: String(v) }; }
+    if (o.style === "html") { const t = String(v).replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim(); return { value: t, nativeValue: t, formattedValue: t }; }
+    return { value: v, nativeValue: v, formattedValue: typeof v === "number" ? String(v) : String(v) };
+  };
+
+  // -- colours (bounds below / in / above, gradient, a dimension's value map) and bars
+  const colorOf = (o, rowIdx) => {
+    const c = o.cfg.color;
+    if (!c || typeof c !== "object") return null;
+    const rowObj = rowsOut[rowIdx];
+    const k = outCols.indexOf(o);
+    let v = rowObj.values[k];
+    if (c.valueColumn && c.valueColumn !== o.id) {
+      const vc = byName.get(c.valueColumn);
+      if (!vc || !rowObj.src) return null;
+      v = valueOf(rowObj.src, vc);
+    }
+    if (c.type === "discrete" || (c.map && typeof c.map === "object" && Object.keys(c.map).length)) {
+      return c.map && !isNull(v) ? stArgb(c.map[String(v)]) : null;
+    }
+    if (typeof v !== "number") return null;
+    const lo = c.lowerBound !== undefined && c.lowerBound !== "" ? Number(c.lowerBound) : null;
+    const hi = c.upperBound !== undefined && c.upperBound !== "" ? Number(c.upperBound) : null;
+    const below = stArgb(c.belowColor), inside = stArgb(c.inColor), above = stArgb(c.aboveColor);
+    if (c.gradient === true && below && (above || inside)) {
+      const nums = columnNums(k);
+      const a = lo ?? nums.reduce((m, x) => Math.min(m, x), Infinity), b = hi ?? nums.reduce((m, x) => Math.max(m, x), -Infinity);
+      const t = b > a ? Math.max(0, Math.min(1, (v - a) / (b - a))) : 0;
+      return stMixColors(below, above || inside, t);
+    }
+    if (lo !== null && v <= lo && below) return below;
+    if (hi !== null && v >= hi && above) return above;
+    return inside;
+  };
+  const theme = st.theme || {};
+  const fontSize = stPt(theme.fontSize) || 9;
+  const headerSize = stPt(theme.headerFontSize) || fontSize;
+  const stripe = st.settings.showOddRowStyling === "false" ? null : (stArgb(theme.oddRowBackgroundColor) || "FFF6F6F6");
+  const headerBg = stArgb(theme.headerBackgroundColor) || "FFF5F5F5";
+  const headerFg = stArgb(theme.headerForegroundColor || theme.headerFontColor) || "FF181D1F";
+  const fg = stArgb(theme.foregroundColor || theme.fontColor) || "FF181D1F";
+  const font = st.settings.useTableauFont === "true" ? undefined : "Arial";
+  const bars = outCols.map(o => {
+    const c = o.cfg.color || {};
+    if (!(o.cfg.showRowAsBarChart === true || c.barChart === true)) return null;
+    return { color: stArgb(c.inColor) || stArgb(c.aboveColor) || "FF2A95BF",
+             min: c.autoMin === false && c.lowerBound !== "" && c.lowerBound !== undefined ? Number(c.lowerBound) : null,
+             max: c.autoMax === false && c.upperBound !== "" && c.upperBound !== undefined ? Number(c.upperBound) : null };
+  });
+  if (bars.some(Boolean)) notes.push("bars drawn as Excel data bars");
+  const linkOf = (o, rowObj) => {
+    if (!rowObj.src) return null;
+    const v = rowObj.values[outCols.indexOf(o)];
+    if (o.cfg.urlExpression) {
+      const url = String(o.cfg.urlExpression).replace(/<([^<>]+)>/g, (m, n) => { const c = byName.get(n); return c ? String(valueOf(rowObj.src, c) ?? "") : ""; });
+      if (/^(https?:|mailto:|ftp:)/i.test(url)) return { url, text: o.style === "image" ? (o.label || "link") : String(v ?? url) };
+      if (/@/.test(url) && !/\s/.test(url)) return { url: `mailto:${url}`, text: String(v ?? url) };
+    }
+    if (o.style === "image" && /^https?:/i.test(String(v || ""))) return { url: String(v), text: "image" };
+    if (o.style === "html") { const m = /href=["']([^"']+)["']/i.exec(String(v || "")); if (m) return { url: m[1], text: cellDv(o, v).formattedValue }; }
+    return null;
+  };
+
+  // odd-row styling: every second detail row as shown (rows inside closed groups do not count)
+  let shownDetail = 0;
+  rowsOut.forEach(r => { if (r.kind === "detail" && !r.hidden) r.striped = (++shownDetail % 2 === 0); });
+  // gradient bounds per column, computed once
+  const numsOf = new Map();
+  const columnNums = k => { if (!numsOf.has(k)) numsOf.set(k, rowsOut.map(r => r.values[k]).filter(x => typeof x === "number")); return numsOf.get(k); };
+
+  // -- the view model the table writer draws
+  const scaleW = px => (px ? Math.max(24, Math.round(px)) : null);
+  vm.cols = outCols.map(o => ({ name: o.id === "__group" ? "Group" : o.id, label: o.label, dataType: o.col && o.col.dataType || "string",
+                                ref: null, isHeader: false, zoneWidthPx: scaleW(o.width) }));
+  vm.rows = rowsOut.map(r => r.values.map((v, k) => cellDv(outCols[k], v)));
+  vm.order = outCols.map((_, i) => i);
+  vm.headerOrder = [];
+  vm.showHeaderRow = true;
+  if (st.kind === "dashboard") vm.showTitle = false;
+  vm.markTable = false;
+  vm.cellFill = null;
+  vm.lossless = true;
+  vm.superTable = {
+    kind: st.kind, notes, grouped: groupMode,
+    headerGroups: (() => {
+      const g = [];
+      outCols.forEach((o, k) => {
+        const name = o.headerGroup || null;
+        if (name && g.length && g[g.length - 1].name === name && g[g.length - 1].to === k - 1) g[g.length - 1].to = k;
+        else if (name) g.push({ name, from: k, to: k });
+      });
+      return g;
+    })(),
+    headerStyle: ci => ({ fontName: font, fontSize: headerSize, bold: true, color: headerFg, bgColor: headerBg,
+                          hAlign: outCols[ci].cfg.alignment || (outCols[ci].numFmt && !outCols[ci].isDate && outCols[ci].id !== "__group" ? "right" : "left"),
+                          wrap: true }),
+    bodyStyle: ci => ({ fontName: font, fontSize, color: fg, numFmt: outCols[ci].numFmt || undefined,
+                        hAlign: outCols[ci].cfg.alignment || (outCols[ci].isDate ? "left" : undefined) }),
+    /** a cell's style and fill: group / total rows bold, stripes on odd detail rows, conditional colours, links */
+    cell: (rowIdx, ci) => {
+      const row = rowsOut[rowIdx], o = outCols[ci];
+      const out = { p: {}, fill: undefined };
+      if (row.kind !== "detail") { out.p.bold = true; out.fill = "FFF0F0F0"; }
+      else if (stripe && row.striped) out.fill = stripe;
+      if (o.id === "__group" && row.level) out.p.indent = row.level;
+      const color = colorOf(o, rowIdx);
+      if (color) {
+        if (o.cfg.colorCellBackground !== false) out.fill = color; else out.fontColor = color;
+        const cc = o.cfg.color || {};
+        if (cc.useCustomFontColor && stArgb(cc.customFontColor)) out.fontColor = stArgb(cc.customFontColor);
+      }
+      const link = linkOf(o, row);
+      if (link) { out.hyperlink = link.url; out.hyperlinkText = link.text; out.p.underline = true; out.p.color = "FF0563C1"; }
+      return out;
+    },
+    rowMeta: rowIdx => rowsOut[rowIdx],
+    bars,
+    summary: `${outCols.length} column${outCols.length === 1 ? "" : "s"}` + (groupMode ? `, grouped by ${groupIds.map(labelOf).join(" › ")}` : "")
+           + (pivotIds.length ? `, pivoted on ${labelOf(pivotIds[0])}` : "") + (sorts.length ? `, sorted by ${sorts.map(s => labelOf(s.colId)).join(", ")}` : "")
+  };
+  visualModel.type = VISUAL_TYPES.TABLE;
+  return vm.superTable;
+}
+
+/** SuperTables' aggregations over a column's values */
+function stAggregate(fn, values) {
+  const f = String(fn || "").toLowerCase();
+  const nums = values.filter(v => typeof v === "number" && isFinite(v));
+  if (f === "count") return values.filter(v => v !== null && v !== undefined && v !== "").length;
+  if (f === "countd" || f === "distinct") return new Set(values.filter(v => v !== null && v !== undefined && v !== "").map(String)).size;
+  if (!nums.length) return null;
+  if (f === "avg" || f === "average" || f === "mean") return nums.reduce((a, b) => a + b, 0) / nums.length;
+  if (f === "min") return Math.min(...nums);
+  if (f === "max") return Math.max(...nums);
+  if (f === "first") return nums[0];
+  if (f === "last") return nums[nums.length - 1];
+  return nums.reduce((a, b) => a + b, 0);                           // sum (and "calc" columns handled by their formula)
+}
+
+/** two ARGB colours mixed: t = 0 → a, 1 → b */
+function stMixColors(a, b, t) {
+  const ch = (c, i) => parseInt(c.slice(2 + 2 * i, 4 + 2 * i), 16);
+  const h = n => Math.round(n).toString(16).padStart(2, "0").toUpperCase();
+  return "FF" + [0, 1, 2].map(i => h(ch(a, i) + (ch(b, i) - ch(a, i)) * t)).join("");
+}
+
 function writeRegularTable(worksheet, vm, originRow, originCol, rangeTracker, allTablesInfo, colWidths, exactWidths,
                                   visibleRows = ROW_GROUP_THRESHOLD, fieldCols = null, zoneW = 0) {
   let r = originRow;
   const C = originCol;
   const { fmt, cols, rows, order } = vm;
+  const st = vm.superTable || null;                           // a SuperTable: its own look (export/supertables.js)
   const numCols = order.length;
   // field k's first sheet column, and its last: a field crossed by another block's column edge spans both columns
   const grid = fieldCols && fieldCols.length === numCols ? fieldCols : null;
@@ -7760,7 +8293,7 @@ function writeRegularTable(worksheet, vm, originRow, originCol, rangeTracker, al
 
   // ── Header row: Measure Names aliases / captions; hidden field labels stay blank ──
   const styles = {};
-  order.forEach(ci => { styles[ci] = cols[ci].isHeader ? fmt.headerCellStyle(cols[ci].ref) : fmt.markCellStyle(cols[ci].ref); });
+  order.forEach(ci => { styles[ci] = st ? st.bodyStyle(ci) : cols[ci].isHeader ? fmt.headerCellStyle(cols[ci].ref) : fmt.markCellStyle(cols[ci].ref); });
   // ── Column widths: Tableau pixel width → text-box header width → content estimate ──
   const widthOf = {};
   order.forEach((ci, k) => {
@@ -7785,6 +8318,20 @@ function writeRegularTable(worksheet, vm, originRow, originCol, rangeTracker, al
 
   const numericCol = ci => { const d = rows.find(rw => !tfIsNull(rw[ci])); return !!d && typeof (d[ci].nativeValue !== undefined ? d[ci].nativeValue : d[ci].value) === "number"; };
 
+  // SuperTables' column groups (and a pivot's values): a band above the headers
+  if (st && st.headerGroups.length && vm.showHeaderRow) {
+    st.headerGroups.forEach(g => {
+      const hp = { ...st.headerStyle(order[g.from]), hAlign: "center" };
+      const cell = worksheet.getCell(r + 1, colAt(g.from) + 1);
+      tfWriteCell(cell, { formattedValue: g.name, value: g.name }, hp,
+                  { fill: hp.bgColor, border: { bottom: { style: "thin", color: { argb: "FFBDC3C7" } } } });
+      for (let c = colAt(g.from) + 1; c <= lastAt(g.to); c++) worksheet.getCell(r + 1, c + 1).style = cell.style;
+      if (lastAt(g.to) > colAt(g.from)) worksheet.mergeCells(r + 1, colAt(g.from) + 1, r + 1, lastAt(g.to) + 1);
+      rangeTracker.update(r, lastAt(g.to));
+    });
+    r++;
+  }
+
   let headerRow = r;
   if (vm.showHeaderRow) {
     const span = headerRowSpan(vm);
@@ -7792,7 +8339,7 @@ function writeRegularTable(worksheet, vm, originRow, originCol, rangeTracker, al
     const merges = [];
     order.forEach((ci, k) => {
       const info = cols[ci];
-      let p = fmt.fieldLabelStyle(info.ref, !info.isHeader);
+      let p = st ? st.headerStyle(ci) : fmt.fieldLabelStyle(info.ref, !info.isHeader);
       if (info.labelProps) p = tfMerge(p, { bold: false }, info.labelProps);      // dashboard text box font
       // header label sits over its column: same alignment as the values (numbers right, text left)
       if (!p.hAlign) p.hAlign = info.isHeader ? styles[ci].hAlign : (styles[ci].hAlign || (numericCol(ci) ? "right" : "left"));
@@ -7800,7 +8347,8 @@ function writeRegularTable(worksheet, vm, originRow, originCol, rangeTracker, al
       const cell = worksheet.getCell(r + 1, colAt(k) + 1);
       tfWriteCell(cell, { formattedValue: info.label, value: info.label }, p, {
         fill: p.bgColor || tableBg || undefined,
-        border: { bottom: borderSide(rowDiv), right: k < numCols - 1 ? borderSide(colDiv) : undefined }
+        border: st ? { bottom: { style: "thin", color: { argb: "FFBDC3C7" } } }
+                   : { bottom: borderSide(rowDiv), right: k < numCols - 1 ? borderSide(colDiv) : undefined }
       });
       // a dashboard text box as the header: its runs (fonts, sizes, line breaks) as rich text
       if (info.labelRuns && info.labelRuns.length && !info.headerCovered) {
@@ -7834,7 +8382,7 @@ function writeRegularTable(worksheet, vm, originRow, originCol, rangeTracker, al
   const dataStartRow = r;
   const totalRows = rows.length;
   const keepRows = Math.max(ROW_GROUP_THRESHOLD, visibleRows || 0);   // rows a block beside the table uses stay visible
-  const needsGrouping = FORMAT_CONFIG.groupOverflowRows && totalRows > keepRows;
+  const needsGrouping = FORMAT_CONFIG.groupOverflowRows && totalRows > keepRows && !(st && st.grouped);
   const level = Math.max(1, rowDiv.level || 1);
   const rowHeightPx = fmt.rowHeightPx();
 
@@ -7890,11 +8438,34 @@ function writeRegularTable(worksheet, vm, originRow, originCol, rangeTracker, al
           p = { ...p, underline: true, color: p.explicitColor ? p.color : "FF0563C1" };
         }
       }
+      if (st) {                                                 // SuperTables: its fills, colours, links, group rows
+        const o = st.cell(rowIdx, ci);
+        extra.fill = o.fill;
+        extra.border = { bottom: { style: "thin", color: { argb: "FFE5E8EC" } } };
+        if (o.fontColor) extra.fontColor = o.fontColor;
+        if (o.hyperlink) { extra.hyperlink = o.hyperlink; extra.hyperlinkText = o.hyperlinkText; }
+        if (Object.keys(o.p).length) p = { ...p, ...o.p };
+      }
       const pp = /\n/.test(text) ? { ...p, wrap: true } : p;    // wrap only on real line breaks
-      const cell = worksheet.getCell(r + 1, colAt(k) + 1);
+      // a SuperTable field over several sheet columns is not merged (thousands of rows): a number sits in the
+      // field's last column (right-aligned at its edge), text in its first and runs on over the empty ones
+      let at = colAt(k);
+      if (st && lastAt(k) > colAt(k)) {
+        const native = dv ? (dv.nativeValue !== undefined ? dv.nativeValue : dv.value) : null;
+        if (pp.hAlign ? pp.hAlign === "right" : typeof native === "number") at = lastAt(k);
+      }
+      const cell = worksheet.getCell(r + 1, at + 1);
       tfWriteCell(cell, dv, pp, extra);
+      if (st && pp.indent) cell.alignment = { ...(cell.alignment || {}), indent: pp.indent };
       if (vm.slicerBinding && !cols[ci].isHeader) vm.slicerBinding.bindCell(cell, [row], ci);
-      if (lastAt(k) > colAt(k)) {                                // a field over several columns: one merged cell
+      if (st && lastAt(k) > colAt(k)) {                         // SuperTables: the span shares the cell's fill and border
+        const centred = pp.hAlign === "center";
+        for (let c = colAt(k); c <= lastAt(k); c++) {
+          const o = worksheet.getCell(r + 1, c + 1);
+          if (c !== at) o.style = cell.style;
+          if (centred) o.alignment = { ...(cell.alignment || {}), horizontal: "centerContinuous" };
+        }
+      } else if (lastAt(k) > colAt(k)) {                         // a field over several columns: one merged cell
         for (let c = colAt(k) + 1; c <= lastAt(k); c++) worksheet.getCell(r + 1, c + 1).style = cell.style;
         worksheet.mergeCells(r + 1, colAt(k) + 1, r + 1, lastAt(k) + 1);
       }
@@ -7902,7 +8473,12 @@ function writeRegularTable(worksheet, vm, originRow, originCol, rangeTracker, al
     });
 
     const excelRow = worksheet.getRow(r + 1);
-    if (rowHeightPx) excelRow.height = Math.round(rowHeightPx * 0.75);   // only a height Tableau stores
+    if (rowHeightPx && !st) excelRow.height = Math.round(rowHeightPx * 0.75);   // only a height Tableau stores
+    if (st && st.grouped) {                                    // SuperTables' row groups: Excel's outline, closed as saved
+      const m = st.rowMeta(rowIdx);
+      if (m.level) excelRow.outlineLevel = Math.min(7, m.level);
+      if (m.hidden) excelRow.hidden = true;
+    }
     if (needsGrouping && rowIdx >= keepRows) {
       excelRow.outlineLevel = 1;
       excelRow.hidden = true;
@@ -7911,6 +8487,16 @@ function writeRegularTable(worksheet, vm, originRow, originCol, rangeTracker, al
   });
 
   if (marks.size) writeMarkBars(worksheet, marks, cols, rows, order, dataStartRow, colAt);
+  if (st) {
+    if (st.grouped) worksheet.properties.outlineProperties = { summaryBelow: false, summaryRight: false };
+    st.bars.forEach((b, k) => {                                // "show background as a bar chart": Excel data bars
+      if (!b || !totalRows) return;
+      const cfvo = [b.min !== null ? { type: "num", value: b.min } : { type: "min" }, b.max !== null ? { type: "num", value: b.max } : { type: "max" }];
+      const ref = `${worksheet.getCell(dataStartRow + 1, colAt(k) + 1).address}:${worksheet.getCell(dataStartRow + totalRows, colAt(k) + 1).address}`;
+      worksheet.addConditionalFormatting(/** @type {any} */ ({ ref, rules: [{ type: "dataBar", gradient: false, border: false, minLength: 0, maxLength: 100,
+        cfvo, color: { argb: b.color }, negativeFillColor: { argb: b.color }, negativeBarColorSameAsPositive: true, axisPosition: "auto" }] }));
+    });
+  }
 
   if (needsGrouping) {
     const hiddenCount = totalRows - keepRows;
@@ -8768,7 +9354,7 @@ async function refreshChecks(dashboard) {
 const DEFAULT_BACKEND_URL = "";      // production: the hosted Worker URL, e.g. "https://export-to-excel-backend.<account>.workers.dev"
 const EXTENSION_VERSION = "2.2.0";
 /** which build made an export: shown in the Conversion Report and the panel (old cached files are easy to spot) */
-const EXTENSION_BUILD = "2026-11-10 summary-only";
+const EXTENSION_BUILD = "2026-11-11 summary-only supertables";
 console.info(`[Export to Excel] v${EXTENSION_VERSION} · build ${EXTENSION_BUILD}`);
 /** Links shown with the licence status (leave "" to hide). */
 const PRODUCT_LINKS = { buy: "", help: "" };
@@ -11011,6 +11597,11 @@ function conversionOf(visualModel, semantics) {
   const renderer = visualModel.renderer;
   const why = String(visualModel.statusReason || "");
   if (visualModel.status === "warning" && /injection failed/i.test(why)) return make(STRATEGY.FAILED, "Nothing", why);
+  const stSpec = visualModel.viewModel && visualModel.viewModel.superTable;
+  if (stSpec) return make(STRATEGY.CONSTRUCTED, "SuperTables grid as cells",
+    `Excel has no SuperTables: its grid rebuilt from its saved layout - ${stSpec.summary}` +
+    (stSpec.notes.length ? `. Not as in SuperTables: ${stSpec.notes.join("; ")}` : ""),
+    stSpec.notes.some(x => !/data bars/.test(x)) ? "Medium" : undefined);
   if (visualModel.gauge) return make(STRATEGY.CONSTRUCTED, "Gauge: doughnut dial + pie needle",
     "Excel has no gauge chart: built Excel's standard way – the dial's bands as a doughnut (the rest of the circle see-through), " +
     "the needle as a thin pie slice, both turned to the dial's start; positions recomputed from the workbook's calculations, " +
@@ -16799,11 +17390,20 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
       : "⚠ Workbook not loaded – charts can only be recognised from the workbook, so they may be exported as tables. Click 📁 Load Workbook, then export again";
     if (workbookWarning) console.warn("[Export]", workbookWarning);
 
-    const layoutMap = buildLayoutMap(dashboard.objects || [], titleMap);
+    // SuperTables (dashboard extension): its datasheet sits in a 1 px zone; it is drawn in the extension's zone
+    const dashObjects = reseatSuperTables(fmtModel, dashboard.name, dashboard.objects || []);
+    const layoutMap = buildLayoutMap(dashObjects, titleMap);
+    // a SuperTable's saved view may live in a parameter: its value as Tableau has it now
+    let liveParams = null;
+    const stUsesParam = fmtModel && ((fmtModel.dashboards[dashboard.name] || { zones: [] }).zones.some(z => z.addIn && (z.addIn.settings || {}).stateParameter) ||
+      (dashboard.objects || []).some(o => o.type === "worksheet" && ((fmtModel.sheets[o.name] || {}).addIn || { settings: {} }).settings.stateParameter));
+    if (stUsesParam && target.dashboard && typeof target.dashboard.getParametersAsync === "function") {
+      try { liveParams = await target.dashboard.getParametersAsync(); } catch (e) { liveParams = null; }
+    }
 
     // ── 1. Build DZV map ── (a sheet squeezed into a 1 px zone is a common way to hide it: not shown either)
     const dzvMap = {};
-    (dashboard.objects || [])
+    dashObjects
       .filter(obj => obj.type === "worksheet")
       .forEach(obj => {
         const tiny = obj.size && (obj.size.width < 8 || obj.size.height < 8);
@@ -16944,6 +17544,10 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
         // ── NEW: rebuild the visual table (pivot, merge, sort, visible columns, title) ──
         const visualModel = buildVisualModel(fmtModel, sheet.name, summaryData,
           { dashboardName: dashboard.name, displayName: visualName, visualSpec, visualSpecError, layout });
+        // SuperTables (Infotopics): the grid as SuperTables shows it - columns, sort, groups, formats (export/supertables.js)
+        const superTable = fmtModel ? superTableOf(fmtModel, sheet.name, dashboard.name, liveParams) : null;
+        const superSpec = superTable ? applySuperTable(visualModel, superTable, summaryData) : null;
+        if (superSpec) console.log(`[SuperTables] ${sheet.name}: ${superSpec.summary}${superSpec.notes.length ? " - " + superSpec.notes.join("; ") : ""}`);
         if (FORMAT_CONFIG.debug) console.log(`[VisualSpec] ${sheet.name}:`, {
           available: visualModel.metadata.visualSpecAvailable,
           keys: visualModel.metadata.visualSpecKeys,
@@ -16958,8 +17562,10 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
                         !(FORMAT_CONFIG.crosstabKeepsSparklines && isSparklineZone(layout));
         visualModel.crosstab = asTable;
         let renderDecision = chooseVisualRenderer(visualModel, { asTable });
+        if (superSpec) renderDecision = { renderer: "cell", status: "success",
+          reason: `SuperTables ${superTable.kind} extension, rebuilt as its table: ${superSpec.summary}${superSpec.notes.length ? ` (${superSpec.notes.join("; ")})` : ""}` };
         // a pie or donut (one or two layers): drawn the way Tableau draws it – slices, labels, hole, tooltips
-        if (!asTable && fmtModel && FORMAT_CONFIG.nativeCharts && visualModel.viewModel.fmt.pieLayers()) {
+        if (!asTable && !superSpec && fmtModel && FORMAT_CONFIG.nativeCharts && visualModel.viewModel.fmt.pieLayers()) {
           const pieOpts = {
             dashboardName: dashboard.name, selectedTables: await fetchSelectedMarks(sheet),
             dataOf: name => (allSheetsData.find(x => x.sheet.name === name) || { data: null }).data
@@ -16978,7 +17584,7 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
           }
         }
         // a gauge drawn with map layers / polygons: rebuilt from its calculations as Excel's doughnut + needle gauge
-        if (!asTable && fmtModel && FORMAT_CONFIG.nativeCharts && !visualModel.pie &&
+        if (!asTable && !superSpec && fmtModel && FORMAT_CONFIG.nativeCharts && !visualModel.pie &&
             ((fmtModel.sheets[sheet.name] || {}).panes || []).some(p => /^polygon$/i.test(p.markClass || ""))) {
           const gauge = buildMapGaugeModel(fmtModel, sheet.name, summaryData);
           if (gauge) { visualModel.gauge = gauge; renderDecision = VISUAL_RENDERERS.chart; }
@@ -17064,7 +17670,7 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
         }
         const isGraphic = visualModel.renderer === "excel-chart" || visualModel.renderer === "tableau-image";
         const box = isGraphic ? graphicBox(layout, vm) : null;
-        const isKPI = !isGraphic && isKPIViewModel(vm);
+        const isKPI = !isGraphic && !vm.superTable && isKPIViewModel(vm);
         // KPI tile: rebuilt from its Tableau label and filling its zone (null = drawn as a label | value table)
         const kpiCard = isKPI ? buildKpiCard(vm, sheet.name, layout) : null;
         const kpiW = kpiCard && layout && layout.widthPx ? Math.max(kpiCard.tiles.length, layout.gridRight - layout.gridCol) : null;
@@ -18030,7 +18636,9 @@ setTableVisibleRows(placedItems);
     /** @type {ReportVisual[]} */
     const reportVisuals = [];
     adjustedItems.filter(it => it.type === "worksheet" && it.visualModel).forEach(item => {
-      const semantics = describeVisual(item.visualModel, fmtModel);
+      let semantics = describeVisual(item.visualModel, fmtModel);
+      const stSpec = item.visualModel.viewModel && item.visualModel.viewModel.superTable;
+      if (stSpec) semantics = { ...semantics, visual: `SuperTables (${stSpec.kind} extension)` };
       const conversion = conversionOf(item.visualModel, semantics);
       reportVisuals.push({ worksheet: item.name, semantics, ...conversion });
       const status = visualStatuses.find(entry => entry.worksheet === item.name);
