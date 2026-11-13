@@ -8004,6 +8004,9 @@ function applySuperTable(visualModel, st, summary) {
   const pivotIds = st.state.pivotMode ? stateCols.filter(s => s.pivot).sort((a, b) => (a.pivotIndex ?? 0) - (b.pivotIndex ?? 0))
     .map(s => s.colId).filter(id => byName.has(id)) : [];
   const sorts = stateCols.filter(s => s.sort && byName.has(s.colId)).sort((a, b) => (a.sortIndex ?? 0) - (b.sortIndex ?? 0));
+  // every sort the grid saved, also on its group column and on pivot result columns: these order the groups
+  const groupSorts = stateCols.filter(s => s.sort && (byName.has(s.colId) || /^(ag-Grid-AutoColumn|pivot_)/.test(s.colId)))
+    .sort((a, b) => (a.sortIndex ?? 0) - (b.sortIndex ?? 0));
   const labelOf = id => {
     const c = byName.get(id) || { name: id };
     const cfg = cfgOf(id);
@@ -8031,6 +8034,13 @@ function applySuperTable(visualModel, st, summary) {
   const cmp = (x, y) => (x === y ? 0 : isNull(x) ? 1 : isNull(y) ? -1
     : typeof x === "number" && typeof y === "number" ? x - y : String(x).localeCompare(String(y), undefined, { numeric: true }));
   let detail = rowsIn.slice();
+  // the grid's saved filters (column filters, advanced filter): rows the SuperTable hides are not exported
+  const filtered = stFilterRows(detail, st.state, id => byName.get(id), valueOf, labelOf);
+  if (filtered.applied.length) {
+    detail = filtered.rows;
+    notes.push(`filtered as saved: ${filtered.applied.join("; ")}`);
+  }
+  if (filtered.skipped.length) notes.push(`filter not applied: ${filtered.skipped.join("; ")} - all its rows exported`);
   if (sorts.length) {
     detail.sort((r1, r2) => {
       for (const s of sorts) {
@@ -8048,20 +8058,45 @@ function applySuperTable(visualModel, st, summary) {
   const groupMode = groupIds.length > 0;
   if (groupMode) {
     const w = (known.get("ag-Grid-AutoColumn") || {}).width || Math.max(...groupIds.map(id => (known.get(id) || {}).width || 160));
-    addOut({ id: "__group", label: groupIds.map(labelOf).join(" › "), width: w, group: true });
+    const autoCfg = cfgOf("ag-Grid-AutoColumn");
+    const groupLabel = autoCfg.fieldName || (st.settings.showGroupMultiColumn === "true" ? groupIds.map(labelOf).join(" › ") : "Group");
+    addOut({ id: "__group", label: groupLabel, width: w, group: true });
   }
   const valueIds = shown.map(s => s.colId).filter(id => !groupIds.includes(id) && !pivotIds.includes(id) && !(groupMode && id === "index"));
   if (pivotIds.length) {
     // pivot: one column per pivot value and value column, the values aggregated over the group's rows
     const pv = byName.get(pivotIds[0]);
-    const keys = [...new Set(detail.map(r => valueOf(r, pv)).filter(v => !isNull(v)))].sort(cmp);
     const valCols = valueIds.filter(id => aggOf(id, true));
+    const prefix = `pivot_${pivotIds[0]}_`;
+    let keys = [...new Set(detail.map(r => valueOf(r, pv)).filter(v => !isNull(v)))].sort(cmp);
+    // the pivot columns' order as the grid saved it ("pivot_<field>_<key>_<value column>"), unless SuperTables is
+    // told not to store it; keys it has not seen yet follow, sorted
+    if (st.settings.doNotStorePivotOrder !== "true") {
+      const saved = [];
+      stateCols.forEach(s => {
+        if (!String(s.colId).startsWith(prefix)) return;
+        const rest = String(s.colId).slice(prefix.length);
+        const vid = valCols.find(id => rest.endsWith(`_${id}`));
+        const k = vid ? rest.slice(0, rest.length - vid.length - 1) : rest;
+        if (!saved.includes(k)) saved.push(k);
+      });
+      const rank = k => { const i = saved.indexOf(String(k)); return i < 0 ? saved.length : i; };
+      if (saved.length) keys = keys.slice().sort((a, b) => rank(a) - rank(b));
+    }
     if (pivotIds.length > 1) notes.push(`pivot on ${pivotIds.length} fields shown on the first (${labelOf(pivotIds[0])})`);
+    // ag-Grid's pivot header: the key above, the value column below with its aggregation ("Profit Ratio (Calc)")
+    const pivotLabel = id => {
+      const a = (known.get(id) || {}).aggFunc;
+      return a && st.settings.showAggFuncInHeader !== "false" ? `${labelOf(id)} (${a})` : labelOf(id);
+    };
+    let hiddenPivot = 0;
     keys.forEach(key => valCols.forEach(id => {
-      const width = (known.get(`pivot_${pivotIds[0]}_${key}_${id}`) || known.get(id) || {}).width;
-      addOut({ id, label: valCols.length > 1 ? labelOf(id) : String(key), headerGroup: valCols.length > 1 ? String(key) : labelOf(pivotIds[0]),
-               width, pivotKey: key, pivotCol: pv });
+      const saved = known.get(`${prefix}${key}_${id}`);
+      if (saved && saved.hide === true) { hiddenPivot++; return; }
+      addOut({ id, label: pivotLabel(id), headerGroup: String(key), width: (saved || known.get(id) || {}).width,
+               pivotKey: key, pivotCol: pv, stateId: `${prefix}${key}_${id}` });
     }));
+    if (hiddenPivot) notes.push(`${hiddenPivot} pivot column${hiddenPivot === 1 ? "" : "s"} hidden in the grid, left out`);
   } else {
     valueIds.forEach(id => addOut({ id, label: labelOf(id), width: (known.get(id) || {}).width, headerGroup: cfgOf(id).groupHeader || null }));
   }
@@ -8084,29 +8119,63 @@ function applySuperTable(visualModel, st, summary) {
     if (!o.agg) return null;
     return stAggregate(o.agg, rows.map(r => valueOf(r, c)));
   };
-  const expandedAll = st.settings.autoExpandGroups === "true" || st.settings.showOpenedGroup === "true";
+  // which groups are open: all ("expand groups automatically", maybe but the last N levels), else those the grid
+  // saved open (expandedRowGroups)
+  const autoExpand = st.settings.autoExpandGroups === "true" || st.settings.showOpenedGroup === "true";
+  const butLast = st.settings.autoExpandGroups === "true" ? Math.max(0, parseInt(st.settings.expandAllButLastNGroups, 10) || 0) : 0;
   const expanded = st.state.expandedRowGroups && typeof st.state.expandedRowGroups === "object" ? st.state.expandedRowGroups : {};
+  const openKeys = Object.keys(expanded).filter(k => expanded[k]);
+  const savedOpen = pairs => stGroupSavedOpen(openKeys, pairs);
   const suppressCount = st.settings.groupSuppressCount !== "false";
+  const footers = st.settings.showGroupIncludeFooter === "true";
+  const openedNames = [];
   if (groupMode) {
-    const walk = (members, depth, parentHidden, path) => {
+    const walk = (members, depth, parentHidden, pairs) => {
       const gc = byName.get(groupIds[depth]);
-      const gSort = sorts.find(s => s.colId === groupIds[depth]);
-      const keys = [...new Set(members.map(r => valueOf(r, gc)))].sort(cmp);
-      if (gSort && gSort.sort === "desc") keys.reverse();
-      keys.forEach(key => {
-        const sub = members.filter(r => cmp(valueOf(r, gc), key) === 0);
-        const id = [...path, String(key)];
-        const open = expandedAll || !!expanded[id.join("|")] || !!expanded[String(key)];
+      // the groups in the order of their first row - as the SuperTable shows them - unless the grid sorts them
+      const groups = new Map();
+      members.forEach(r => { const k = valueOf(r, gc); const g = groups.get(k); if (g) g.push(r); else groups.set(k, [r]); });
+      const entries = [...groups].map(([key, rows]) => ({ key, rows }));
+      if (groupSorts.length) {
+        entries.sort((A, B) => {
+          for (const s of groupSorts) {
+            let d = 0;
+            if (s.colId === groupIds[depth] || /^ag-Grid-AutoColumn/.test(s.colId)) d = cmp(A.key, B.key);
+            else {
+              const o = outCols.find(x => (x.stateId ? x.stateId === s.colId : x.id === s.colId && x.pivotKey === undefined));
+              if (o && (o.agg || (o.col && o.col.calc))) d = cmp(cellOf(o, A.rows, null), cellOf(o, B.rows, null));
+            }
+            if (d) return s.sort === "desc" ? -d : d;
+          }
+          return 0;
+        });
+      }
+      entries.forEach(({ key, rows: sub }) => {
+        const here = [...pairs, [groupIds[depth], key]];
+        const hasChildren = depth + 1 < groupIds.length || !pivotIds.length;
+        const open = hasChildren && ((autoExpand && depth < groupIds.length - butLast) || savedOpen(here));
+        if (open && !autoExpand && !parentHidden) openedNames.push(here.map(p => (isNull(p[1]) ? "(blank)" : String(p[1]))).join(" › "));
         const label = `${isNull(key) ? "(blank)" : String(key)}${suppressCount ? "" : ` (${sub.length})`}`;
+        const totals = outCols.map(o => (o.id === "__group" ? label : cellOf(o, sub, null)));
+        // with group footers an open group's totals move to its footer ("Total Furniture"), a closed one shows them
+        const withFooter = footers && hasChildren;
         rowsOut.push({ kind: "group", level: depth, hidden: parentHidden, label,
-                       values: outCols.map(o => (o.id === "__group" ? label : cellOf(o, sub, null))) });
+                       values: withFooter && open ? outCols.map(o => (o.id === "__group" ? label : null)) : totals });
         const childHidden = parentHidden || !open;
-        if (depth + 1 < groupIds.length) walk(sub, depth + 1, childHidden, id);
+        if (depth + 1 < groupIds.length) walk(sub, depth + 1, childHidden, here);
         else if (!pivotIds.length) sub.forEach(r => rowsOut.push({ kind: "detail", level: depth + 1, hidden: childHidden, src: r,
                                                                     values: outCols.map(o => cellOf(o, [r], r)) }));
+        if (withFooter) {
+          const fl = `Total ${isNull(key) ? "(blank)" : String(key)}`;
+          // an open group's footer sits on the group's own level: shown under its rows, and still shown when
+          // the group is closed in Excel; a closed group's footer stays inside it, hidden with its rows
+          rowsOut.push({ kind: "footer", level: open ? depth : depth + 1, indent: depth + 1, hidden: open ? parentHidden : childHidden, label: fl,
+                         values: outCols.map((o, k) => (o.id === "__group" ? fl : totals[k])) });
+        }
       });
     };
     walk(detail, 0, false, []);
+    if (openedNames.length) notes.push(`groups open as saved: ${openedNames.slice(0, 8).join(", ")}${openedNames.length > 8 ? ` … ${openedNames.length} in all` : ""}`);
     if (st.settings.showGroupIncludeTotalFooter === "true") {
       rowsOut.push({ kind: "total", level: 0, hidden: false, label: "Total",
                      values: outCols.map(o => (o.id === "__group" ? "Total" : cellOf(o, detail, null))) });
@@ -8115,6 +8184,11 @@ function applySuperTable(visualModel, st, summary) {
     rowsOut.push({ kind: "total", level: 0, hidden: false, values: outCols.map(o => cellOf(o, detail, null)) });
   } else {
     detail.forEach(r => rowsOut.push({ kind: "detail", level: 0, hidden: false, src: r, values: outCols.map(o => cellOf(o, [r], r)) }));
+    // the grand total row SuperTables pins under a flat table: the aggregated columns, "Total" in the first one
+    if (st.settings.showGroupIncludeTotalFooter === "true" && outCols.some(o => o.agg || (o.col && o.col.calc))) {
+      rowsOut.push({ kind: "total", level: 0, hidden: false, label: "Total",
+                     values: outCols.map((o, k) => (k === 0 && !o.agg && !(o.col && o.col.calc) ? "Total" : cellOf(o, detail, null))) });
+    }
   }
 
   // -- formats: SuperTables' own, else Tableau's; dates as Excel dates
@@ -8253,9 +8327,10 @@ function applySuperTable(visualModel, st, summary) {
     cell: (rowIdx, ci) => {
       const row = rowsOut[rowIdx], o = outCols[ci];
       const out = { p: {}, fill: undefined };
-      if (row.kind !== "detail") { out.p.bold = true; out.fill = "FFF0F0F0"; }
+      if (row.kind === "footer" || row.kind === "total") out.p.bold = true;
       else if (stripe && row.striped) out.fill = stripe;
-      if (o.id === "__group" && row.level) out.p.indent = row.level;
+      const indent = row.indent ?? row.level;
+      if (o.id === "__group" && indent) out.p.indent = indent;
       const color = bars[ci] ? null : colorOf(o, rowIdx);          // a bar column: the cell is the bar
       if (color) {
         if (o.cfg.colorCellBackground !== false) out.fill = color; else out.fontColor = color;
@@ -8283,6 +8358,7 @@ function applySuperTable(visualModel, st, summary) {
     placed: [],                                    // pictures to anchor once the columns are sized: { row, col, lastCol, w, h, pic }
     summary: `${outCols.length} column${outCols.length === 1 ? "" : "s"}` + (groupMode ? `, grouped by ${groupIds.map(labelOf).join(" › ")}` : "")
            + (pivotIds.length ? `, pivoted on ${labelOf(pivotIds[0])}` : "") + (sorts.length ? `, sorted by ${sorts.map(s => labelOf(s.colId)).join(", ")}` : "")
+           + (filtered.applied.length ? `, filtered (${detail.length.toLocaleString("en-US")} of ${rowsIn.length.toLocaleString("en-US")} rows)` : "")
   };
   visualModel.type = VISUAL_TYPES.TABLE;
   return vm.superTable;
@@ -8301,6 +8377,143 @@ function stAggregate(fn, values) {
   if (f === "first") return nums[0];
   if (f === "last") return nums[nums.length - 1];
   return nums.reduce((a, b) => a + b, 0);                           // sum (and "calc" columns handled by their formula)
+}
+
+/**
+ * Is this group saved open? SuperTables stores ag-Grid's expanded groups as "<key>:::<field>:::<level>:::<node id>"
+ * (node id "row-group-Category-Furniture-Sub-Category-Chairs"); older states as the path joined by "|" or the key.
+ * @param {string[]} openKeys the keys saved true @param {[string, any][]} pairs [field, key] from the top level down
+ */
+function stGroupSavedOpen(openKeys, pairs) {
+  if (!openKeys.length) return false;
+  const txt = v => (v === null || v === undefined || v === "%null%" ? "" : String(v));
+  const depth = pairs.length - 1;
+  const [field, key] = pairs[depth];
+  const nodeId = "row-group-" + pairs.map(([f, k]) => `${f}-${txt(k)}`).join("-");
+  const pathKey = pairs.map(p => txt(p[1])).join("|");
+  return openKeys.some(k => {
+    if (k === nodeId || k === pathKey || (depth === 0 && k === txt(key))) return true;
+    const p = k.split(":::");
+    if (p.length >= 4) return p.slice(3).join(":::") === nodeId;
+    return p.length === 3 && p[0] === txt(key) && p[1] === field && Number(p[2]) === depth;
+  });
+}
+
+/**
+ * The rows a SuperTable's saved filters keep - ag-Grid's filter model (text, number, date and set filters, two
+ * conditions joined by AND / OR, multi filters) and its advanced filter - with each filter in words and those that
+ * cannot be read (their rows all kept).
+ * @param {any[][]} rows @param {any} state the grid state @param {(id: string) => any} colOf
+ * @param {(row: any[], col: any) => any} valueOf @param {(id: string) => string} labelOf
+ */
+function stFilterRows(rows, state, colOf, valueOf, labelOf) {
+  const applied = [], skipped = [], tests = [];
+  const name = id => labelOf(id) || String(id).replace(/^\((.*)\)$/, "$1");
+  const fm = state && state.filterModel && typeof state.filterModel === "object" ? state.filterModel : {};
+  Object.entries(fm).forEach(([colId, model]) => {
+    if (!model) return;
+    const c = colOf(colId);
+    if (!c) { skipped.push(`${name(colId)} (not in the sheet's data)`); return; }
+    const t = stFilterTest(model);
+    if (!t) { skipped.push(`${name(colId)} (${model.filterType || model.type || "unknown"} filter)`); return; }
+    tests.push(r => t.test(valueOf(r, c)));
+    applied.push(`${name(colId)} ${t.text}`);
+  });
+  const adv = state && state.advancedFilterModel;
+  if (adv && typeof adv === "object") {
+    const t = stAdvancedTest(adv, colOf, valueOf, name);
+    if (t) { tests.push(t.test); applied.push(t.text); } else skipped.push("advanced filter");
+  }
+  return { rows: tests.length ? rows.filter(r => tests.every(f => f(r))) : rows, applied, skipped };
+}
+
+/** a day number (days since 1970, UTC) of a date value or "YYYY-MM-DD[ hh:mm:ss]"; null when it is not a date */
+function stDayNumber(v) {
+  if (v instanceof Date) return Math.floor(v.getTime() / 86400000);
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(v ?? ""));
+  return m ? Math.floor(Date.UTC(+m[1], +m[2] - 1, +m[3]) / 86400000) : null;
+}
+
+/** one ag-Grid filter as a test of a cell value and its words; null when it cannot be read */
+function stFilterTest(m) {
+  if (!m || typeof m !== "object") return null;
+  const blank = v => v === null || v === undefined || v === "" || v === "%null%";
+  if (m.filterType === "multi") {                       // several filters on one column: all must pass
+    const parts = (m.filterModels || []).filter(Boolean).map(stFilterTest);
+    if (!parts.length || parts.some(p => !p)) return null;
+    return { test: v => parts.every(p => p.test(v)), text: parts.map(p => p.text).join(" and ") };
+  }
+  const conds = Array.isArray(m.conditions) ? m.conditions : m.condition1 ? [m.condition1, m.condition2].filter(Boolean) : null;
+  if (conds && m.operator) {                           // two conditions joined by AND / OR
+    const parts = conds.map(c => stFilterTest({ filterType: m.filterType, ...c }));
+    if (!parts.length || parts.some(p => !p)) return null;
+    const or = String(m.operator).toUpperCase() === "OR";
+    return { test: v => (or ? parts.some(p => p.test(v)) : parts.every(p => p.test(v))), text: parts.map(p => p.text).join(or ? " or " : " and ") };
+  }
+  const type = m.type;
+  if (type === "blank" || type === "empty") return { test: blank, text: "is blank" };
+  if (type === "notBlank") return { test: v => !blank(v), text: "is not blank" };
+  const ft = m.filterType || (Array.isArray(m.values) ? "set" : typeof m.filter === "number" ? "number" : m.dateFrom !== undefined ? "date" : "text");
+  if (ft === "set") {
+    if (!Array.isArray(m.values)) return null;
+    const keyOf = v => (blank(v) ? "\u0000" : v instanceof Date ? v.toISOString().slice(0, 10) : String(v));
+    const keep = new Set(m.values.map(x => (x === null ? "\u0000" : String(x))));
+    const shown = m.values.slice(0, 5).map(x => (x === null ? "(blank)" : `"${x}"`)).join(", ");
+    return { test: v => keep.has(keyOf(v)), text: `is ${m.values.length === 1 ? shown : `one of ${shown}${m.values.length > 5 ? ` … (${m.values.length})` : ""}`}` };
+  }
+  if (ft === "text") {
+    const f = String(m.filter ?? "").toLowerCase();
+    const ops = { contains: x => x.includes(f), notContains: x => !x.includes(f), equals: x => x === f, notEqual: x => x !== f,
+                  startsWith: x => x.startsWith(f), endsWith: x => x.endsWith(f) };
+    const words = { contains: "contains", notContains: "does not contain", equals: "is", notEqual: "is not", startsWith: "begins with", endsWith: "ends with" };
+    const op = ops[type || "contains"];
+    if (!op) return null;
+    // ag-Grid compares lower case; an empty cell passes only "does not contain" / "is not"
+    return { test: v => (blank(v) ? type === "notContains" || type === "notEqual" : op(String(v).toLowerCase())),
+             text: `${words[type || "contains"]} "${m.filter}"` };
+  }
+  if (ft === "number") {
+    const a = Number(m.filter), b = Number(m.filterTo);
+    const ops = { equals: x => x === a, notEqual: x => x !== a, lessThan: x => x < a, lessThanOrEqual: x => x <= a,
+                  greaterThan: x => x > a, greaterThanOrEqual: x => x >= a, inRange: x => x > a && x < b };
+    const words = { equals: `= ${a}`, notEqual: `≠ ${a}`, lessThan: `< ${a}`, lessThanOrEqual: `≤ ${a}`, greaterThan: `> ${a}`,
+                    greaterThanOrEqual: `≥ ${a}`, inRange: `between ${a} and ${b}` };
+    const op = ops[type || "equals"];
+    if (!op || !isFinite(a) || (type === "inRange" && !isFinite(b))) return null;
+    return { test: v => { const x = typeof v === "number" ? v : blank(v) ? NaN : Number(v); return isFinite(x) && op(x); }, text: words[type || "equals"] };
+  }
+  if (ft === "date") {                                  // compared by day, as ag-Grid's date filter does
+    const a = stDayNumber(m.dateFrom), b = stDayNumber(m.dateTo);
+    const ops = { equals: x => x === a, notEqual: x => x !== a, lessThan: x => x < a, lessThanOrEqual: x => x <= a,
+                  greaterThan: x => x > a, greaterThanOrEqual: x => x >= a, inRange: x => x > a && x < b };
+    const d1 = String(m.dateFrom || "").slice(0, 10), d2 = String(m.dateTo || "").slice(0, 10);
+    const words = { equals: `on ${d1}`, notEqual: `not on ${d1}`, lessThan: `before ${d1}`, lessThanOrEqual: `on or before ${d1}`,
+                    greaterThan: `after ${d1}`, greaterThanOrEqual: `on or after ${d1}`, inRange: `between ${d1} and ${d2}` };
+    const op = ops[type || "equals"];
+    if (!op || a === null || (type === "inRange" && b === null)) return null;
+    return { test: v => { const x = stDayNumber(v); return x !== null && op(x); }, text: words[type || "equals"] };
+  }
+  return null;
+}
+
+/** ag-Grid's advanced filter (conditions joined by AND / OR, each on one column) as a row test; null when unreadable */
+function stAdvancedTest(m, colOf, valueOf, name) {
+  if (!m || typeof m !== "object") return null;
+  if (m.filterType === "join") {
+    const parts = (m.conditions || []).map(x => stAdvancedTest(x, colOf, valueOf, name));
+    if (!parts.length || parts.some(p => !p)) return null;
+    const or = String(m.type).toUpperCase() === "OR";
+    return { test: r => (or ? parts.some(p => p.test(r)) : parts.every(p => p.test(r))), text: `(${parts.map(p => p.text).join(or ? " or " : " and ")})` };
+  }
+  const c = m.colId && colOf(m.colId);
+  if (!c) return null;
+  if (m.filterType === "boolean") {
+    const want = m.type === "true";
+    if (m.type !== "true" && m.type !== "false") return null;
+    return { test: r => { const v = valueOf(r, c); return (v === true || String(v).toLowerCase() === "true") === want; }, text: `${name(m.colId)} is ${m.type}` };
+  }
+  const t = stFilterTest(m);
+  return t ? { test: r => t.test(valueOf(r, c)), text: `${name(m.colId)} ${t.text}` } : null;
 }
 
 /** two ARGB colours mixed: t = 0 → a, 1 → b */
@@ -8591,7 +8804,7 @@ function writeRegularTable(worksheet, vm, originRow, originCol, rangeTracker, al
       if (m.level) excelRow.outlineLevel = Math.min(7, m.level);
       if (m.hidden) excelRow.hidden = true;
     }
-    if (needsGrouping && rowIdx >= keepRows) {
+    if (needsGrouping && rowIdx >= keepRows && !(st && st.rowMeta(rowIdx).kind === "total")) {
       excelRow.outlineLevel = 1;
       excelRow.hidden = true;
     }
@@ -8612,7 +8825,7 @@ function writeRegularTable(worksheet, vm, originRow, originCol, rangeTracker, al
   }
 
   if (needsGrouping) {
-    const hiddenCount = totalRows - keepRows;
+    const hiddenCount = totalRows - keepRows - (st && st.rowMeta(totalRows - 1).kind === "total" ? 1 : 0);
     const noteCell = worksheet.getCell(r + 1, C + 1);
     noteCell.value = `${hiddenCount} rows are hidden — use the row group controls [+] / [-] on the left to expand or collapse`;
     noteCell.font = { italic: true, size: 9, color: { argb: "FF888888" } };
@@ -9467,7 +9680,7 @@ async function refreshChecks(dashboard) {
 const DEFAULT_BACKEND_URL = "";      // production: the hosted Worker URL, e.g. "https://export-to-excel-backend.<account>.workers.dev"
 const EXTENSION_VERSION = "2.2.0";
 /** which build made an export: shown in the Conversion Report and the panel (old cached files are easy to spot) */
-const EXTENSION_BUILD = "2026-11-11 summary-only supertables";
+const EXTENSION_BUILD = "2026-11-13 summary-only supertables 2";
 console.info(`[Export to Excel] v${EXTENSION_VERSION} · build ${EXTENSION_BUILD}`);
 /** Links shown with the licence status (leave "" to hide). */
 const PRODUCT_LINKS = { buy: "", help: "" };
@@ -13125,9 +13338,15 @@ function fixRowOutlines(xml) {
   const above = /<outlinePr\b[^>]*\ssummaryBelow="(0|false)"/.test(xml);
   // hidden grouped rows → their summary rows (the row just before / after each unbroken run)
   const grouped = new Set(tags.filter(t => levelOf(t) && /\shidden="1"/.test(t)).map(numOf));
+  const rowInfo = new Map(tags.map(t => [numOf(t), { level: levelOf(t), hidden: /\shidden="1"/.test(t) }]));
   const summaries = new Set();
   grouped.forEach(r => {
-    if (above && !grouped.has(r - 1) && r > 1) summaries.add(r - 1);
+    if (above && !grouped.has(r - 1) && r > 1) {
+      // LibreOffice reads collapsed="1" as closing the group ABOVE the row, whatever summaryBelow says: right
+      // under an open (shown) deeper group the flag is left out - Excel shows the hidden rows the same either way
+      const s = r - 1, prev = rowInfo.get(s - 1), cur = rowInfo.get(s) || { level: 0 };
+      if (!(prev && !prev.hidden && prev.level > cur.level)) summaries.add(s);
+    }
     if (!above && !grouped.has(r + 1)) summaries.add(r + 1);
   });
   const present = new Set(tags.map(numOf));
