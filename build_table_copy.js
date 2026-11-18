@@ -1719,8 +1719,13 @@ function tfZoneStyle(el) {
   const m = tfNum(f.margin) || 0;
   const side = s => (f[`margin-${s}`] !== undefined ? tfNum(f[`margin-${s}`]) || 0 : m);
   const margin = Object.keys(f).some(k => /^margin/.test(k)) ? { t: side("top"), r: side("right"), b: side("bottom"), l: side("left") } : undefined;
+  // a see-through background ("#aa55ff18": 9 % of the colour over what is behind it) keeps its opacity: the cells
+  // show the colour blended with the containers / dashboard shading under it (backgroundPlan), not the full colour
+  const bgHex = String(f["background-color"] || "").trim().replace(/^#/, "");
+  const alpha = /^[0-9a-f]{8}$/i.test(bgHex) ? parseInt(bgHex.slice(6), 16) / 255 : 1;
   const style = tfDefined({
     bgColor: tfArgb(f["background-color"]) || undefined,
+    bgAlpha: alpha > 0 && alpha < 1 ? alpha : undefined,
     borderColor: tfArgb(f["border-color"]) || undefined,
     borderStyle: f["border-style"] || undefined,
     borderWidth: tfNum(f["border-width"]),
@@ -7491,6 +7496,71 @@ function viewModelHeight(vm) {
   return (vm.showTitle ? 1 : 0) + headerRowSpan(vm) + vm.rows.length + (grouped ? 1 : 0);
 }
 
+/**
+ * Cards: a horizontal layout container whose children are blocks, or vertical stacks of blocks (a KPI's title, value
+ * and comparison beside its chart). Tableau draws its children level, but their first blocks can round onto
+ * neighbouring sheet rows (the title sits a padding lower than the chart): they start on one row here, the lower one,
+ * so the card moves down as a whole and its chart stays beside its own title. Items within one row of each other only.
+ * @param {any[]} items placed items (gridRow, layout.id) – their tops are levelled in place
+ * @param {any[]} zones the dashboard's zones (id, parent, type, param)
+ * @returns {{ rowZoneOf: (item: any) => string | null }} the nearest horizontal container holding an item
+ */
+function levelCardRows(items, zones) {
+  const byId = new Map((zones || []).map(z => [String(z.id), z]));
+  const parentOf = id => { const z = byId.get(id); return z && z.parent !== undefined && z.parent !== null ? String(z.parent) : null; };
+  const isFlow = (z, dir) => !!z && z.type === "layout-flow" && (!dir || z.param === dir);
+  const isLayout = z => !!z && /^layout/.test(z.type || "");
+  const idOf = it => (it.layout && it.layout.id !== undefined && it.layout.id !== null ? String(it.layout.id) : null);
+  const rowZoneOf = it => {
+    for (let id = idOf(it), n = 0; id && n < 50; n++) {
+      const p = parentOf(id);
+      if (p && isFlow(byId.get(p), "horz")) return p;
+      id = p;
+    }
+    return null;
+  };
+  const kids = new Map();
+  (zones || []).forEach(z => {
+    const p = z.parent !== undefined && z.parent !== null ? String(z.parent) : null;
+    if (p) { if (!kids.has(p)) kids.set(p, []); kids.get(p).push(String(z.id)); }
+  });
+  // a card's child: a block, or a vertical stack of blocks only
+  const plainChild = id => {
+    const z = byId.get(id);
+    if (!isLayout(z)) return true;
+    return isFlow(z, "vert") && (kids.get(id) || []).every(k => !isLayout(byId.get(k)));
+  };
+  const branchOf = (it, card) => {                  // the card's child an item sits in
+    for (let id = idOf(it), n = 0; id && n < 50; n++) {
+      const p = parentOf(id);
+      if (p === card) return id;
+      id = p;
+    }
+    return null;
+  };
+  (zones || []).filter(z => isFlow(z, "horz")).forEach(z => {
+    const card = String(z.id), children = kids.get(card) || [];
+    if (children.length < 2 || !children.every(plainChild)) return;
+    const branches = new Map();
+    items.forEach(it => {
+      const b = rowZoneOf(it) === card ? branchOf(it, card) : null;
+      if (!b) return;
+      if (!branches.has(b)) branches.set(b, []);
+      branches.get(b).push(it);
+    });
+    if (branches.size < 2) return;
+    const tops = [...branches.values()].map(list => {
+      const row = Math.min(...list.map(it => it.gridRow));
+      return list.filter(it => it.gridRow === row);
+    });
+    const rows = tops.map(t => t[0].gridRow);
+    const lo = Math.min(...rows), hi = Math.max(...rows);
+    if (hi === lo || hi - lo > 1) return;
+    tops.forEach(t => t.forEach(it => { it.gridRow = hi; }));
+  });
+  return { rowZoneOf };
+}
+
 function resolveCollisions(zones, clusterOf = null) {
 if (!zones || zones.length === 0) return zones;
 
@@ -9220,7 +9290,8 @@ function buildTextCard(zone, layout, model) {
   const used = lineHeightsPt.reduce((s, h) => s + h * 4 / 3, 0);
   const pad = layout && layout.heightPx ? Math.max(0, Math.round((layout.heightPx - used) / 20)) : 0;
   const widthPx = [Math.max(40, ...kpiLines.map(l => l.segments.reduce((w, s) => w + s.text.length * (s.props.fontSize || 9) * 4 / 3 * 0.58, 0) + 12))];
-  return { title: null, tiles: [{ lines: kpiLines }], background: (zone.style && zone.style.bgColor) || null,
+  // a see-through colour is left to the background pass, which blends it with what is behind the box
+  return { title: null, tiles: [{ lines: kpiLines }], background: (zone.style && !(zone.style.bgAlpha < 1) && zone.style.bgColor) || null,
            padTop: Math.floor(pad / 2), padBottom: pad - Math.floor(pad / 2), lineHeightsPt, rows: pad + kpiLines.length,
            widthPx, zoneWidthPx: (layout && layout.widthPx) || null };
 }
@@ -9424,29 +9495,54 @@ function backgroundPlan(zones, dashColor, blocks, canvas, dashPx) {
   const layers = coloured
     .filter(({ z }) => { const { w, h } = px(z); return Math.min(w, h) >= LINE_PX; })
     .map(({ z, order }) => {
-      const members = placed.filter(p => inside(center(p.z), z)).map(p => p.b);
+      const inZone = placed.filter(p => inside(center(p.z), z));
+      const members = inZone.map(p => p.b);
       const rect = { top: Math.round(mapY(z.y)), left: Math.round(mapX(z.x)),
                      bottom: Math.round(mapY(z.y + z.h)) - 1, right: Math.round(mapX(z.x + z.w)) - 1 };
+      if (inZone.length) {
+        // a zone holding blocks reaches past them only by its own padding: a long table elsewhere on the same
+        // dashboard rows stretches the shared row map, which would carry the colour down to the table's last row
+        // (only when the map ran far past it – twice the zone's own rows and its blocks' rows; padding under the last
+        // block in whole rows, so a stack inside a card never ends below the card; never shorter than the zone itself,
+        // as a block it holds may not be exported: a web page, an extension)
+        const rowsOf = units => Math.max(0, Math.floor(units * dashPx.h / 100000 / PX_PER_ROW));
+        const lastEdge = Math.max(...inZone.map(p => p.z.y + p.z.h));
+        const top = Math.min(rect.top, ...members.map(b => b.top)), blocksEnd = Math.max(...members.map(b => b.bottom));
+        if (rect.bottom - top + 1 > 2 * Math.max(rowsOf(z.h), blocksEnd - top + 1)) {
+          rect.bottom = Math.max(blocksEnd + rowsOf(z.y + z.h - lastEdge), top + rowsOf(z.h) - 1);
+        }
+      }
       members.forEach(b => {
         rect.top = Math.min(rect.top, b.top); rect.left = Math.min(rect.left, b.left);
         rect.bottom = Math.max(rect.bottom, b.bottom); rect.right = Math.max(rect.right, b.right);
       });
       if (rect.bottom < rect.top || rect.right < rect.left) return null;
-      return { color: z.style.bgColor, area: z.w * z.h, order, members: new Set(members), ...rect };
+      return { color: z.style.bgColor, alpha: z.style.bgAlpha || 1, area: z.w * z.h, order, members: new Set(members), ...rect };
     })
     .filter(Boolean)
     .sort((a, b) => b.area - a.area || a.order - b.order);             // back to front
   const covers = (b, r, c) => r >= b.top && r <= b.bottom && c >= b.left && c <= b.right;
+  // the layers that apply, back to front: an opaque one hides those behind it, a see-through one is blended over them
+  const paint = (applies, own, ownAlpha) => {
+    let k = -1;
+    for (let i = layers.length - 1; i >= 0; i--) if (applies(layers[i])) { k = i; if (layers[i].alpha >= 1) break; }
+    if (k < 0 && !own) return dashColor || null;
+    let color = null;
+    for (let i = k; i >= 0 && i < layers.length; i++) {
+      if (!applies(layers[i])) continue;
+      color = layers[i].alpha >= 1 ? layers[i].color : tfInterpolate(color || dashColor || "FFFFFFFF", layers[i].color, layers[i].alpha);
+    }
+    if (own) color = ownAlpha && ownAlpha < 1 ? tfInterpolate(color || dashColor || "FFFFFFFF", own, ownAlpha) : own;
+    return color || dashColor || null;
+  };
   const colorAt = (r, c) => {
     const block = blocks.find(b => covers(b, r, c));
     if (block) {
       if (block.own === "white") return null;
-      if (block.own) return block.own;
-      for (let i = layers.length - 1; i >= 0; i--) if (layers[i].members.has(block)) return layers[i].color;
-      return dashColor || null;
+      if (block.own && !(block.ownAlpha < 1)) return block.own;
+      return paint(l => l.members.has(block), block.own, block.ownAlpha);
     }
-    for (let i = layers.length - 1; i >= 0; i--) if (covers(layers[i], r, c)) return layers[i].color;
-    return dashColor || null;
+    return paint(l => covers(l, r, c), null, 1);
   };
   return { colorAt, lines };
 }
@@ -9680,7 +9776,7 @@ async function refreshChecks(dashboard) {
 const DEFAULT_BACKEND_URL = "";      // production: the hosted Worker URL, e.g. "https://export-to-excel-backend.<account>.workers.dev"
 const EXTENSION_VERSION = "2.2.0";
 /** which build made an export: shown in the Conversion Report and the panel (old cached files are easy to spot) */
-const EXTENSION_BUILD = "2026-11-13 summary-only supertables 2";
+const EXTENSION_BUILD = "2026-11-18 summary-only supertables 2 card-layout";
 console.info(`[Export to Excel] v${EXTENSION_VERSION} · build ${EXTENSION_BUILD}`);
 /** Links shown with the licence status (leave "" to hide). */
 const PRODUCT_LINKS = { buy: "", help: "" };
@@ -18555,7 +18651,12 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
       for (let n = 0; id && zoneParent.get(id) && n < 50; n++) id = zoneParent.get(id);
       return id || "";
     };
-    resolveCollisions(placedItems, topZoneOf);
+    const cardRows = levelCardRows(placedItems, dashZones);
+    // blocks level on the dashboard move down together only within the horizontal container that puts them side by
+    // side: a column pushed down by its own content (a navigation panel) no longer drags a card in another column
+    // that happens to start on the same row
+    const rowZoneOf = it => cardRows.rowZoneOf(it) || topZoneOf(it);
+    resolveCollisions(placedItems, rowZoneOf);
 
 // SNAP-OUT-OF-GROUPED-ROWS PASS
 // Excel hides entire physical rows, not per-column cells, so a long table's collapsed rows would
@@ -18588,7 +18689,7 @@ while (FORMAT_CONFIG.groupOverflowRows && snapChanged && snapPass < MAX_SNAP_PAS
   }
   // a table moved below another's collapsed rows can now sit on what was under it: everything below moves
   // down with it (resolveCollisions only ever moves items down, and only where they really overlap)
-  if (snapChanged) resolveCollisions(placedItems, topZoneOf);
+  if (snapChanged) resolveCollisions(placedItems, rowZoneOf);
 }
 setTableVisibleRows(placedItems);
 
@@ -19089,8 +19190,9 @@ setTableVisibleRows(placedItems);
       // a worksheet draws its shading over its zone: its colour, Tableau's white, or see-through
       const shading = it.type === "worksheet" && it.vm ? it.vm.fmt.sheetShading() : "none";
       const own = shading === "none" ? zoneBg : shading || "white";
+      const ownAlpha = shading === "none" && zoneBg ? zone.style.bgAlpha : undefined;    // a see-through zone colour
       return { zoneId: String(it.layout.id), top: it.gridRow, left: it.gridCol,
-               bottom: it.gridRow + it.allocatedRows - 1, right: it.gridCol + it.gridW - 1, own };
+               bottom: it.gridRow + it.allocatedRows - 1, right: it.gridCol + it.gridW - 1, own, ownAlpha };
     });
     // the dashboard's extent in px (its objects), for the size of zones given in 0–100000 units
     const dashExt = (dashboard.objects || []).reduce((a, o) => o.position && o.size
