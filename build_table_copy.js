@@ -9776,7 +9776,7 @@ async function refreshChecks(dashboard) {
 const DEFAULT_BACKEND_URL = "";      // production: the hosted Worker URL, e.g. "https://export-to-excel-backend.<account>.workers.dev"
 const EXTENSION_VERSION = "2.2.0";
 /** which build made an export: shown in the Conversion Report and the panel (old cached files are easy to spot) */
-const EXTENSION_BUILD = "2026-11-18 summary-only supertables 2 card-layout";
+const EXTENSION_BUILD = "2026-11-19 summary-only supertables 2 card-layout bar-labels";
 console.info(`[Export to Excel] v${EXTENSION_VERSION} · build ${EXTENSION_BUILD}`);
 /** Links shown with the licence status (leave "" to hide). */
 const PRODUCT_LINKS = { buy: "", help: "" };
@@ -12586,6 +12586,187 @@ function labelTxPr(spec) {
               { bold: lf.bold, noWrap: true });
 }
 
+/**
+ * A value label format that writes large numbers short ("$1,038,565,771" → "$1.0B", "$170,791,220" → "$170.8M"): the
+ * format's own text around the number (currency, units) kept, each value in its own unit (Excel's [>=…] sections:
+ * the two largest units the data needs, smaller values as they are). Null for percentages, dates, text, a format
+ * that already scales, or numbers too small to shorten.
+ * @param {string} fmt @param {number[]} values
+ * @returns {{ fmt: string, text: (v: number) => string } | null}
+ */
+function compactLabelFmt(fmt, values) {
+  const sec0 = (tfSplitSections(String(fmt || "General")) || ["General"])[0] || "General";
+  const sec = /general/i.test(sec0) ? "#,##0" : sec0;
+  // the number's first and last digit place, outside quoted text and [brackets]
+  let first = -1, last = -1;
+  for (let i = 0, q = false; i < sec.length; i++) {
+    const ch = sec[i];
+    if (ch === '"') q = !q;
+    else if (q) continue;
+    else if (ch === "\\" || ch === "_" || ch === "*") i++;
+    else if (ch === "[") { const j = sec.indexOf("]", i); i = j < 0 ? sec.length : j; }
+    else if (/[0#?]/.test(ch)) { if (first < 0) first = i; last = i; }
+  }
+  if (first < 0) return null;
+  const prefix = sec.slice(0, first).replace(/\[[^\]]*\]/g, ""), suffix = sec.slice(last + 1);
+  const bare = (prefix + suffix).replace(/"[^"]*"/g, "");
+  if (/%|[dmyhs@]/i.test(bare) || /^[.,0#?]*,/.test(suffix)) return null;
+  const vals = values.filter(v => typeof v === "number" && isFinite(v));
+  if (!vals.length) return null;
+  const maxAbs = Math.max(...vals.map(Math.abs));
+  const units = [[1e9, ",,,", "B"], [1e6, ",,", "M"], [1e3, ",", "K"]];
+  const top = units.findIndex(u => maxAbs >= u[0] * (u[2] === "K" ? 10 : 1));
+  if (top < 0) return null;
+  const part = u => `${prefix}#,##0.0${u[1]}"${u[2]}"${suffix}`;
+  const plain = `${prefix}#,##0${suffix}`;
+  const textIn = (u, v) => (v < 0 ? "-" : "") + tfFormatNumber(Math.abs(v), part(u));
+  if (vals.some(v => v < 0)) {
+    // negative values: one unit for all (a [>=…] section would show them without their sign)
+    const u = units[top];
+    return { fmt: part(u), text: v => textIn(u, v) };
+  }
+  // the two largest units the data needs; smaller values (a zero, a few hundred) as they are
+  const used = units.slice(top, top + 2);
+  return {
+    fmt: [...used.map(u => `[>=${u[0]}]${part(u)}`), plain].join(";"),
+    text: v => { const u = used.find(x => v >= x[0]); return u ? textIn(u, v) : tfFormatNumber(v, plain); }
+  };
+}
+
+/**
+ * Short label formats to try, the most precise first: each value in its own unit with one decimal; the smaller
+ * unit in whole numbers ("$340M"); every value in the largest unit ("$0.3B").
+ * @param {string} fmt @param {number[]} values @returns {{ fmt: string, text: (v: number) => string }[]}
+ */
+function compactLabelFmts(fmt, values) {
+  const one = compactLabelFmt(fmt, values);
+  if (!one) return [];
+  const out = [one];
+  if (!one.fmt.startsWith("[")) return out;                           // one unit already (negative values)
+  // (the largest unit keeps its decimal: "$1.0B", "$340M")
+  const secs = (tfSplitSections(one.fmt) || []).map((x, i) => i ? x.replace(/#,##0\.0(,+)/, "#,##0$1") : x);
+  const whole = { fmt: secs.join(";"), text: null };
+  whole.text = v => {
+    const sec = secs.find(x => { const m = x.match(/^\[>=([\d.e+]+)\]/); return m && v >= +m[1]; }) || secs[secs.length - 1];
+    return tfFormatNumber(v, sec.replace(/^\[[^\]]*\]/, ""));
+  };
+  out.push(whole);
+  const big = secs[0].match(/^\[>=([\d.e+]+)\](.*)$/);
+  if (big) {
+    const sec = big[2].replace(/#,##0(,+)/, "#,##0.0$1");
+    out.push({ fmt: sec, text: v => (v < 0 ? "-" : "") + tfFormatNumber(Math.abs(v), sec) });
+  }
+  return out;
+}
+
+/**
+ * Value labels over bars that would run into each other: as Tableau (which leaves out a label that would overlap
+ * another), but first written short (K / M / B) and then a point or two smaller, so as many as possible stay. Label
+ * boxes are estimated from the plot size, the axis range and the text. Sets each series' labelNumFmt, the label font
+ * size, and returns the points whose label is left out, per series index.
+ * @param {ChartSpec} spec @param {{ w: number, h: number } | null} axisPlot @param {{ min?: number, max?: number }} fixed
+ * @returns {Map<number, number[]>}
+ */
+function fitBarLabels(spec, axisPlot, fixed) {
+  const out = new Map();
+  if (!axisPlot || !(axisPlot.w > 0) || !(axisPlot.h > 0) || spec.stacked || spec.percent) return out;
+  if (spec.kind !== "bar" && spec.kind !== "combo") return out;
+  const barOf = s => (s.type || spec.kind) === "bar" && !s.refLine && Array.isArray(s.values);
+  const bars = spec.series.map((s, i) => ({ s, i })).filter(x => barOf(x.s));
+  const labelled = bars.filter(x => x.s.labels);
+  if (!labelled.length) return out;
+  const horizontal = spec.barDir === "bar";
+  const n = Math.max(...bars.map(x => x.s.values.length));
+  if (!n) return out;
+  const along = horizontal ? axisPlot.h : axisPlot.w, across = horizontal ? axisPlot.w : axisPlot.h;
+  const slot = along / n;
+  const pos = spec.labelPos || "outEnd";
+  // each axis's range: the primary one as Excel will draw it, a secondary one from its data
+  const rangeOf = secondary => {
+    const vals = bars.filter(x => !!x.s.secondary === secondary).flatMap(x => x.s.values.map(num)).filter(v => v !== null);
+    let lo = Math.min(0, ...vals), hi = Math.max(0, ...vals);
+    if (!secondary && fixed && fixed.min !== undefined && fixed.max !== undefined && fixed.max > fixed.min) { lo = fixed.min; hi = fixed.max; }
+    else hi += (hi - lo) * 0.12;
+    return hi > lo ? { lo, hi } : null;
+  };
+  const ranges = { false: rangeOf(false), true: rangeOf(true) };
+  // bars side by side in a category: Excel's bar width from the gap (a % of one bar) and the bars in the group
+  const groupOf = sec => bars.filter(x => !!x.s.secondary === sec);
+  const offsetOf = x => {
+    const g = groupOf(!!x.s.secondary), k = g.indexOf(x);
+    const gap = (x.s.secondary && spec.secondaryGapWidth !== undefined ? spec.secondaryGapWidth : spec.gapWidth ?? 60) / 100;
+    const side = spec.overlap ? 1 : g.length, bw = slot / (side + gap);
+    return { bw, off: spec.overlap ? 0 : (k - (side - 1) / 2) * bw };
+  };
+  const baseFmt = s => s.labelNumFmt || (s.secondary ? spec.secondaryNumFmt : spec.numFmt) || "General";
+  const textOf = (s, j, fmt) => {
+    if (s.labelTexts) return String(s.labelTexts[j] || "");
+    const v = /** @type {number} */ (num(s.values[j]));
+    return shortText.has(fmt) ? shortText.get(fmt)(v) : tfFormatNumber(v, fmt);
+  };
+  const boxes = (fmts, pt) => {
+    const px = pt * 4 / 3, h = px * 1.25 + 2, list = [];
+    labelled.forEach(x => {
+      const r = ranges[String(!!x.s.secondary)];
+      if (!r) return;
+      const { off } = offsetOf(x), only = x.s.labelOnly ? new Set(x.s.labelOnly) : null;
+      x.s.values.forEach((v, j) => {
+        const val = num(v);
+        if (val === null || (only && !only.has(j))) return;
+        const t = textOf(x.s, j, fmts.get(x.i));
+        if (!t) return;
+        const w = t.length * px * 0.56 + 4;
+        const u = (j + 0.5) * slot + off;                        // centre along the category axis
+        const end = across * (val - r.lo) / (r.hi - r.lo), base = across * (0 - r.lo) / (r.hi - r.lo);
+        const len = horizontal ? w : h;                          // the label's size along the value axis
+        const tip = val >= 0 ? 1 : -1;
+        const at = pos === "inBase" ? base + tip * len / 2 : pos === "ctr" ? (end + base) / 2
+                 : pos === "inEnd" ? end - tip * len / 2 : end + tip * (len / 2 + 3);
+        const box = horizontal ? { a0: u - h / 2, a1: u + h / 2, v0: at - w / 2, v1: at + w / 2 }
+                               : { a0: u - w / 2, a1: u + w / 2, v0: at - h / 2, v1: at + h / 2 };
+        list.push({ i: x.i, j, last: j === x.s.values.length - 1, box });
+      });
+    });
+    return list;
+  };
+  const hit = (p, q) => p.a0 < q.a1 - 1 && q.a0 < p.a1 - 1 && p.v0 < q.v1 - 1 && q.v0 < p.v1 - 1;
+  const crowded = list => list.some((p, a) => list.some((q, b) => b > a && hit(p.box, q.box)));
+  // the steps tried, in order: as set; written short; then smaller, down to 7 pt
+  const pt0 = (spec.labelFont && spec.labelFont.size) || spec.font.size || 9;
+  const asSet = new Map(labelled.map(x => [x.i, baseFmt(x.s)]));
+  // written short: a few formats per series (the most precise first), their texts measured as Excel writes them
+  const shortText = new Map();
+  const variants = labelled.map(x => !x.s.labelTexts ? compactLabelFmts(baseFmt(x.s), x.s.values.map(num).filter(v => v !== null)) : []);
+  variants.flat().forEach(c => shortText.set(c.fmt, c.text));
+  const shorts = Array.from({ length: Math.max(0, ...variants.map(v => v.length)) }, (_, k) =>
+    new Map(labelled.map((x, n) => [x.i, (variants[n][Math.min(k, variants[n].length - 1)] || { fmt: baseFmt(x.s) }).fmt])));
+  const steps = [[asSet, pt0]], forms = shorts.length ? shorts : [asSet];
+  for (let pt = pt0; pt >= Math.min(pt0, 7); pt--) forms.forEach(f => steps.push([f, pt]));
+  let chosen = steps.find(([f, pt]) => !crowded(boxes(f, pt)));
+  const fits = !!chosen;
+  // none fits: the smallest size, in the format that keeps the most labels
+  const cull = (f, pt) => {
+    const list = boxes(f, pt).sort((p, q) => (q.last ? 1 : 0) - (p.last ? 1 : 0) || p.j - q.j || p.i - q.i), kept = [], hidden = [];
+    list.forEach(p => (kept.some(q => hit(p.box, q.box)) ? hidden : kept).push(p));
+    return hidden;
+  };
+  if (!chosen) {
+    const ptMin = steps[steps.length - 1][1];
+    const tries = forms.map(f => [f, ptMin, cull(f, ptMin).length]);
+    const best = tries.reduce((a, b) => (b[2] < a[2] ? b : a));
+    chosen = [best[0], best[1]];
+  }
+  const [fmts, pt] = chosen;
+  if (fmts !== asSet) labelled.forEach(x => { if (!x.s.labelTexts) x.s.labelNumFmt = fmts.get(x.i); });
+  if (pt !== pt0 || fmts !== asSet) spec.labelFont = { ...(spec.labelFont || {}), size: pt };
+  if (fits) return out;
+  // still crowded: leave out a label that would overlap one already placed – each series' last bar first (the
+  // latest value), then the bars from the left
+  cull(fmts, pt).forEach(p => { if (!out.has(p.i)) out.set(p.i, []); out.get(p.i).push(p.j); });
+  out.forEach(v => v.sort((a, b) => a - b));
+  return out;
+}
+
 /** @param {ChartSpec} spec @param {ChartSeries} s @param {string | null} pos @param {number[]} [hidden] points without a label */
 function dLbls(spec, s, pos, hidden) {
   if (!s.labels) return "";
@@ -12811,7 +12992,7 @@ function seriesXml(spec, s, k, refs, type, hiddenLabels) {
       `<c:spPr>${solid(c, opacity)}<a:ln><a:noFill/></a:ln></c:spPr></c:dPt>` : "").join("");
     const pos = spec.labelPos || (spec.stacked ? null : "outEnd");
     return `<c:ser>${head}<c:spPr>${solid(s.color, opacity)}<a:ln><a:noFill/></a:ln></c:spPr><c:invertIfNegative val="0"/>` +
-      `${dpts}${dLbls(spec, s, pos)}${catXml(refs.cat, levels, spec.dateAxis, spec.categories.starts)}${valXml("val", r.val, s.values)}${labelRangeXml(s, r)}</c:ser>`;
+      `${dpts}${dLbls(spec, s, pos, hiddenLabels)}${catXml(refs.cat, levels, spec.dateAxis, spec.categories.starts)}${valXml("val", r.val, s.values)}${labelRangeXml(s, r)}</c:ser>`;
   }
   if (type === "line" && s.refLine) {         // reference line: flat, no markers; label above the 2nd point, as Tableau's
     const at = Math.min(1, Math.max(0, (s.values || []).length - 1));
@@ -13139,6 +13320,8 @@ function plotAreaXml(spec, refs, plot = null, axisPlot = null) {
       if (hide.length) culled.set(i, hide);
     });
   }
+  // value labels over bars: written short, smaller, or left out where they would run into each other
+  fitBarLabels(spec, axisPlot, fixed).forEach((hide, i) => culled.set(i, hide));
   // bar / line / area / combo: one chart group per (type, axis)
   const groups = [];
   spec.series.forEach((s, i) => {
