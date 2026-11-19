@@ -4105,6 +4105,23 @@ function tipShapeXml(t, id, rid) {
 }
 
 /**
+ * A chart's anchor: "don't move or size with cells" from its cell to its far corner's cell when that is known (a
+ * filter that hides rows leaves it in place), else from its cell at a fixed size.
+ * @param {any} chart col / row / offsets, widthPx / heightPx, to @param {number} emu EMU per px @param {string} body
+ */
+function chartAnchorXml(chart, emu, body) {
+  const from = `<xdr:from><xdr:col>${chart.col}</xdr:col><xdr:colOff>${Math.round((chart.colOffPx || 0) * emu)}</xdr:colOff>` +
+    `<xdr:row>${chart.row}</xdr:row><xdr:rowOff>${Math.round((chart.rowOffPx || 0) * emu)}</xdr:rowOff></xdr:from>`;
+  const t = chart.to;
+  if (t) {
+    return `<xdr:twoCellAnchor editAs="absolute">${from}<xdr:to><xdr:col>${t.col}</xdr:col><xdr:colOff>${Math.round(t.colOffPx * emu)}</xdr:colOff>` +
+      `<xdr:row>${t.row}</xdr:row><xdr:rowOff>${Math.round(t.rowOffPx * emu)}</xdr:rowOff></xdr:to>${body}<xdr:clientData/></xdr:twoCellAnchor>`;
+  }
+  const cx = Math.max(1, Math.round(chart.widthPx * emu)), cy = Math.max(1, Math.round(chart.heightPx * emu));
+  return `<xdr:oneCellAnchor>${from}<xdr:ext cx="${cx}" cy="${cy}"/>${body}<xdr:clientData/></xdr:oneCellAnchor>`;
+}
+
+/**
  * The anchor of a chart with tooltip wedges: chart and wedges grouped, so the wedges keep their exact px
  * positions over the slices whatever the cell sizes.
  * @param {any} chart ChartJob (col / row / offsets, widthPx / heightPx, name) @param {string} chartRid
@@ -4118,9 +4135,7 @@ function groupedAnchorXml(chart, chartRid, ids, tipRids) {
   const group = `<xdr:grpSp><xdr:nvGrpSpPr><xdr:cNvPr id="${ids.next++}" name="${esc((chart.name || "Chart") + " group")}"/><xdr:cNvGrpSpPr/></xdr:nvGrpSpPr>` +
     `<xdr:grpSpPr><a:xfrm>${xfrmXml(0, 0, w, h)}<a:chOff x="0" y="0"/><a:chExt cx="${Math.round(w * PIE_EMU_PER_PX)}" cy="${Math.round(h * PIE_EMU_PER_PX)}"/></a:xfrm></xdr:grpSpPr>` +
     frame + chart.tips.map((t, k) => tipShapeXml(t, ids.next++, tipRids[k])).join("") + `</xdr:grpSp>`;
-  return `<xdr:oneCellAnchor><xdr:from><xdr:col>${chart.col}</xdr:col><xdr:colOff>${Math.round((chart.colOffPx || 0) * PIE_EMU_PER_PX)}</xdr:colOff>` +
-    `<xdr:row>${chart.row}</xdr:row><xdr:rowOff>${Math.round((chart.rowOffPx || 0) * PIE_EMU_PER_PX)}</xdr:rowOff></xdr:from>` +
-    `<xdr:ext cx="${Math.round(w * PIE_EMU_PER_PX)}" cy="${Math.round(h * PIE_EMU_PER_PX)}"/>${group}<xdr:clientData/></xdr:oneCellAnchor>`;
+  return chartAnchorXml(chart, PIE_EMU_PER_PX, group);
 }
 
 
@@ -9776,7 +9791,7 @@ async function refreshChecks(dashboard) {
 const DEFAULT_BACKEND_URL = "";      // production: the hosted Worker URL, e.g. "https://export-to-excel-backend.<account>.workers.dev"
 const EXTENSION_VERSION = "2.2.0";
 /** which build made an export: shown in the Conversion Report and the panel (old cached files are easy to spot) */
-const EXTENSION_BUILD = "2026-11-19 summary-only supertables 2 card-layout bar-labels";
+const EXTENSION_BUILD = "2026-11-19 summary-only supertables 2 card-layout bar-labels fixed-charts";
 console.info(`[Export to Excel] v${EXTENSION_VERSION} · build ${EXTENSION_BUILD}`);
 /** Links shown with the licence status (leave "" to hide). */
 const PRODUCT_LINKS = { buy: "", help: "" };
@@ -13560,9 +13575,7 @@ function anchorExXml(chart, id, rid) {
   const cx = Math.max(1, Math.round(chart.widthPx * EMU_PER_PX));
   const cy = Math.max(1, Math.round(chart.heightPx * EMU_PER_PX));
   const name = esc(chart.name || "Chart " + id);
-  return `<xdr:oneCellAnchor><xdr:from><xdr:col>${chart.col}</xdr:col><xdr:colOff>${Math.round((chart.colOffPx || 0) * EMU_PER_PX)}</xdr:colOff>` +
-    `<xdr:row>${chart.row}</xdr:row><xdr:rowOff>${Math.round((chart.rowOffPx || 0) * EMU_PER_PX)}</xdr:rowOff></xdr:from>` +
-    `<xdr:ext cx="${cx}" cy="${cy}"/>` +
+  return chartAnchorXml(chart, EMU_PER_PX,
     `<mc:AlternateContent xmlns:mc="${NS.mc}"><mc:Choice xmlns:cx1="${NS.cx1}" Requires="cx1">` +
     `<xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="${id}" name="${name}"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>` +
     `<xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm><a:graphic>` +
@@ -13572,8 +13585,7 @@ function anchorExXml(chart, id, rid) {
     `<xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom>` +
     `<a:solidFill><a:prstClr val="white"/></a:solidFill><a:ln w="1"><a:solidFill><a:prstClr val="green"/></a:solidFill></a:ln></xdr:spPr>` +
     `<xdr:txBody><a:bodyPr vertOverflow="clip" horzOverflow="clip"/><a:lstStyle/><a:p><a:r><a:rPr lang="en-US" sz="1100"/>` +
-    `<a:t>This treemap needs Excel 2016 or later.</a:t></a:r></a:p></xdr:txBody></xdr:sp></mc:Fallback></mc:AlternateContent>` +
-    `<xdr:clientData/></xdr:oneCellAnchor>`;
+    `<a:t>This treemap needs Excel 2016 or later.</a:t></a:r></a:p></xdr:txBody></xdr:sp></mc:Fallback></mc:AlternateContent>`);
 }
 
 
@@ -13831,13 +13843,11 @@ async function fixSheetProperties(buffer) {
 function anchorXml(chart, id, rid) {
   const cx = Math.max(1, Math.round(chart.widthPx * EMU_PER_PX));
   const cy = Math.max(1, Math.round(chart.heightPx * EMU_PER_PX));
-  return `<xdr:oneCellAnchor><xdr:from><xdr:col>${chart.col}</xdr:col><xdr:colOff>${Math.round((chart.colOffPx || 0) * EMU_PER_PX)}</xdr:colOff>` +
-    `<xdr:row>${chart.row}</xdr:row><xdr:rowOff>${Math.round((chart.rowOffPx || 0) * EMU_PER_PX)}</xdr:rowOff></xdr:from>` +
-    `<xdr:ext cx="${cx}" cy="${cy}"/><xdr:graphicFrame macro=""><xdr:nvGraphicFramePr>` +
+  return chartAnchorXml(chart, EMU_PER_PX, `<xdr:graphicFrame macro=""><xdr:nvGraphicFramePr>` +
     `<xdr:cNvPr id="${id}" name="${esc(chart.name || "Chart " + id)}"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>` +
     `<xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm><a:graphic>` +
     `<a:graphicData uri="${NS.c}"><c:chart xmlns:c="${NS.c}" xmlns:r="${NS.r}" r:id="${rid}"/></a:graphicData>` +
-    `</a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:oneCellAnchor>`;
+    `</a:graphic></xdr:graphicFrame>`);
 }
 
 function relTarget(relsXml, id) {
@@ -18887,6 +18897,8 @@ setTableVisibleRows(placedItems);
     const colWidths = {};
     const exactWidths = {};
     const allTablesInfo = [];
+    /** the rows of every table written on the sheet: a filter on any of them hides those rows (the user picks one) */
+    const tableRows = [];
     const tracker = makeRangeTracker();
 
     let currentRow = 0;
@@ -19212,6 +19224,7 @@ setTableVisibleRows(placedItems);
       } else {
         writeRegularTable(worksheet, item.vm, item.gridRow, item.gridCol, tracker, allTablesInfo, colWidths, exactWidths, item.visibleRows,
                           item.fieldCols, item.gridW);
+        tableRows.push({ top: item.gridRow, bottom: item.gridRow + Math.max(1, item.allocatedRows || 1) - 1 });
       }
     }
 
@@ -19489,8 +19502,11 @@ setTableVisibleRows(placedItems);
       const pic = await prepareImage(image.file, image.info, w, h);
       if (!pic) { console.warn(`[Images] ${image.zone.param}: cannot be drawn in this browser`); return false; }
       const id = workbook.addImage({ base64: pic.base64, extension: pic.extension });
+      // beside a table's rows: "don't move or size with cells", as the charts there (filtering leaves it in place)
+      const tl = nativeAnchor(col, row, x, y, colPx, rowPx), br = nativeAnchor(col, row, x + w, y + h, colPx, rowPx);
+      const fixed = tableRows.some(t => tl.nativeRow <= t.bottom && br.nativeRow >= t.top);
       worksheet.addImage(id, /** @type {any} */ ({
-        tl: nativeAnchor(col, row, x, y, colPx, rowPx), ext: { width: w, height: h }, editAs: "oneCell",
+        tl, ...(fixed ? { br, editAs: "absolute" } : { ext: { width: w, height: h }, editAs: "oneCell" }),
         ...(image.url ? { hyperlinks: { hyperlink: image.url, tooltip: image.url } } : {})
       }));
       return true;
@@ -19648,6 +19664,19 @@ setTableVisibleRows(placedItems);
           const link = `#'${worksheet.name.replace(/'/g, "''")}'!${worksheet.getCell(job.row + 1, job.col + 1).address}`;
           const tips = ExcelChartWriter.bubbleTips(job.spec, job, link);
           if (tips.length) job.tips = tips;
+        });
+        // a chart beside a table's rows: drawn "don't move or size with cells" (its far
+        // corner as a cell + offset), so filtering the table – Excel hides its rows, and every row beside it – leaves
+        // the chart in place instead of piling it up on the next visible row. Other charts keep moving with their
+        // cells (a long table's row group opened above them pushes them down)
+        const endOf = (start, offPx, len, size) => {
+          let i = start, off = offPx + len;
+          for (let g = 0; g < 20000 && (off > size(i) || size(i) === 0); g++) { off -= size(i); i++; }
+          return { i, off: Math.max(0, off) };
+        };
+        [...chartJobs, ...pieChartJobs].forEach(job => {
+          const c = endOf(job.col, job.colOffPx || 0, job.widthPx, colPx), r = endOf(job.row, job.rowOffPx || 0, job.heightPx, rowPx);
+          if (tableRows.some(t => job.row <= t.bottom && r.i >= t.top)) job.to = { col: c.i, colOffPx: c.off, row: r.i, rowOffPx: r.off };
         });
         return [...chartJobs, ...pieChartJobs];
       }
