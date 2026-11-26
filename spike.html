@@ -22,6 +22,9 @@
   <!-- JSZip Library - reads .twbx files in the browser for title extraction -->
   <script src="./js/jszip.min.js"></script>
 
+  <!-- Microsoft sign-in library (MSAL.js 3.30): the user's company sign-in for the backend (/api) -->
+  <script src="./js/msal-browser.min.js"></script>
+
   <style>
     :root {
       --ink: #1c2b26;
@@ -257,7 +260,7 @@
     Previously it was in <head> which caused getElementById to return null
     for every element, making all buttons non-functional.
   -->
-  <script src="./build_table_copy.js"></script>
+  <script src="./build_table_copy.js?v=2.3.0-2026-11-25-signin"></script>
 
 </body>
 
