@@ -22,6 +22,10 @@
   <!-- JSZip Library - reads .twbx files in the browser for title extraction -->
   <script src="./js/jszip.min.js"></script>
 
+  <!-- Microsoft sign-in library (MSAL.js 3.30): the user's company sign-in for the backend (/api).
+       Local copy, so the extension still depends only on the server it is hosted on. -->
+  <script src="./js/msal-browser.min.js"></script>
+
   <style>
     :root {
       --ink: #1c2b26;
@@ -195,7 +199,7 @@
     <div class="section-title">Workbook formatting</div>
 
     <!--
-      Status line, updated by build_table_copy.js (auto-load progress, result, or fallback hint).
+      Status line, updated by tableau-to-excel.js (auto-load progress, result, or fallback hint).
       id="twb_file_label" must match exactly what the JS expects.
     -->
     <div id="twb_file_label">Connecting…</div>
@@ -249,7 +253,7 @@
   </div>
 
   <!--
-    IMPORTANT: build_table_copy.js is loaded at the BOTTOM of <body>,
+    IMPORTANT: tableau-to-excel.js is loaded at the BOTTOM of <body>,
     NOT in <head>. This ensures the DOM elements above (load_workbook_btn,
     twb_file_label, export_button) all exist before the JS runs and tries
     to find them with getElementById.
@@ -257,7 +261,9 @@
     Previously it was in <head> which caused getElementById to return null
     for every element, making all buttons non-functional.
   -->
-  <script src="./build_table_copy.js"></script>
+  <!-- "?v=…" makes browsers and GitHub Pages fetch the new file after each release instead of an old cached copy.
+       Change it with every release (it matches EXTENSION_VERSION / EXTENSION_BUILD in tableau-to-excel.js). -->
+  <script src="./tableau-to-excel.js?v=2.3.0-2026-11-25-signin"></script>
 
 </body>
 
