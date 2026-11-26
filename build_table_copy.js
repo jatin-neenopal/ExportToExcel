@@ -13,6 +13,7 @@
  * module tree, so a change can be traced back to it). The src/ modules are folded in up to "Donut centre
  * totals and waterfall grand totals" (eab0bfb); this file is now the only source. Sections that belong to the merge:
  *   cloud/backend.js      auto-load from Tableau Cloud (Advanced → Backend URL)
+ *   cloud/user-signin.js  company sign-in (Microsoft Entra ID): the user's token on every backend call
  *   cloud/dashboards.js   the other dashboards (hidden views, sign-in, progress screen, sheet names)
  *   ui/workbook-store.js  applyWorkbookXml(): manual 📁 load and auto-load share one path
  *   export/export.js      exportToExcel() → writeDashboardSheet() per dashboard → charts injected per sheet
@@ -21,7 +22,8 @@
  * Settings that change the output: FORMAT_CONFIG (config.js section).
  *
  * The page (index.html) must load, before this file:
- *   ./js/tableau.extensions.1.latest.js, ExcelJS 4.4 (window.ExcelJS) and JSZip 3.10 (window.JSZip).
+ *   ./js/tableau.extensions.1.latest.js, ExcelJS 4.4 (window.ExcelJS), JSZip 3.10 (window.JSZip) and,
+ *   for a backend with user sign-in, MSAL.js 3.30 (window.msal) plus the blank auth.html next to index.html.
  * Panel element ids used: twb_file_label, load_workbook_btn, export_button, export_status,
  *   export_all (checkbox "All dashboards"), backend_url, backend_key, backend_save (Advanced settings).
  * ══════════════════════════════════════════════════════════════════════════════════════════════════════ */
@@ -9789,9 +9791,9 @@ async function refreshChecks(dashboard) {
  * ============================================================================= */
 
 const DEFAULT_BACKEND_URL = "";      // production: the hosted Worker URL, e.g. "https://export-to-excel-backend.<account>.workers.dev"
-const EXTENSION_VERSION = "2.2.0";
+const EXTENSION_VERSION = "2.3.0";
 /** which build made an export: shown in the Conversion Report and the panel (old cached files are easy to spot) */
-const EXTENSION_BUILD = "2026-11-19 summary-only supertables 2 card-layout bar-labels fixed-charts";
+const EXTENSION_BUILD = "2026-11-25 user sign-in, per-user workbook check";
 console.info(`[Export to Excel] v${EXTENSION_VERSION} · build ${EXTENSION_BUILD}`);
 /** Links shown with the licence status (leave "" to hide). */
 const PRODUCT_LINKS = { buy: "", help: "" };
@@ -9996,12 +9998,134 @@ function openLicenceSetup() {
   /** @type {HTMLElement} */ (box.querySelector("#licence_key")).focus();
 }
 
-/** Call the backend. Throws a readable Error on network failure or non-2xx. */
-async function backendFetch(path, init = {}) {
+/* ═══ cloud/user-signin.js ═══════════════════════════════════════════════════════════════════════════ */
+/* Company sign-in (Microsoft Entra ID) for the backend. A backend with AUTH_REQUIRED=true answers its public
+ * sign-in settings at /auth-config; every other backend call then carries the user's access token
+ * ("Authorization: Bearer …"). The backend checks the token, then asks Tableau whether THIS user may open the
+ * workbook. An older backend without /auth-config (404) needs no sign-in: calls go out as before.
+ * The token comes from Microsoft silently when the user already has a session (usually true: they signed in to
+ * Tableau through it); otherwise a "Sign in" button opens Microsoft's sign-in pop-up (a pop-up needs a click). */
+
+/** "the user must sign in first" – shown as a Sign in button, not as an error */
+class SignInNeededError extends Error {
+  constructor(message) { super(message || "Please sign in with your company account"); this.signInNeeded = true; }
+}
+/** Tableau says this user may not open the workbook (backend 403) */
+class NoAccessError extends Error {}
+
+/** @type {undefined | null | { required: true, clientId: string, authority: string, scope: string }} */
+let AUTH_CFG;                       // undefined = not asked yet · null = this backend needs no sign-in
+/** @type {any} */
+let MSAL_APP = null;
+/** @type {null | { token: string, exp: number }} */
+let AUTH_TOKEN = null;
+const SIGNIN_REDIRECT_PAGE = "auth.html";   // blank page the sign-in pop-up returns to (registered in Entra)
+
+async function getAuthConfig() {
+  if (AUTH_CFG !== undefined) return AUTH_CFG;
+  const { url } = getBackendConfig();
+  if (!url) return null;
+  let res;
+  try { res = await fetch(url + "/auth-config"); }
+  catch (e) { return null; }                          // not remembered: asked again with the next call
+  if (res.status === 404) return (AUTH_CFG = null);   // a backend without user sign-in
+  if (!res.ok) return null;
+  let j = null;
+  try { j = await res.json(); } catch (e) { /* not JSON */ }
+  AUTH_CFG = j && j.required ? j : null;
+  return AUTH_CFG;
+}
+
+async function signInApp(cfg) {
+  if (MSAL_APP) return MSAL_APP;
+  const lib = /** @type {any} */ (window).msal;
+  if (!lib || !lib.PublicClientApplication) throw new Error("the sign-in library (js/msal-browser.min.js) is missing");
+  const app = new lib.PublicClientApplication({
+    auth: {
+      clientId: cfg.clientId,
+      authority: cfg.authority,
+      redirectUri: new URL(SIGNIN_REDIRECT_PAGE, location.href).href,
+      navigateToLoginRequestUrl: false,
+    },
+    cache: { cacheLocation: "localStorage" },
+  });
+  await app.initialize();
+  MSAL_APP = app;
+  return app;
+}
+
+/**
+ * The user's access token for the backend, or null when the backend needs no sign-in.
+ * interactive: allowed to open the sign-in pop-up (only from a click). force: don't reuse the token in memory.
+ * Throws SignInNeededError when the user has to click "Sign in".
+ */
+async function getAccessToken({ interactive = false, force = false } = {}) {
+  const cfg = await getAuthConfig();
+  if (!cfg) return null;
+  if (!force && AUTH_TOKEN && AUTH_TOKEN.exp - Date.now() > 2 * 60 * 1000) return AUTH_TOKEN.token;
+  const app = await signInApp(cfg);
+  const request = { scopes: [cfg.scope] };
+  const account = app.getActiveAccount() || app.getAllAccounts()[0] || null;
+  let result = null;
+  if (account) {
+    try { result = await app.acquireTokenSilent({ ...request, account, forceRefresh: force }); } catch (e) { result = null; }
+  }
+  if (!result && !interactive) {
+    try { result = await app.ssoSilent(request); } catch (e) { result = null; }   // existing Microsoft session
+  }
+  if (!result) {
+    if (!interactive) throw new SignInNeededError();
+    try { result = await app.acquireTokenPopup(request); }
+    catch (e) {
+      const code = String((e && (e.errorCode || e.message)) || "");
+      if (/popup_window_error|empty_window_error|popup.*block/i.test(code)) {
+        throw new SignInNeededError("The sign-in window was blocked — allow pop-ups for this page and click Sign in again");
+      }
+      if (/user_cancelled/i.test(code)) throw new SignInNeededError("Sign-in was cancelled — click Sign in to try again");
+      throw new SignInNeededError(`Sign-in failed (${code.slice(0, 120)}) — click Sign in to try again`);
+    }
+  }
+  app.setActiveAccount(result.account);
+  const exp = result.expiresOn ? new Date(result.expiresOn).getTime() : Date.now() + 30 * 60 * 1000;
+  AUTH_TOKEN = { token: result.accessToken, exp };
+  return AUTH_TOKEN.token;
+}
+
+/** Show a "Sign in" button under the workbook status; after a successful sign-in, onSignedIn() runs. */
+function showSignInPrompt(message, onSignedIn) {
+  showWorkbookStatus(message, true);
+  const label = document.getElementById("twb_file_label");
+  if (!label || document.getElementById("signin_button")) return;
+  const btn = document.createElement("button");
+  btn.id = "signin_button";
+  btn.className = "btn-load";
+  btn.style.marginBottom = "8px";
+  btn.textContent = "Sign in with your company account";
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    try {
+      await getAccessToken({ interactive: true, force: true });
+      btn.remove();
+      await onSignedIn();
+    } catch (e) {
+      btn.disabled = false;
+      showWorkbookStatus(e.message, true);
+    }
+  });
+  label.insertAdjacentElement("afterend", btn);
+}
+
+/** Call the backend. Throws a readable Error on network failure or non-2xx.
+ *  With user sign-in on: adds the access token, retries once with a fresh token on 401,
+ *  then throws SignInNeededError; a 403 "no access" becomes NoAccessError. */
+async function backendFetch(path, init = {}, retried = false) {
   const { url, key } = getBackendConfig();
   if (!url) throw new Error("No backend URL configured");
   const headers = { ...(init.headers || {}) };
   if (key) headers["X-Spike-Key"] = key;
+  // the licence check runs before anything else and needs no sign-in (a single-client backend answers 404)
+  const token = path === "/licence" ? null : await getAccessToken({ force: retried });   // null: no sign-in needed
+  if (token) headers["Authorization"] = "Bearer " + token;
   // licence headers only with a licence key (marketplace backend): a single-client backend's CORS allows just
   // Content-Type and X-Spike-Key – any other header makes the browser block the request ("could not reach")
   const tk = tenantKey();
@@ -10025,6 +10149,19 @@ async function backendFetch(path, init = {}) {
     try { text = await res.text(); } catch (e) { /* ignore */ }
     let msg = text, body = null;
     try { body = JSON.parse(text); msg = body.error || text; } catch (e) { /* not JSON */ }
+    if (res.status === 401) {
+      if (!retried) {                                             // the token may have just expired, or the
+        if (token === null) AUTH_CFG = undefined;                 // sign-in settings could not be read before
+        return backendFetch(path, init, true);
+      }
+      if (AUTH_CFG) {
+        AUTH_TOKEN = null;
+        throw new SignInNeededError("Your sign-in has expired — please sign in again");
+      }
+    }
+    if (res.status === 403 && AUTH_CFG && /access to this workbook/i.test(String(msg))) {
+      throw new NoAccessError(String(msg));
+    }
     if (body && body.error === "licence") {
       // the licence ran out (or no key): switch to Lite mode and say why
       const info = { valid: false, reason: body.reason, message: body.message, ...(body.licence || {}) };
@@ -10244,6 +10381,15 @@ async function autoLoadWorkbook(dashboard) {
   } catch (e) {
     if (gen !== WORKBOOK_LOAD_GEN) return;
     console.warn("[AutoFetch]", e);
+    if (e && e.signInNeeded) {
+      showSignInPrompt(`🔒 ${e.message} to load this workbook's formatting${savedFile ? ` (until then: ${savedFile})` : ""}`,
+        () => autoLoadWorkbook(dashboard));
+      return;
+    }
+    if (e instanceof NoAccessError) {
+      showWorkbookStatus(`⛔ ${e.message}${fallback}`, true);
+      return;
+    }
     showWorkbookStatus(`⚠️ Auto-load failed: ${e.message}${fallback}`, true);
   }
 }
